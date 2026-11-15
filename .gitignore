@@ -11,3 +11,12 @@ tools/
 *.db
 *.db-shm
 *.db-wal
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+dist/
+*.tar.gz
+*.zip
+*.sha256

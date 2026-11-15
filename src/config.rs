@@ -406,6 +406,45 @@ pub fn redact_secrets(text: &str, secrets: &[&str]) -> String {
     out
 }
 
+/// Redacts configured/environment secrets and workspace paths from an error message.
+pub fn redact_error(root: &Path, err: &dyn std::fmt::Display) -> String {
+    let owned_secrets = env_sensitive_values(root);
+    let secret_refs: Vec<&str> = owned_secrets.iter().map(String::as_str).collect();
+    let mut msg = redact_secrets(&err.to_string(), &secret_refs);
+
+    let mut prefixes = Vec::new();
+    for candidate in [Some(root.to_path_buf()), fs::canonicalize(root).ok()]
+        .into_iter()
+        .flatten()
+    {
+        let s = candidate.to_string_lossy().into_owned();
+        if s.len() <= 1 || s == "." || s == ".." {
+            continue;
+        }
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            let clean = stripped.to_string();
+            let clean_forward = clean.replace('\\', "/");
+            if clean_forward != clean {
+                prefixes.push(clean_forward);
+            }
+            prefixes.push(clean);
+        }
+        let forward = s.replace('\\', "/");
+        if forward != s {
+            prefixes.push(forward);
+        }
+        prefixes.push(s);
+    }
+    prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    prefixes.dedup();
+    for prefix in prefixes {
+        if msg.contains(&prefix) {
+            msg = msg.replace(&prefix, "<workspace>");
+        }
+    }
+    msg
+}
+
 pub fn find_cli_in_path(name: &str) -> Option<PathBuf> {
     let path_os = std::env::var_os("PATH")?;
     find_cli_in_dirs(name, std::env::split_paths(&path_os))
@@ -664,5 +703,21 @@ mod tests {
             assert_eq!(dir_mode, 0o700);
             assert_eq!(file_mode, 0o600);
         }
+
+        let canon = fs::canonicalize(root.path()).unwrap();
+        let canon_str = canon.to_string_lossy();
+        let clean_root = canon_str.strip_prefix(r"\\?\").unwrap_or(&canon_str);
+        let forward_root = clean_root.replace('\\', "/");
+        let err_msg = format!(
+            "failed at {} and {canon_str} and {forward_root}/data with sk-ant-test-secret.",
+            root.path().display()
+        );
+        let redacted = redact_error(root.path(), &err_msg);
+        assert!(!redacted.contains("sk-ant-test-secret"));
+        assert!(!redacted.contains(clean_root));
+        assert!(!redacted.contains(&forward_root));
+        assert!(redacted.contains("<workspace>/data"));
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redact_error(Path::new("."), &"network error.").contains("<workspace>."));
     }
 }

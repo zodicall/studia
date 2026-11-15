@@ -1,12 +1,16 @@
 mod app;
 mod ui;
 
-use crate::{Result, i18n::Lang};
+use crate::{Result, config, i18n::Lang};
 use crossterm::event::{self, Event};
 use std::{
     path::Path,
     time::{Duration, Instant},
 };
+
+fn status_error(root: &Path, label: &str, err: &dyn std::fmt::Display) -> String {
+    format!("{label}: {}", config::redact_error(root, err))
+}
 
 struct TerminalGuard;
 
@@ -44,16 +48,17 @@ pub fn run_with(root: &Path, lang: Lang) -> Result<()> {
             }
             app.tick();
             if let Err(error) = app.coach_tick() {
-                app.status = format!("{}: {error}", app.lang.pick("Koç", "Coach"));
+                app.status = status_error(root, app.lang.pick("Koç", "Coach"), &error);
             }
             terminal.draw(|frame| ui::draw(frame, &app))?;
             if event::poll(Duration::from_millis(100))?
                 && let Event::Key(key) = event::read()?
                 && let Err(error) = app.key(key)
             {
-                app.status = format!(
-                    "{}: {error}",
-                    app.lang.pick("İşlem yapılamadı", "Action failed")
+                app.status = status_error(
+                    root,
+                    app.lang.pick("İşlem yapılamadı", "Action failed"),
+                    &error,
                 );
             }
         }
@@ -63,4 +68,30 @@ pub fn run_with(root: &Path, lang: Lang) -> Result<()> {
     app.stop_listener();
     let closed = app.close_session();
     result.and(closed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_error;
+    use std::fs;
+
+    #[test]
+    fn status_error_redacts_secrets_and_workspace_path() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(".env"),
+            "OPENAI_API_KEY=sk-tui-secret-1234\n",
+        )
+        .unwrap();
+        let raw = format!(
+            "failed reading {} with sk-tui-secret-1234",
+            root.path().join("kaynaklar/doc.md").display()
+        );
+        let formatted = status_error(root.path(), "Action failed", &raw);
+        assert!(formatted.starts_with("Action failed: "));
+        assert!(!formatted.contains("sk-tui-secret-1234"));
+        assert!(formatted.contains("[REDACTED]"));
+        assert!(!formatted.contains(&root.path().to_string_lossy().into_owned()));
+        assert!(formatted.contains("<workspace>"));
+    }
 }

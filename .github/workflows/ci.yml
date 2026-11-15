@@ -77,14 +77,14 @@ jobs:
         run: |
           set -euo pipefail
           # Reject leaked personal paths or legacy artifacts in shipped source/docs/examples.
-          if git grep -nE '(C:\\Users\\|/Users/|/home/)' -- \
+          if git grep -nE '(C:\\Users\\|C:/Users/|/Users/|/home/)' -- \
             src/ examples/ docs/ .github/ README.md README.tr.md CHANGELOG.md CONTRIBUTING.md SECURITY.md .env.example Cargo.toml \
             ':!.github/workflows/ci.yml'; then
             echo "::error::Personal filesystem path found in tracked files."
             exit 1
           fi
           # Ensure no tracked secret files or runtime databases exist.
-          if git ls-files | grep -E '(^|/)\.env$|\.db$|^kaynaklar/|^data/|^anki/'; then
+          if git ls-files | grep -vE '(^|/)\.env\.example$' | grep -E '(^|/)\.env(\.|$)|\.db(-shm|-wal)?$|\.log$|^kaynaklar/|^data/|^anki/'; then
             echo "::error::Runtime or secret file committed to git."
             exit 1
           fi

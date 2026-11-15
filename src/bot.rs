@@ -2758,26 +2758,6 @@ pub fn question_text(question: &StoredQuestion) -> String {
     text
 }
 
-fn safe_bot_error(root: &Path, err: &dyn std::fmt::Display) -> String {
-    let owned_secrets = config::env_sensitive_values(root);
-    let secret_refs: Vec<&str> = owned_secrets.iter().map(String::as_str).collect();
-    let mut msg = config::redact_secrets(&err.to_string(), &secret_refs);
-    for candidate in [Some(root.to_path_buf()), fs::canonicalize(root).ok()]
-        .into_iter()
-        .flatten()
-    {
-        let s = candidate.to_string_lossy();
-        if !s.is_empty() {
-            msg = msg.replace(s.as_ref(), "<workspace>");
-            let forward = s.replace('\\', "/");
-            if forward != s.as_ref() {
-                msg = msg.replace(&forward, "<workspace>");
-            }
-        }
-    }
-    msg
-}
-
 impl Bot {
     fn load_course(&self, subject: &str) -> course::CourseConfig {
         course::CourseConfig::load_or_default(&self.root, subject).unwrap_or_default()
@@ -3091,7 +3071,7 @@ impl Bot {
     }
 
     fn send_error(&self, err: &dyn std::fmt::Display, caller: &mut Caller<'_>) -> Result<i64> {
-        self.send(&safe_bot_error(&self.root, err), None, caller)
+        self.send(&config::redact_error(&self.root, err), None, caller)
     }
 
     fn send(&self, text: &str, keyboard: Option<&str>, caller: &mut Caller<'_>) -> Result<i64> {
@@ -3635,7 +3615,7 @@ impl Bot {
                     &self.root,
                     &format!(
                         "AI isteği veya yanıtın teslimi başarısız: {}",
-                        safe_bot_error(&self.root, &err)
+                        config::redact_error(&self.root, &err)
                     ),
                 );
                 self.edit(pending.message_id, failure, caller)?;
@@ -4535,7 +4515,10 @@ pub fn listen_with_cli(root: &Path, default_lang: Lang, cli_lang: Option<Lang>) 
             Ok(Err(err)) => {
                 telegram::log(
                     &root,
-                    &format!("Telegram yoklama veya iş teslimi başarısız: {err}"),
+                    &format!(
+                        "Telegram yoklama veya iş teslimi başarısız: {}",
+                        config::redact_error(&root, &err)
+                    ),
                 );
                 thread::sleep(backoff);
                 backoff = next_listener_backoff(backoff, false);
@@ -7155,7 +7138,7 @@ mod tests {
             "failed reading {} with token 12345:secret-bot-token",
             leaked_path.display()
         );
-        let sanitized = safe_bot_error(root.path(), &raw_err);
+        let sanitized = config::redact_error(root.path(), &raw_err);
         assert!(!sanitized.contains("12345:secret-bot-token"));
         assert!(sanitized.contains("[REDACTED]"));
         assert!(!sanitized.contains(&root.path().to_string_lossy().into_owned()));
