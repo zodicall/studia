@@ -1,6 +1,9 @@
-use super::app::{App, CoachMode, CoachReply, DenemeChat, Input, PLAN_TAB, PlanChat, tabs};
+use super::app::{
+    ANKI_TAB, AnkiSession, AnkiView, App, CoachMode, CoachReply, DenemeChat, Input, PLAN_TAB,
+    PlanChat, tabs,
+};
 use super::modals::{AiSettingsModal, Modal, PlanEditModal, PlanEditPrompt, TASK_CMD_KINDS};
-use crate::{bot, config::AiProvider, i18n::Lang, plan};
+use crate::{bot, config::AiProvider, fsrs_engine, i18n::Lang, plan};
 use chrono::{Days, Utc};
 use ratatui::{
     Frame,
@@ -36,44 +39,52 @@ const ONBOARDING_EN: &str = "Getting started:\n\
 4. Press 2 for Quiz and n to generate your first quiz";
 
 const HELP: &str = "\
-Genel    Tab / Shift+Tab, 1–7 sekme · ↑/↓ ders · r dizinle
+Genel    Tab / Shift+Tab, 1–8 sekme · ↑/↓ ders · r dizinle
          F2 Telegram · F3 Koç · F4 Dil · F5 AI/Model · q çık
 Sor      Enter soru yaz · ↑/↓ PgUp/PgDn kaydır · Ctrl+Q bu konudan 5 soruluk quiz
 Komut    / her sekmeden komut yazar (Telegram ile aynı):
          /quiz [konu n] · /tekrar [n] [orijinal] · /kazanim <konu> [n]
-         /kelime <konu> [n] · /anlat <konu> · /deneme [n] · /denemeler
-         /plan [baslat tarih | gun N | gec N | olustur | duzenle] · /bugun · /dersler
+         /kartlar · /kart <konu> [n] · /kulucka · /strateji · /kelime <konu> [n]
+         /anlat <konu> · /deneme [n] · /denemeler · /bugun · /dersler
+         /plan [baslat tarih | gun N | gec N | olustur | duzenle]
          /ai · /model <ad> · /effort <seviye> · /yanlislar · /ders <ad> · /lang <tr|en> · /iptal · /test · /yardim
 Quiz     n yeni quiz · Enter kayıtlı sorular · w yanlışları tekrar
-         a–e veya 1–5 cevap · Enter sonraki · Esc bitir
+         a–e veya 1–5 cevap · yanlışsa c Cuotiben analizi · Enter sonraki · Esc bitir
 Tekrar   t veya Enter bugünkü tekrarları başlat
 Deneme   ↑/↓ seç · Enter koçla tartış · d sil (y onay)
-         sohbette Tab/Shift+Tab yanlışları gez · Enter gönder
+         sohbette Tab/Shift+Tab yanlışları gez · Ctrl+F Cuotiben · Enter gönder
 Bugün    ←/→ gün değiştir · ↑/↓ görev · Enter çalıştır · b başlat
          g Planla sekmesini aç · e planı elle düzenle
 Planla   Enter / n AI ile plan tartış · ←/→ taslak gün · Ctrl+B bugünden başlat
          Ctrl+S taslağı kaydet · Ctrl+N sıfırla · Esc çık
+Kartlar  Enter FSRS çalış · n AI kart üret · t/←/→ etiket · h High-Yield
+         k Kuluçka · s Strateji Defteri · x Anki dışa aktar
+         tekrarda Space/Enter cevabı aç · 1 Hatırlamadım · 2 Hatırladım · r Sülük AI onar
          F3 koçu aç/kapat · F5 AI ve model ayarları
 Her yerde PgUp / PgDn kaydır · Esc AI işini iptal eder · F1 / ? yardım";
 
 const HELP_EN: &str = "\
-General  Tab / Shift+Tab, 1–7 tabs · ↑/↓ course · r index
+General  Tab / Shift+Tab, 1–8 tabs · ↑/↓ course · r index
          F2 Telegram listener · F3 Coach · F4 Lang (TR/EN) · F5 AI/Model · q quit
 Ask      Enter ask a question · ↑/↓ PgUp/PgDn scroll · Ctrl+Q 5-question quiz on topic
 Command  / runs slash commands from any tab (shared with Telegram):
-         /quiz [topic n] · /review [n] [exact] · /cards <topic> [n]
+         /quiz [topic n] · /review [n] [exact] · /practice <t> [n]
+         /anki · /flashcards <topic> [n] · /incubation · /strategy · /cards <topic> [n]
          /explain <topic> · /exam [n] · /exams · /today · /courses
          /plan [start date | day N | goto N | create | edit] · /ai · /model <name> · /effort <lvl>
-         /mistakes · /course <name> · /practice <t> [n] · /lang <tr|en> · /cancel · /test · /help
+         /mistakes · /course <name> · /lang <tr|en> · /cancel · /test · /help
 Quiz     n new quiz · Enter saved questions · w retry mistakes
-         a–e or 1–5 answer · Enter next · Esc finish
+         a–e or 1–5 answer · on wrong c Cuotiben · Enter next · Esc finish
 Review   t or Enter start due reviews
 Exams    ↑/↓ select · Enter discuss with coach · d delete (y confirm)
-         in chat Tab/Shift+Tab step mistakes · Enter send
+         in chat Tab/Shift+Tab step mistakes · Ctrl+F Cuotiben · Enter send
 Today    ←/→ change day · ↑/↓ task · Enter run · b start plan
          g open Plan tab · e edit plan manually
 Plan     Enter / n discuss plan with AI · ←/→ draft day · Ctrl+B toggle start today
          Ctrl+S save draft · Ctrl+N reset · Esc exit
+Cards    Enter FSRS study · n AI generate · t/←/→ tag filter · h High-Yield
+         k Incubation · s Strategy Sheet · x export Anki .txt
+         in review Space/Enter reveal · 1 Again · 2 Good · r Leech AI repair
          F3 toggle coach · F5 AI & model settings
 Everywhere PgUp / PgDn scroll · Esc cancel AI · F1 / ? help";
 
@@ -488,6 +499,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         3 => draw_stats(frame, content, app),
         5 => draw_denemeler(frame, content, app),
         PLAN_TAB => draw_plan_studio(frame, content, app),
+        ANKI_TAB => draw_anki(frame, content, app),
         _ => unreachable!(),
     }
     let activity = app.spinner();
@@ -710,6 +722,10 @@ fn draw_practice(frame: &mut Frame, content: Rect, app: &App) {
             Input::DenemeChat => app.lang.pick("Koça soru", "Question for coach"),
             Input::LessonChat => app.lang.pick("Ders hakkında soru", "Question on lesson"),
             Input::PlanChat => app.lang.pick("Plan tartışması", "Plan discussion"),
+            Input::FlashcardTopic => app.lang.pick(
+                "FSRS kart konusu [adet] (ör. Phrasal Verbs 10)",
+                "FSRS card topic [count] (e.g. Conditionals 10)",
+            ),
         };
         let hint = app
             .lang
@@ -818,13 +834,23 @@ fn draw_session(frame: &mut Frame, area: Rect, app: &App, session: &bot::Session
         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
     ));
     let body = match &app.feedback {
-        Some(feedback) => format!(
-            "{feedback}\n\n{}",
-            app.lang.pick(
-                "Enter: sonraki soru / sonucu göster",
-                "Enter: next question / show summary",
+        Some(feedback) => {
+            let cuotiben = if app.last_wrong_choice.is_some() {
+                app.lang.pick(
+                    "\n[c] Cuotiben hata defterine analiz et (FSRS / Sınav Tekniği)",
+                    "\n[c] Analyze mistake with Cuotiben (FSRS / Strategy Sheet)",
+                )
+            } else {
+                ""
+            };
+            format!(
+                "{feedback}{cuotiben}\n\n{}",
+                app.lang.pick(
+                    "Enter: sonraki soru / sonucu göster",
+                    "Enter: next question / show summary",
+                )
             )
-        ),
+        }
         None => match session.questions.get(answered) {
             Some(question) => match app.lang {
                 Lang::Tr => format!(
@@ -1204,15 +1230,20 @@ fn draw_deneme_chat(frame: &mut Frame, content: Rect, app: &App, chat: &DenemeCh
         wrong_position(chat, app.lang)
     );
     panel_text(frame, panel_area, &title, rendered, offset);
-    let title = if app.input.is_empty() {
-        app.lang.pick(
-            "Soru · Enter gönder · Esc sohbetten çık",
-            "Question · Enter send · Esc exit chat",
-        )
-    } else {
+    let title = if !app.input.is_empty() {
         app.lang.pick(
             "Soru · Enter gönder · Esc temizle",
             "Question · Enter send · Esc clear",
+        )
+    } else if chat.focus.is_some() {
+        app.lang.pick(
+            "Soru · Enter gönder · Ctrl+F Cuotiben · Esc çık",
+            "Question · Enter send · Ctrl+F Cuotiben · Esc exit",
+        )
+    } else {
+        app.lang.pick(
+            "Soru · Enter gönder · Esc sohbetten çık",
+            "Question · Enter send · Esc exit chat",
         )
     };
     paragraph(frame, input, title, &input_tail(&app.input, input.width), 0);
@@ -1596,6 +1627,499 @@ fn weakest_lines(app: &App) -> String {
         .join("\n")
 }
 
+fn draw_anki(frame: &mut Frame, content: Rect, app: &App) {
+    if app.editing == Some(Input::FlashcardTopic) {
+        let prompt = app.lang.pick(
+            "FSRS kart konusu [adet] (ör. Phrasal Verbs 10)",
+            "FSRS card topic [count] (e.g. Conditionals 10)",
+        );
+        let hint = app
+            .lang
+            .pick("Enter kart üret · Esc iptal", "Enter generate · Esc cancel");
+        paragraph(
+            frame,
+            content,
+            prompt,
+            &format!("{}\n\n{hint}", app.input),
+            0,
+        );
+        return;
+    }
+    if let Some(session) = &app.anki_session {
+        draw_anki_review(frame, content, app, session);
+        return;
+    }
+    match app.anki_view {
+        AnkiView::Overview => draw_anki_overview(frame, content, app),
+        AnkiView::Incubation => draw_anki_incubation(frame, content, app),
+        AnkiView::Strategy => draw_anki_strategy(frame, content, app),
+    }
+}
+
+fn draw_anki_overview(frame: &mut Frame, content: Rect, app: &App) {
+    let subject = app
+        .subjects
+        .get(app.selected)
+        .map(|s| s.name.as_str())
+        .unwrap_or("—");
+    let st = &app.anki_stats;
+    let selected_tag = if app.anki_tag_idx == 0 {
+        app.lang.pick("Tümü (Tek Havuz)", "All (Single Pool)")
+    } else {
+        app.anki_tags
+            .get(app.anki_tag_idx - 1)
+            .map_or("—", |t| t.tag.as_str())
+    };
+    let hy_badge = if app.anki_high_yield_only {
+        app.lang.pick("AÇIK ★", "ON ★")
+    } else {
+        app.lang.pick("KAPALI", "OFF")
+    };
+
+    let banner_height = if st.backlog_paused { 3 } else { 0 };
+    let [stats_area, banner_area, tags_area] = Layout::vertical([
+        Constraint::Length(7),
+        Constraint::Length(banner_height),
+        Constraint::Min(4),
+    ])
+    .areas(content);
+
+    let stats_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{}: {}   ",
+                    app.lang.pick("Aktif Havuz", "Active Pool"),
+                    st.total_active
+                ),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{}: {}   ",
+                    app.lang.pick("Öğrenme (10m/30m)", "Learning (10m/30m)"),
+                    st.due_learning
+                ),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(
+                    "{}: {}   ",
+                    app.lang.pick("Bekleyen Review", "Due Reviews"),
+                    st.due_reviews
+                ),
+                Style::default().fg(if st.due_reviews > 0 { GOOD } else { MUTED }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{}: {}/{} ({}: {}, {}: {})   ",
+                    app.lang.pick("Yeni Kota", "New Quota"),
+                    st.new_today,
+                    crate::fsrs_engine::DAILY_NEW_CARD_LIMIT,
+                    app.lang.pick("kalan", "left"),
+                    st.new_remaining_today,
+                    app.lang.pick("yeni havuz", "new pool"),
+                    st.new_total
+                ),
+                Style::default().fg(TEXT),
+            ),
+            Span::styled(
+                format!(
+                    "{}: {:.1}d   ",
+                    app.lang.pick("Ort. S", "Avg S"),
+                    st.avg_stability
+                ),
+                Style::default().fg(MUTED),
+            ),
+            Span::styled(
+                format!("Leech: {}   ", st.leech_count),
+                Style::default().fg(if st.leech_count > 0 { WARN } else { MUTED }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{}: {}   {}: {}   ",
+                    app.lang.pick("Kuluçka", "Incubation"),
+                    st.incubation_count,
+                    app.lang.pick("Strateji Notu", "Strategy Notes"),
+                    st.strategy_notes_count
+                ),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                format!(
+                    "R*={:.0}%",
+                    crate::fsrs_engine::DEFAULT_RETENTION * 100.0
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            format!(
+                "{}: {selected_tag}   |   High-Yield [h]: {hy_badge}",
+                app.lang.pick("Etiket Filtresi", "Tag Filter")
+            ),
+            Style::default().fg(TEXT),
+        )]),
+        Line::from(Span::styled(
+            app.lang.pick(
+                "Enter: çalış · n: AI kart üret · k: Kuluçka · s: Strateji · x: Anki .txt aktar",
+                "Enter: study · n: generate AI cards · k: Incubation · s: Strategy · x: export Anki .txt",
+            ),
+            Style::default().fg(GOOD),
+        )),
+    ];
+    let title = format!("{} · {subject}", app.lang.pick("FSRS Kart Havuzu", "FSRS Card Pool"));
+    panel_text(frame, stats_area, &title, Text::from(stats_lines), 0);
+
+    if st.backlog_paused {
+        let warn_text = match app.lang {
+            Lang::Tr => format!(
+                "⚠ YIĞILMA KORUMASI AKTİF: {} vadesi gelmiş tekrar var (≥ {}). Yeni kart açılımı otomatik durduruldu.",
+                st.due_reviews,
+                crate::fsrs_engine::BACKLOG_PROTECTION_THRESHOLD
+            ),
+            Lang::En => format!(
+                "⚠ BACKLOG PROTECTION ACTIVE: {} due reviews (≥ {}). Daily new cards automatically paused.",
+                st.due_reviews,
+                crate::fsrs_engine::BACKLOG_PROTECTION_THRESHOLD
+            ),
+        };
+        panel_text(
+            frame,
+            banner_area,
+            app.lang.pick("Koruma", "Protection"),
+            Text::from(Line::styled(
+                warn_text,
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            )),
+            0,
+        );
+    }
+
+    if app.anki_tags.is_empty() {
+        paragraph(
+            frame,
+            tags_area,
+            app.lang
+                .pick("Hiyerarşik Etiket Ağacı", "Hierarchical Tag Tree"),
+            app.lang.pick(
+                "Henüz FSRS kartı yok. n tuşuna basıp konu yazarak AI ile atomik FSRS kartları üretin veya quiz yanlışlarında [c] ile Cuotiben kullanın.",
+                "No FSRS flashcards yet. Press n to generate atomic FSRS cards on any topic, or press [c] on a quiz mistake for Cuotiben.",
+            ),
+            app.scroll,
+        );
+    } else {
+        let items: Vec<ListItem> = std::iter::once(ListItem::new(Line::styled(
+            app.lang
+                .pick("*  Tüm Etiketler (Tek Havuz)", "*  All Tags (Single Pool)"),
+            Style::default().fg(TEXT),
+        )))
+        .chain(app.anki_tags.iter().map(|t| {
+            let leech_part = if t.leech_count > 0 {
+                format!(" · ⚠ {} leech", t.leech_count)
+            } else {
+                String::new()
+            };
+            ListItem::new(Line::styled(
+                format!(
+                    "{}   ({} {} · {} due · {} {}{})",
+                    t.tag,
+                    t.total,
+                    app.lang.pick("kart", "cards"),
+                    t.due,
+                    t.new_count,
+                    app.lang.pick("yeni", "new"),
+                    leech_part
+                ),
+                Style::default().fg(if t.due > 0 { ACCENT } else { MUTED }),
+            ))
+        }))
+        .collect();
+        let mut list_state = ListState::default().with_selected(Some(app.anki_tag_idx));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(panel(app.lang.pick(
+                    "Hiyerarşik Etiket Ağacı (t / ←→ seç)",
+                    "Hierarchical Tag Tree (t / ←→ select)",
+                )))
+                .highlight_style(
+                    Style::default()
+                        .fg(BASE)
+                        .bg(ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            tags_area,
+            &mut list_state,
+        );
+    }
+}
+
+fn draw_anki_review(frame: &mut Frame, content: Rect, app: &App, session: &AnkiSession) {
+    let Some(card) = session.current() else {
+        return;
+    };
+    let now = Utc::now();
+    let elapsed = session.elapsed_secs();
+    let limit = card.card_type.speed_focus_limit_secs();
+    let speed_over = session.speed_focus_exceeded();
+    let retrievability = fsrs_engine::retrievability(card, now, None);
+
+    let [header_area, card_area, action_area] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(6),
+        Constraint::Length(4),
+    ])
+    .areas(content);
+
+    let mut line1_spans = vec![
+        Span::styled(
+            format!(
+                " {}/{}  {}  ",
+                session.position + 1,
+                session.cards.len(),
+                card.tag
+            ),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "[{} · {}]  ",
+                card.state.label(app.lang),
+                card.card_type.as_str()
+            ),
+            Style::default().fg(ACCENT),
+        ),
+    ];
+    if card.is_high_yield {
+        line1_spans.push(Span::styled("★  ", Style::default().fg(GOOD)));
+    }
+    if card.is_leech {
+        line1_spans.push(Span::styled(
+            format!("⚠ LEECH ({}x)  ", card.lapses),
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let timer_label = if speed_over {
+        match app.lang {
+            Lang::Tr => format!(" ⏰ {elapsed}s/{limit}s HIZ ODAĞI!"),
+            Lang::En => format!(" ⏰ {elapsed}s/{limit}s SPEED FOCUS!"),
+        }
+    } else {
+        format!(" ⏱ {elapsed}s/{limit}s")
+    };
+    let line2_spans = vec![
+        Span::styled(
+            timer_label,
+            Style::default()
+                .fg(if speed_over { WARN } else { GOOD })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "   |   R={:.0}%  S={:.1}d  D={:.1}",
+                retrievability * 100.0,
+                card.stability,
+                card.difficulty
+            ),
+            Style::default().fg(MUTED),
+        ),
+    ];
+    let filter_label = match (session.tag_filter.as_deref(), session.high_yield_only) {
+        (Some(tag), true) => format!(" · {tag} · ★"),
+        (Some(tag), false) => format!(" · {tag}"),
+        (None, true) => " · ★ High-Yield".into(),
+        (None, false) => String::new(),
+    };
+    panel_text(
+        frame,
+        header_area,
+        &format!("FSRS · {}{}", session.subject, filter_label),
+        Text::from(vec![Line::from(line1_spans), Line::from(line2_spans)]),
+        0,
+    );
+
+    let rendered_front = if card.card_type == fsrs_engine::CardKind::Cloze {
+        fsrs_engine::format_cloze_front(&card.front)
+    } else {
+        card.front.clone()
+    };
+    let mut body = format!("**{}**\n\n{}", card.context_prefix, rendered_front);
+    if session.revealed {
+        let clean_back = if card.card_type == fsrs_engine::CardKind::Cloze {
+            fsrs_engine::format_cloze_back(&card.back)
+        } else {
+            card.back.clone()
+        };
+        body.push_str(&format!("\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n{clean_back}"));
+        if !card.extra_context.trim().is_empty() {
+            body.push_str(&format!("\n\n> {}", card.extra_context.trim()));
+        }
+        if let Some(hint) = &card.mnemonic_hint
+            && !hint.trim().is_empty()
+        {
+            body.push_str(&format!(
+                "\n\n💡 **{}:** {}",
+                app.lang.pick("İpucu", "Mnemonic"),
+                hint.trim()
+            ));
+        }
+    } else {
+        body.push_str(app.lang.pick(
+            "\n\n---\n*Hatırlamaya çalış ve Space / Enter ile cevabı aç.*",
+            "\n\n---\n*Recall first, then press Space / Enter to reveal.*",
+        ));
+    }
+    panel_text(
+        frame,
+        card_area,
+        app.lang.pick("Kart", "Card"),
+        markdown(&body),
+        app.scroll,
+    );
+
+    let action_lines = if session.revealed {
+        let (again_label, good_label) = fsrs_engine::preview_ratings(card, now, app.lang);
+        let mut spans = vec![
+            Span::styled(
+                format!(
+                    " [1] {} ({again_label}) ",
+                    app.lang.pick("Hatırlamadım", "Again")
+                ),
+                Style::default()
+                    .fg(BASE)
+                    .bg(WARN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    " [2] {} ({good_label}) ",
+                    app.lang.pick("Hatırladım", "Good")
+                ),
+                Style::default()
+                    .fg(BASE)
+                    .bg(GOOD)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if card.is_leech {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                app.lang.pick(" [r] AI Onar ", " [r] AI Repair "),
+                Style::default()
+                    .fg(BASE)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        vec![Line::from(spans)]
+    } else {
+        vec![Line::from(Span::styled(
+            app.lang.pick(
+                " [Space / Enter] Cevabı Göster     [Esc] Oturumdan Çık",
+                " [Space / Enter] Reveal Answer     [Esc] Exit Session",
+            ),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))]
+    };
+    panel_text(
+        frame,
+        action_area,
+        app.lang
+            .pick("2-Buton Değerlendirme", "2-Button Rating"),
+        Text::from(action_lines),
+        0,
+    );
+}
+
+fn draw_anki_incubation(frame: &mut Frame, content: Rect, app: &App) {
+    if app.anki_incubation.is_empty() {
+        paragraph(
+            frame,
+            content,
+            app.lang.pick("Kuluçka Havuzu (Cuotiben)", "Incubation Queue (Cuotiben)"),
+            app.lang.pick(
+                "Onay bekleyen kuluçka kartı yok.\nQuiz veya Deneme yanlışlarında [c] / Ctrl+F ile Cuotiben analizi çalıştırabilirsiniz.\n\nEsc: geri dön",
+                "No pending incubation cards.\nPress [c] on a quiz mistake or Ctrl+F in Exam Coach to run Cuotiben analysis.\n\nEsc: go back",
+            ),
+            0,
+        );
+        return;
+    }
+    let idx = app.anki_inc_idx.min(app.anki_incubation.len() - 1);
+    let card = &app.anki_incubation[idx];
+    let mut text = format!(
+        "{} {}/{} · {} {}\n\n**{}** {}\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n{}",
+        app.lang.pick("Kart", "Card"),
+        idx + 1,
+        app.anki_incubation.len(),
+        card.tag,
+        if card.is_high_yield { "★ High-Yield" } else { "" },
+        card.context_prefix,
+        card.front,
+        card.back
+    );
+    if !card.extra_context.trim().is_empty() {
+        text.push_str(&format!("\n\n> {}", card.extra_context.trim()));
+    }
+    if let Some(hint) = &card.mnemonic_hint
+        && !hint.trim().is_empty()
+    {
+        text.push_str(&format!(
+            "\n\n💡 **{}:** {}",
+            app.lang.pick("İpucu", "Mnemonic"),
+            hint.trim()
+        ));
+    }
+    text.push_str(app.lang.pick(
+        "\n\n[a / Enter] Onayla ve FSRS Havuzuna Ekle   ·   [x] Sil   ·   [←/→] Gez   ·   [Esc] Geri",
+        "\n\n[a / Enter] Approve to FSRS Pool   ·   [x] Delete   ·   [←/→] Browse   ·   [Esc] Back",
+    ));
+    panel_text(
+        frame,
+        content,
+        app.lang.pick("Kuluçka Havuzu (Cuotiben)", "Incubation Queue (Cuotiben)"),
+        markdown(&text),
+        app.scroll,
+    );
+}
+
+fn draw_anki_strategy(frame: &mut Frame, content: Rect, app: &App) {
+    if app.anki_notes.is_empty() {
+        paragraph(
+            frame,
+            content,
+            app.lang
+                .pick("Sınav Tekniği Defteri (Cuotiben)", "Strategy Sheet (Cuotiben)"),
+            app.lang.pick(
+                "Henüz sınav tekniği / dikkat hatası notu yok.\nBilgi eksikliği dışındaki hatalar FSRS kart kuyruğunu kirletmeden buraya kaydedilir.\n\nEsc: geri dön",
+                "No exam strategy / careless mistake notes yet.\nNon-knowledge errors are logged here without cluttering your FSRS queue.\n\nEsc: go back",
+            ),
+            0,
+        );
+        return;
+    }
+    let body = app
+        .anki_notes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("### {}. {}\n{}\n*{}*", i + 1, n.tag, n.note, n.created_at))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    panel_text(
+        frame,
+        content,
+        app.lang
+            .pick("Sınav Tekniği Defteri (Esc: geri)", "Strategy Sheet (Esc: back)"),
+        markdown(&body),
+        app.scroll,
+    );
+}
+
 /// Aktif bağlama göre alt satırdaki tuş ipuçları.
 fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let lang = app.lang;
@@ -1647,14 +2171,20 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("Esc", lang.pick("vazgeç", "cancel")),
                 ("Backspace", lang.pick("sil", "del")),
             ],
-            Input::DenemeChat => vec![
-                ("Enter", lang.pick("gönder", "send")),
-                ("Tab", lang.pick("sonraki yanlış", "next mistake")),
-                ("Shift+Tab", lang.pick("önceki", "prev")),
-                ("↑/↓", lang.pick("kaydır", "scroll")),
-                ("PgUp/PgDn", lang.pick("hızlı kaydır", "fast scroll")),
-                ("Esc", lang.pick("çık", "exit")),
-            ],
+            Input::DenemeChat => {
+                let mut keys = vec![
+                    ("Enter", lang.pick("gönder", "send")),
+                    ("Tab", lang.pick("sonraki yanlış", "next mistake")),
+                    ("Shift+Tab", lang.pick("önceki", "prev")),
+                    ("↑/↓", lang.pick("kaydır", "scroll")),
+                    ("PgUp/PgDn", lang.pick("hızlı kaydır", "fast scroll")),
+                    ("Esc", lang.pick("çık", "exit")),
+                ];
+                if app.deneme_chat.as_ref().is_some_and(|c| c.focus.is_some()) {
+                    keys.insert(1, ("Ctrl+F", "Cuotiben"));
+                }
+                keys
+            }
             Input::LessonChat => vec![
                 (
                     lang.pick("Yaz + Enter", "Type + Enter"),
@@ -1681,6 +2211,11 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 }
                 keys
             }
+            Input::FlashcardTopic => vec![
+                ("Enter", lang.pick("kart üret", "generate cards")),
+                ("Esc", lang.pick("vazgeç", "cancel")),
+                ("Backspace", lang.pick("sil", "del")),
+            ],
         };
     }
     if app.tab == 4 && app.lesson.is_some() {
@@ -1692,10 +2227,14 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     if app.session.is_some() && app.session_tab == app.tab {
         return if app.feedback.is_some() {
-            vec![
+            let mut keys = vec![
                 ("Enter", lang.pick("sonraki soru", "next question")),
                 ("Esc", lang.pick("quizi bitir", "finish quiz")),
-            ]
+            ];
+            if app.last_wrong_choice.is_some() {
+                keys.insert(1, ("c", "Cuotiben"));
+            }
+            keys
         } else {
             vec![
                 ("a–e / 1–5", lang.pick("cevap", "answer")),
@@ -1747,6 +2286,48 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ),
             ("e", lang.pick("elle düzenle", "edit manually")),
         ],
+        ANKI_TAB => {
+            if let Some(session) = &app.anki_session {
+                if session.revealed {
+                    let mut keys = vec![
+                        ("1", lang.pick("Hatırlamadım", "Again")),
+                        ("2", lang.pick("Hatırladım", "Good")),
+                        ("Esc", lang.pick("çık", "exit")),
+                    ];
+                    if session.current().is_some_and(|c| c.is_leech) {
+                        keys.insert(2, ("r", lang.pick("AI onar", "AI repair")));
+                    }
+                    keys
+                } else {
+                    vec![
+                        ("Space / Enter", lang.pick("cevabı aç", "reveal")),
+                        ("Esc", lang.pick("çık", "exit")),
+                    ]
+                }
+            } else {
+                match app.anki_view {
+                    AnkiView::Overview => vec![
+                        ("Enter", lang.pick("çalış", "study")),
+                        ("n", lang.pick("kart üret", "generate")),
+                        ("t / ←→", lang.pick("etiket", "tag")),
+                        ("h", lang.pick("yüksek getiri", "high-yield")),
+                        ("k", lang.pick("kuluçka", "incubation")),
+                        ("s", lang.pick("strateji", "strategy")),
+                        ("x", lang.pick("dışa aktar", "export")),
+                    ],
+                    AnkiView::Incubation => vec![
+                        ("a / Enter", lang.pick("onayla", "approve")),
+                        ("x", lang.pick("sil", "delete")),
+                        ("←/→", lang.pick("gez", "browse")),
+                        ("Esc", lang.pick("geri", "back")),
+                    ],
+                    AnkiView::Strategy => vec![
+                        ("PgUp/PgDn", lang.pick("kaydır", "scroll")),
+                        ("Esc / b", lang.pick("geri", "back")),
+                    ],
+                }
+            }
+        }
         _ => vec![
             ("←/→", lang.pick("gün", "day")),
             ("↑/↓", lang.pick("görev", "task")),
@@ -1761,7 +2342,7 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
 fn global_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let lang = app.lang;
     vec![
-        ("Tab / 1–7", lang.pick("sekme", "tabs")),
+        ("Tab / 1–8", lang.pick("sekme", "tabs")),
         ("r", lang.pick("dizinle", "index")),
         (
             "F2",
@@ -2558,5 +3139,143 @@ mod tests {
             en_screen.contains("AI Provider & Model Settings"),
             "{en_screen}"
         );
+    }
+
+    #[test]
+    fn anki_tab_renders_overview_2button_speed_focus_incubation_and_strategy() {
+        let (_root, mut app) = app_with_subject();
+        let cards = app
+            .store
+            .add_flashcards(
+                vec![crate::store::NewFlashcard {
+                    subject: "Ders".into(),
+                    tag: "#Ders::Baglac::Zitlik".into(),
+                    status: crate::fsrs_engine::CardStatus::Active,
+                    card_type: crate::fsrs_engine::CardKind::Cloze,
+                    context_prefix: "[YDS - Bağlaç]".into(),
+                    front: "{{c1::Although}} tam cümle alır.".into(),
+                    back: "**Although** + **tam cümle**".into(),
+                    extra_context: "Despite isim öbeği alır.".into(),
+                    mnemonic_hint: Some("ALL-Sentence".into()),
+                    is_high_yield: true,
+                    source_question_id: None,
+                }],
+                Utc::now(),
+            )
+            .unwrap();
+        let mut t = Utc::now();
+        app.store
+            .record_flashcard_review(cards[0].id, crate::fsrs_engine::BinaryRating::Good, 1500, t)
+            .unwrap();
+        t += chrono::Duration::minutes(35);
+        app.store
+            .record_flashcard_review(cards[0].id, crate::fsrs_engine::BinaryRating::Good, 1500, t)
+            .unwrap();
+        for _ in 0..3 {
+            t += chrono::Duration::days(2);
+            app.store
+                .record_flashcard_review(
+                    cards[0].id,
+                    crate::fsrs_engine::BinaryRating::Again,
+                    2000,
+                    t,
+                )
+                .unwrap();
+            if app.store.flashcard(cards[0].id).unwrap().unwrap().state
+                == crate::fsrs_engine::CardState::Relearning
+            {
+                t += chrono::Duration::minutes(15);
+                app.store
+                    .record_flashcard_review(
+                        cards[0].id,
+                        crate::fsrs_engine::BinaryRating::Good,
+                        2000,
+                        t,
+                    )
+                    .unwrap();
+            }
+        }
+        app.store
+            .add_flashcards(
+                vec![crate::store::NewFlashcard {
+                    subject: "Ders".into(),
+                    tag: "#Ders::Tense::Perfect".into(),
+                    status: crate::fsrs_engine::CardStatus::Incubation,
+                    card_type: crate::fsrs_engine::CardKind::Qa,
+                    context_prefix: "[YDS - Tense]".into(),
+                    front: "Since + Past Simple sonrasında ana cümle ne olur?".into(),
+                    back: "**Present Perfect** (**have/has V3**)".into(),
+                    extra_context: String::new(),
+                    mnemonic_hint: None,
+                    is_high_yield: false,
+                    source_question_id: None,
+                }],
+                Utc::now(),
+            )
+            .unwrap();
+        app.store
+            .add_exam_technique_note(
+                "Ders",
+                None,
+                "#Ders::Teknik",
+                "Olumsuz soru kökünü çiz.",
+                Utc::now(),
+            )
+            .unwrap();
+        app.refresh().unwrap();
+
+        // 1. Overview renders TR & EN at normal & small terminal sizes.
+        app.key(press(KeyCode::Char('8'))).unwrap();
+        assert_eq!(app.tab, ANKI_TAB);
+        for (w, h) in [(100, 30), (80, 24), (60, 16)] {
+            let overview = render(&app, w, h);
+            assert!(overview.contains("FSRS Kart Havuzu"), "{w}x{h}:\n{overview}");
+            if w >= 80 {
+                assert!(
+                    overview.contains("#Ders::Baglac::Zitlik"),
+                    "{w}x{h}:\n{overview}"
+                );
+            } else {
+                assert!(overview.contains("#Ders"), "{w}x{h}:\n{overview}");
+            }
+        }
+
+        // 2. Active 2-Button Review + Speed Focus warning (>6s for Cloze) + Leech [r] button.
+        let reloaded = app.store.flashcard(cards[0].id).unwrap().unwrap();
+        app.anki_session = Some(AnkiSession {
+            subject: "Ders".into(),
+            cards: vec![reloaded],
+            position: 0,
+            revealed: true,
+            shown_at: std::time::Instant::now() - std::time::Duration::from_secs(9),
+            again_count: 0,
+            good_count: 0,
+            tag_filter: None,
+            high_yield_only: false,
+        });
+        let review_tr = render(&app, 100, 30);
+        assert!(review_tr.contains("HIZ ODAĞI!"), "{review_tr}");
+        assert!(review_tr.contains("Hatırlamadım"), "{review_tr}");
+        assert!(review_tr.contains("Hatırladım"), "{review_tr}");
+        assert!(review_tr.contains("[r] AI Onar"), "{review_tr}");
+        assert!(review_tr.contains("ALL-Sentence"), "{review_tr}");
+        // Strictly 2 rating buttons (no Easy / Hard).
+        assert!(!review_tr.contains("[3]"));
+        assert!(!review_tr.contains("[4]"));
+
+        // Switch to English (F4) and verify EN labels.
+        app.key(press(KeyCode::F(4))).unwrap();
+        let review_en = render(&app, 100, 30);
+        assert!(review_en.contains("SPEED FOCUS!"), "{review_en}");
+        assert!(review_en.contains("[r] AI Repair"), "{review_en}");
+
+        // 3. Incubation & Strategy sub-views render cleanly.
+        app.anki_session = None;
+        app.anki_view = AnkiView::Incubation;
+        let inc_en = render(&app, 100, 30);
+        assert!(inc_en.contains("Incubation Queue"), "{inc_en}");
+        app.anki_view = AnkiView::Strategy;
+        let strat_en = render(&app, 100, 30);
+        assert!(strat_en.contains("Strategy Sheet"), "{strat_en}");
     }
 }

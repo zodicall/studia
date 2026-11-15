@@ -3,9 +3,10 @@ use crate::{
     Result, ai,
     bot::{self, JobKind, JobResult, Session},
     coach, config, exam,
+    fsrs_engine::{BinaryRating, Flashcard},
     i18n::Lang,
     invalid, plan, sources,
-    store::{SessionStats, Store, StoredQuestion},
+    store::{ExamTechniqueNote, FlashcardStats, SessionStats, Store, StoredQuestion, TagSummary},
     telegram,
 };
 use chrono::{Days, Local, NaiveDate, Utc};
@@ -20,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const TABS: [&str; 7] = [
+pub const TABS: [&str; 8] = [
     "Sor",
     "Quiz",
     "Tekrar",
@@ -28,10 +29,13 @@ pub const TABS: [&str; 7] = [
     "Bugün",
     "Denemeler",
     "Planla",
+    "Kartlar",
 ];
-pub const TABS_EN: [&str; 7] = ["Ask", "Quiz", "Review", "Stats", "Today", "Exams", "Plan"];
+pub const TABS_EN: [&str; 8] = [
+    "Ask", "Quiz", "Review", "Stats", "Today", "Exams", "Plan", "Cards",
+];
 
-pub fn tabs(lang: Lang) -> [&'static str; 7] {
+pub fn tabs(lang: Lang) -> [&'static str; 8] {
     match lang {
         Lang::Tr => TABS,
         Lang::En => TABS_EN,
@@ -41,6 +45,8 @@ pub fn tabs(lang: Lang) -> [&'static str; 7] {
 pub const DENEME_TAB: usize = 5;
 /// Planla sekmesi: AI ile tartışmalı çalışma planı oluşturma ve taslak önizleme.
 pub const PLAN_TAB: usize = 6;
+/// Kartlar (FSRS Anki) sekmesi: aralıklı tekrar, kuluçka ve sınav tekniği defteri.
+pub const ANKI_TAB: usize = 7;
 /// `✓` ile başlayan başarı bildirimleri bu kadar sonra kaybolur; hatalar bir sonraki tuşa kadar kalır.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 /// Bu süreyi aşan AI işlerinde kullanıcıya uyarı gösterilir.
@@ -64,6 +70,43 @@ pub enum Input {
     LessonChat,
     /// Planla sekmesi sohbeti: AI ile çalışma planı tartışma ve revizyon.
     PlanChat,
+    /// Kartlar sekmesi: AI ile FSRS kartı üretmek için konu [adet].
+    FlashcardTopic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnkiView {
+    Overview,
+    Incubation,
+    Strategy,
+}
+
+/// FSRS 2-buton aktif kart tekrar oturumu (yalnızca bellekte tutulur).
+pub struct AnkiSession {
+    pub subject: String,
+    pub cards: Vec<Flashcard>,
+    pub position: usize,
+    pub revealed: bool,
+    pub shown_at: Instant,
+    pub again_count: usize,
+    pub good_count: usize,
+    pub tag_filter: Option<String>,
+    pub high_yield_only: bool,
+}
+
+impl AnkiSession {
+    pub fn current(&self) -> Option<&Flashcard> {
+        self.cards.get(self.position)
+    }
+
+    pub fn elapsed_secs(&self) -> u64 {
+        self.shown_at.elapsed().as_secs()
+    }
+
+    pub fn speed_focus_exceeded(&self) -> bool {
+        self.current()
+            .is_some_and(|card| self.elapsed_secs() > card.card_type.speed_focus_limit_secs())
+    }
 }
 
 /// Koçun bir turdaki yanıtı. `Waiting`: AI henüz dönmedi.
@@ -176,6 +219,15 @@ fn job_label(kind: &JobKind, lang: Lang) -> &'static str {
             "Generating mock exam (may take a few minutes)",
         ),
         JobKind::Vocab { .. } => lang.pick("Kavram kartları hazırlanıyor", "Preparing flashcards"),
+        JobKind::GenerateFlashcards { .. } => {
+            lang.pick("FSRS kartları üretiliyor", "Generating FSRS cards")
+        }
+        JobKind::CuotibenAnalyze { .. } => {
+            lang.pick("Cuotiben hata analizi yapılıyor", "Analyzing mistake (Cuotiben)")
+        }
+        JobKind::RepairLeech { .. } => {
+            lang.pick("Sülük kart AI ile onarılıyor", "Repairing leech card with AI")
+        }
         JobKind::DenemeCoach { .. } => lang.pick("Koç yanıtlıyor", "Coach is answering"),
         JobKind::GeneratePlan { .. } => {
             lang.pick("Çalışma planı hazırlanıyor", "Generating study plan")
@@ -364,6 +416,25 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Başlık çubuğundaki etkin sağlayıcı/model etiketi.
     pub ai_badge: String,
+    /// Aktif dersin FSRS kart istatistikleri.
+    pub anki_stats: FlashcardStats,
+    /// Aktif dersin hiyerarşik `#Ders::Konu` etiket ağacı.
+    pub anki_tags: Vec<TagSummary>,
+    /// Seçili etiket filtresi (`0` = Tümü, `1..=len` = `anki_tags[idx - 1]`).
+    pub anki_tag_idx: usize,
+    /// Yalnızca yüksek getirili (`is_high_yield`) kartları getir.
+    pub anki_high_yield_only: bool,
+    /// Kartlar sekmesinin alt görünümü.
+    pub anki_view: AnkiView,
+    /// Aktif 2-butonlu FSRS kart tekrar oturumu.
+    pub anki_session: Option<AnkiSession>,
+    /// Kuluçka (onay bekleyen) kartlar.
+    pub anki_incubation: Vec<Flashcard>,
+    pub anki_inc_idx: usize,
+    /// Sınav Tekniği Defteri notları.
+    pub anki_notes: Vec<ExamTechniqueNote>,
+    /// Quiz geri bildiriminde son yanlış cevaplanan `(question_id, chosen_idx)` (Cuotiben için).
+    pub last_wrong_choice: Option<(i64, usize)>,
 }
 
 fn clamp_scroll(current: u16, max: u16, delta: i32) -> u16 {
@@ -486,6 +557,16 @@ impl App {
             lang,
             modal: None,
             ai_badge,
+            anki_stats: FlashcardStats::default(),
+            anki_tags: vec![],
+            anki_tag_idx: 0,
+            anki_high_yield_only: false,
+            anki_view: AnkiView::Overview,
+            anki_session: None,
+            anki_incubation: vec![],
+            anki_inc_idx: 0,
+            anki_notes: vec![],
+            last_wrong_choice: None,
         };
         app.refresh()?;
         Ok(app)
@@ -542,6 +623,7 @@ impl App {
             .format("%Y-%m-%d")
             .to_string();
         self.daily = self.store.daily_accuracy(&since)?;
+        self.load_anki_state()?;
         // The listener denies file sharing on Windows; existence alone is not status.
         self.listener = listener_running(&self.root.join("data/listen.lock"));
         Ok(())
@@ -852,6 +934,7 @@ impl App {
         if self.coach_mode != CoachMode::On
             || self.pending.is_some()
             || self.session.is_some()
+            || self.anki_session.is_some()
             || self.lesson.is_some()
             || self.plan_chat.is_some()
             || self.tab == PLAN_TAB
@@ -1305,6 +1388,69 @@ impl App {
                             .into();
                     }
                     JobResult::PlanChat(_) => {}
+                    JobResult::Flashcards { cards, tag } => {
+                        self.tab = ANKI_TAB;
+                        self.anki_view = AnkiView::Overview;
+                        self.status = match self.lang {
+                            Lang::Tr => format!(
+                                "✓ {} yeni FSRS kartı eklendi ({tag} · Enter ile çalış).",
+                                cards.len()
+                            ),
+                            Lang::En => format!(
+                                "✓ {} new FSRS card(s) added ({tag} · press Enter to study).",
+                                cards.len()
+                            ),
+                        };
+                    }
+                    JobResult::Cuotiben {
+                        route,
+                        cards,
+                        strategy_note: _,
+                        tag,
+                    } => match route {
+                        ai::CuotibenRoute::AnkiCard => {
+                            self.tab = ANKI_TAB;
+                            self.anki_view = AnkiView::Incubation;
+                            self.anki_inc_idx = 0;
+                            self.status = match self.lang {
+                                Lang::Tr => format!(
+                                    "✓ Cuotiben: {} kart Kuluçka havuzuna eklendi ({tag} · [a] onayla).",
+                                    cards.len()
+                                ),
+                                Lang::En => format!(
+                                    "✓ Cuotiben: {} card(s) added to Incubation ({tag} · [a] approve).",
+                                    cards.len()
+                                ),
+                            };
+                        }
+                        ai::CuotibenRoute::StrategySheet => {
+                            self.tab = ANKI_TAB;
+                            self.anki_view = AnkiView::Strategy;
+                            self.status = match self.lang {
+                                Lang::Tr => {
+                                    format!("✓ Sınav Tekniği Defterine kaydedildi: {tag}")
+                                }
+                                Lang::En => format!("✓ Saved to Strategy Sheet: {tag}"),
+                            };
+                        }
+                    },
+                    JobResult::LeechRepaired { card } => {
+                        if let Some(session) = self.anki_session.as_mut()
+                            && let Some(slot) = session.cards.get_mut(session.position)
+                            && slot.id == card.id
+                        {
+                            *slot = *card;
+                            session.revealed = false;
+                            session.shown_at = Instant::now();
+                        }
+                        self.status = self
+                            .lang
+                            .pick(
+                                "✓ Sülük kart AI ile yeni bağlam/ipucuyla onarıldı.",
+                                "✓ Leech card repaired with fresh AI context/hint.",
+                            )
+                            .into();
+                    }
                 }
             }
         }
@@ -1872,6 +2018,7 @@ impl App {
                     self.coach_after_session(&topic, correct, answered);
                 }
                 self.feedback = None;
+                self.last_wrong_choice = None;
                 self.scroll = 0;
                 self.refresh()?;
             }
@@ -2121,6 +2268,27 @@ impl App {
             "kelime" | "cards" => {
                 let (topic, count) = bot::vocab_request_in(args, self.lang)?;
                 self.begin_ai(JobKind::Vocab { topic, count })?;
+            }
+            "kartlar" | "anki" => {
+                self.select_tab(ANKI_TAB)?;
+                self.anki_view = AnkiView::Overview;
+            }
+            "kart" | "flashcards" if args.is_empty() => {
+                self.select_tab(ANKI_TAB)?;
+                self.editing = Some(Input::FlashcardTopic);
+                self.input.clear();
+            }
+            "kart" | "flashcards" => {
+                let (topic, count) = bot::flashcard_request_in(args, self.lang)?;
+                self.begin_ai(JobKind::GenerateFlashcards { topic, count })?;
+            }
+            "kulucka" | "incubation" => {
+                self.select_tab(ANKI_TAB)?;
+                self.anki_view = AnkiView::Incubation;
+            }
+            "strateji" | "strategy" => {
+                self.select_tab(ANKI_TAB)?;
+                self.anki_view = AnkiView::Strategy;
             }
             "deneme" | "exam" => {
                 let subject = self.subject()?;
@@ -2452,6 +2620,15 @@ impl App {
             Input::DenemeChat => self.send_deneme_chat(ai_generate(&self.root))?,
             Input::LessonChat => self.send_lesson_chat(ai_generate(&self.root))?,
             Input::PlanChat => self.send_plan_chat(ai_generate(&self.root))?,
+            Input::FlashcardTopic => {
+                let text = self.input.trim().to_string();
+                self.input.clear();
+                self.editing = None;
+                if !text.is_empty() {
+                    let (topic, count) = bot::flashcard_request_in(&text, self.lang)?;
+                    self.begin_ai(JobKind::GenerateFlashcards { topic, count })?;
+                }
+            }
         }
         Ok(())
     }
@@ -2469,8 +2646,227 @@ impl App {
             self.editing = Some(Input::LessonChat);
         } else if tab == PLAN_TAB && self.plan_chat.is_some() {
             self.editing = Some(Input::PlanChat);
+        } else if tab == ANKI_TAB {
+            self.load_anki_state()?;
         }
         Ok(())
+    }
+
+    fn selected_anki_tag(&self) -> Option<String> {
+        if self.anki_tag_idx == 0 {
+            None
+        } else {
+            self.anki_tags
+                .get(self.anki_tag_idx - 1)
+                .map(|t| t.tag.clone())
+        }
+    }
+
+    fn load_anki_state(&mut self) -> Result<()> {
+        let Some(subject) = self.subjects.get(self.selected).map(|s| s.name.clone()) else {
+            self.anki_stats = FlashcardStats::default();
+            self.anki_tags.clear();
+            self.anki_tag_idx = 0;
+            self.anki_incubation.clear();
+            self.anki_inc_idx = 0;
+            self.anki_notes.clear();
+            return Ok(());
+        };
+        let now = Utc::now();
+        self.anki_stats = self.store.flashcard_stats(&subject, now)?;
+        self.anki_tags = self.store.flashcard_tag_tree(&subject, now)?;
+        self.anki_tag_idx = self.anki_tag_idx.min(self.anki_tags.len());
+        self.anki_incubation = self.store.incubation_cards(&subject)?;
+        self.anki_inc_idx = self
+            .anki_inc_idx
+            .min(self.anki_incubation.len().saturating_sub(1));
+        self.anki_notes = self.store.exam_technique_notes(&subject, 30)?;
+        Ok(())
+    }
+
+    fn start_anki_review(&mut self) -> Result<()> {
+        let subject = self.subject()?;
+        let tag = self.selected_anki_tag();
+        let queue = self.store.due_flashcards_queue(
+            &subject,
+            tag.as_deref(),
+            self.anki_high_yield_only,
+            Utc::now(),
+        )?;
+        if queue.cards.is_empty() {
+            self.status = if queue.backlog_paused {
+                self.lang
+                    .pick(
+                        "Tekrar edilecek kart yok (150+ yığılma koruması aktif).",
+                        "No due flashcards (150+ backlog protection active).",
+                    )
+                    .into()
+            } else {
+                self.lang
+                    .pick(
+                        "Şu an çalışılacak FSRS kartı yok. n ile yeni kart üretebilirsin.",
+                        "No FSRS flashcards due right now. Press n to generate cards.",
+                    )
+                    .into()
+            };
+            return Ok(());
+        }
+        self.anki_session = Some(AnkiSession {
+            subject,
+            cards: queue.cards,
+            position: 0,
+            revealed: false,
+            shown_at: Instant::now(),
+            again_count: 0,
+            good_count: 0,
+            tag_filter: tag,
+            high_yield_only: self.anki_high_yield_only,
+        });
+        self.scroll = 0;
+        Ok(())
+    }
+
+    fn rate_anki_card(&mut self, rating: BinaryRating) -> Result<()> {
+        let Some(mut session) = self.anki_session.take() else {
+            return Ok(());
+        };
+        let Some(card) = session.current().cloned() else {
+            return Ok(());
+        };
+        let duration_ms = session.shown_at.elapsed().as_millis().min(600_000) as i64;
+        let outcome = self
+            .store
+            .record_flashcard_review(card.id, rating, duration_ms, Utc::now())?;
+        match rating {
+            BinaryRating::Again => session.again_count += 1,
+            BinaryRating::Good => session.good_count += 1,
+        }
+        if outcome.became_leech {
+            self.status = self
+                .lang
+                .pick(
+                    "⚠ Kart 3. kez unutuldu (Sülük Kart)! AI ile onarmak için geri gelip [r] basabilirsin.",
+                    "⚠ Card lapsed 3x (Leech)! You can repair it with AI using [r].",
+                )
+                .into();
+        }
+        if rating == BinaryRating::Again && outcome.updated.due <= Utc::now() {
+            session.cards.push(outcome.updated);
+        }
+        session.position += 1;
+        if session.position >= session.cards.len() {
+            let total = session.again_count + session.good_count;
+            self.status = match self.lang {
+                Lang::Tr => format!(
+                    "✓ FSRS oturumu bitti: {total} kart (Hatırladım {}, Hatırlamadım {}).",
+                    session.good_count, session.again_count
+                ),
+                Lang::En => format!(
+                    "✓ FSRS session done: {total} card(s) (Good {}, Again {}).",
+                    session.good_count, session.again_count
+                ),
+            };
+            self.refresh()?;
+            return Ok(());
+        }
+        session.revealed = false;
+        session.shown_at = Instant::now();
+        self.anki_session = Some(session);
+        self.scroll = 0;
+        self.refresh()
+    }
+
+    fn repair_current_leech(&mut self) -> Result<()> {
+        let Some(card) = self
+            .anki_session
+            .as_ref()
+            .and_then(|s| s.current())
+            .filter(|c| c.is_leech)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.begin_ai(JobKind::RepairLeech { card_id: card.id })
+    }
+
+    fn export_anki_cards(&mut self) -> Result<()> {
+        let subject = self.subject()?;
+        let tag = self.selected_anki_tag();
+        let cards = self.store.active_flashcards(&subject, tag.as_deref())?;
+        if cards.is_empty() {
+            self.status = self
+                .lang
+                .pick("Dışa aktarılacak aktif FSRS kartı yok.", "No active FSRS cards to export.")
+                .into();
+            return Ok(());
+        }
+        let export_topic = tag.as_deref().unwrap_or(&subject);
+        let path =
+            bot::write_anki_flashcards_in(&self.root, &subject, export_topic, &cards, self.lang)?;
+        self.status = match self.lang {
+            Lang::Tr => format!("✓ {} kart Anki'ye aktarıldı: {}", cards.len(), path.display()),
+            Lang::En => format!("✓ Exported {} card(s) to Anki: {}", cards.len(), path.display()),
+        };
+        Ok(())
+    }
+
+    fn approve_incubation(&mut self) -> Result<()> {
+        let Some(card) = self.anki_incubation.get(self.anki_inc_idx).cloned() else {
+            return Ok(());
+        };
+        self.store.approve_incubation_card(card.id, Utc::now())?;
+        self.status = self
+            .lang
+            .pick(
+                "✓ Kuluçka kartı aktif FSRS havuzuna onaylandı.",
+                "✓ Incubation card approved into active FSRS pool.",
+            )
+            .into();
+        self.refresh()
+    }
+
+    fn reject_incubation(&mut self) -> Result<()> {
+        let Some(card) = self.anki_incubation.get(self.anki_inc_idx).cloned() else {
+            return Ok(());
+        };
+        self.store.reject_incubation_card(card.id)?;
+        self.status = self
+            .lang
+            .pick("✓ Kuluçka kartı silindi.", "✓ Incubation card deleted.")
+            .into();
+        self.refresh()
+    }
+
+    fn trigger_cuotiben_quiz(&mut self) -> Result<()> {
+        let Some((question_id, chosen)) = self.last_wrong_choice else {
+            return Ok(());
+        };
+        self.begin_ai(JobKind::CuotibenAnalyze {
+            question_id,
+            chosen,
+        })
+    }
+
+    fn trigger_cuotiben_deneme(&mut self) -> Result<()> {
+        let Some(wrong) = self
+            .deneme_chat
+            .as_ref()
+            .and_then(|chat| chat.focus.and_then(|idx| chat.wrongs.get(idx)))
+        else {
+            self.status = self
+                .lang
+                .pick(
+                    "Önce Tab ile yanlış sorulardan birine odaklanın.",
+                    "First focus a wrong question with Tab.",
+                )
+                .into();
+            return Ok(());
+        };
+        self.editing = None;
+        self.begin_ai(JobKind::CuotibenAnalyze {
+            question_id: wrong.question.id,
+            chosen: wrong.chosen,
+        })
     }
 
     fn load_denemeler(&mut self) -> Result<()> {
@@ -3160,6 +3556,9 @@ impl App {
                 KeyCode::Char('n') if control && input == Input::PlanChat => {
                     self.reset_plan_studio(ai_generate(&self.root))?;
                 }
+                KeyCode::Char('f') if control && input == Input::DenemeChat => {
+                    self.trigger_cuotiben_deneme()?;
+                }
                 KeyCode::Esc => {
                     self.input.clear();
                     self.editing = None;
@@ -3244,16 +3643,160 @@ impl App {
                 .get(session.position)
                 .is_some_and(|question| choice < question.value.choices.len())
         {
+            let current_q = session.questions.get(session.position).cloned();
             let feedback = session.answer_in(&mut self.store, choice, self.lang)?;
+            self.last_wrong_choice = current_q
+                .filter(|q| choice != q.value.answer_index)
+                .map(|q| (q.id, choice));
             self.feedback = Some(feedback);
             self.scroll = 0;
             self.refresh()?;
             return Ok(());
         }
+        if self.tab == self.session_tab
+            && self.feedback.is_some()
+            && self.last_wrong_choice.is_some()
+            && key.code == KeyCode::Char('c')
+        {
+            return self.trigger_cuotiben_quiz();
+        }
+        if self.tab == ANKI_TAB {
+            if let Some(session) = self.anki_session.as_mut() {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.anki_session = None;
+                        self.scroll = 0;
+                        return Ok(());
+                    }
+                    KeyCode::Char(' ') | KeyCode::Enter if !session.revealed => {
+                        session.revealed = true;
+                        self.scroll = 0;
+                        return Ok(());
+                    }
+                    KeyCode::Char('1') if session.revealed => {
+                        return self.rate_anki_card(BinaryRating::Again);
+                    }
+                    KeyCode::Char('2') if session.revealed => {
+                        return self.rate_anki_card(BinaryRating::Good);
+                    }
+                    KeyCode::Char('r')
+                        if session.revealed
+                            && session.current().is_some_and(|c| c.is_leech) =>
+                    {
+                        return self.repair_current_leech();
+                    }
+                    KeyCode::Up => {
+                        self.scroll = self.scroll.saturating_sub(1);
+                        return Ok(());
+                    }
+                    KeyCode::Down => {
+                        self.scroll = self.scroll.saturating_add(1);
+                        return Ok(());
+                    }
+                    KeyCode::PageUp => {
+                        self.scroll = self.scroll.saturating_sub(10);
+                        return Ok(());
+                    }
+                    KeyCode::PageDown => {
+                        self.scroll = self.scroll.saturating_add(10);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('b') if self.anki_view != AnkiView::Overview => {
+                        self.anki_view = AnkiView::Overview;
+                        self.scroll = 0;
+                        return Ok(());
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ')
+                        if self.anki_view == AnkiView::Overview =>
+                    {
+                        return self.start_anki_review();
+                    }
+                    KeyCode::Char('n') if self.anki_view == AnkiView::Overview => {
+                        self.editing = Some(Input::FlashcardTopic);
+                        self.input.clear();
+                        return Ok(());
+                    }
+                    KeyCode::Char('h') if self.anki_view == AnkiView::Overview => {
+                        self.anki_high_yield_only = !self.anki_high_yield_only;
+                        self.status = if self.anki_high_yield_only {
+                            self.lang.pick(
+                                "✓ Yalnızca Yüksek Getirili (High-Yield) kartlar süzülüyor.",
+                                "✓ Filtering High-Yield cards only.",
+                            )
+                        } else {
+                            self.lang
+                                .pick("✓ Tüm kartlar gösteriliyor.", "✓ Showing all cards.")
+                        }
+                        .into();
+                        return Ok(());
+                    }
+                    KeyCode::Char('k') if self.anki_view == AnkiView::Overview => {
+                        self.anki_view = AnkiView::Incubation;
+                        self.anki_inc_idx = 0;
+                        self.scroll = 0;
+                        return Ok(());
+                    }
+                    KeyCode::Char('s') if self.anki_view == AnkiView::Overview => {
+                        self.anki_view = AnkiView::Strategy;
+                        self.scroll = 0;
+                        return Ok(());
+                    }
+                    KeyCode::Char('x') if self.anki_view == AnkiView::Overview => {
+                        return self.export_anki_cards();
+                    }
+                    KeyCode::Left | KeyCode::Char('t')
+                        if self.anki_view == AnkiView::Overview && !self.anki_tags.is_empty() =>
+                    {
+                        let len = self.anki_tags.len() + 1;
+                        self.anki_tag_idx = if key.code == KeyCode::Left {
+                            (self.anki_tag_idx + len - 1) % len
+                        } else {
+                            (self.anki_tag_idx + 1) % len
+                        };
+                        return Ok(());
+                    }
+                    KeyCode::Right
+                        if self.anki_view == AnkiView::Overview && !self.anki_tags.is_empty() =>
+                    {
+                        let len = self.anki_tags.len() + 1;
+                        self.anki_tag_idx = (self.anki_tag_idx + 1) % len;
+                        return Ok(());
+                    }
+                    KeyCode::Left | KeyCode::Right
+                        if self.anki_view == AnkiView::Incubation
+                            && !self.anki_incubation.is_empty() =>
+                    {
+                        let len = self.anki_incubation.len();
+                        self.anki_inc_idx = if key.code == KeyCode::Left {
+                            (self.anki_inc_idx + len - 1) % len
+                        } else {
+                            (self.anki_inc_idx + 1) % len
+                        };
+                        self.scroll = 0;
+                        return Ok(());
+                    }
+                    KeyCode::Char('a') | KeyCode::Enter
+                        if self.anki_view == AnkiView::Incubation =>
+                    {
+                        return self.approve_incubation();
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('d') | KeyCode::Delete
+                        if self.anki_view == AnkiView::Incubation =>
+                    {
+                        return self.reject_incubation();
+                    }
+                    _ => {}
+                }
+            }
+        }
         match key.code {
             KeyCode::Tab => self.select_tab((self.tab + 1) % TABS.len())?,
             KeyCode::BackTab => self.select_tab((self.tab + TABS.len() - 1) % TABS.len())?,
-            KeyCode::Char(ch @ '1'..='7') => self.select_tab((ch as u8 - b'1') as usize)?,
+            KeyCode::Char(ch @ '1'..='8') => self.select_tab((ch as u8 - b'1') as usize)?,
             KeyCode::Up | KeyCode::Down
                 if self.tab == DENEME_TAB && !self.deneme_items.is_empty() =>
             {
@@ -3323,6 +3866,10 @@ impl App {
                 self.deneme_chat = None;
                 self.plan_chat = None;
                 self.lesson = None;
+                self.anki_session = None;
+                self.anki_tag_idx = 0;
+                self.anki_inc_idx = 0;
+                self.anki_view = AnkiView::Overview;
                 self.refresh()?;
             }
             KeyCode::Char('r') => self.begin_index()?,
@@ -4443,7 +4990,11 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, PLAN_TAB);
         key(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, ANKI_TAB);
+        key(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, 0);
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, ANKI_TAB);
         key(&mut app, KeyCode::BackTab);
         assert_eq!(app.tab, PLAN_TAB);
         key(&mut app, KeyCode::BackTab);
@@ -5592,5 +6143,106 @@ mod tests {
         assert_eq!(app.scroll, 12);
         app.mouse(scroll_up);
         assert_eq!(app.scroll, 9);
+    }
+
+    #[test]
+    fn tui_anki_tab_fsrs_2button_review_cuotiben_incubation_strategy_and_leech() {
+        let (root, mut app) = setup();
+        // Add an incubation card & an active card & a strategy note.
+        let active = app
+            .store
+            .add_flashcards(
+                vec![crate::store::NewFlashcard {
+                    subject: "Ders".into(),
+                    tag: "#Ders::Gramer::Modals".into(),
+                    status: crate::fsrs_engine::CardStatus::Active,
+                    card_type: crate::fsrs_engine::CardKind::Cloze,
+                    context_prefix: "[YDS - Modals]".into(),
+                    front: "{{c1::Must have V3}} geçmişe dair güçlü çıkarım bildirir.".into(),
+                    back: "**Must have V3** — güçlü **geçmiş çıkarımı**".into(),
+                    extra_context: "Should have V3 ise pişmanlık bildirir.".into(),
+                    mnemonic_hint: None,
+                    is_high_yield: true,
+                    source_question_id: None,
+                }],
+                Utc::now(),
+            )
+            .unwrap();
+        let inc = app
+            .store
+            .add_flashcards(
+                vec![crate::store::NewFlashcard {
+                    subject: "Ders".into(),
+                    tag: "#Ders::Baglac::Sebep".into(),
+                    status: crate::fsrs_engine::CardStatus::Incubation,
+                    card_type: crate::fsrs_engine::CardKind::Qa,
+                    context_prefix: "[YDS - Sebep]".into(),
+                    front: "Owing to neden isim öbeği alır?".into(),
+                    back: "Edat kökenli (**to**) olduğu için **isim** alır.".into(),
+                    extra_context: "Because ise bağlaçtır, cümle alır.".into(),
+                    mnemonic_hint: None,
+                    is_high_yield: false,
+                    source_question_id: None,
+                }],
+                Utc::now(),
+            )
+            .unwrap();
+        app.store
+            .add_exam_technique_note(
+                "Ders",
+                None,
+                "#Ders::Teknik::Dikkat",
+                "Soru kökündeki NOT kelimesini atlama.",
+                Utc::now(),
+            )
+            .unwrap();
+        app.refresh().unwrap();
+
+        // Tab 8 ('8') opens Kartlar (ANKI_TAB).
+        key(&mut app, KeyCode::Char('8'));
+        assert_eq!(app.tab, ANKI_TAB);
+        assert_eq!(app.anki_stats.total_active, 1);
+        assert_eq!(app.anki_stats.incubation_count, 1);
+        assert_eq!(app.anki_stats.strategy_notes_count, 1);
+
+        // Incubation sub-view: [k] -> [a] approves incubation card into active pool.
+        key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.anki_view, AnkiView::Incubation);
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.anki_incubation.len(), 0);
+        assert_eq!(app.anki_stats.total_active, 2);
+        assert_eq!(
+            app.store.flashcard(inc[0].id).unwrap().unwrap().status,
+            crate::fsrs_engine::CardStatus::Active
+        );
+
+        // Back to Overview [Esc], export Anki .txt [x].
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.anki_view, AnkiView::Overview);
+        key(&mut app, KeyCode::Char('x'));
+        assert!(app.status.contains("✓"));
+        assert!(root.path().join("anki").exists());
+
+        // Start 2-button FSRS review [Enter] -> [Space] reveal -> [2] Good -> [1] Again.
+        key(&mut app, KeyCode::Enter);
+        assert!(app.anki_session.is_some());
+        assert!(!app.anki_session.as_ref().unwrap().revealed);
+        key(&mut app, KeyCode::Char(' '));
+        assert!(app.anki_session.as_ref().unwrap().revealed);
+        key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.store.flashcard(active[0].id).unwrap().unwrap().reps, 1);
+        assert!(app.anki_session.is_some());
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('1'));
+        // Card with Again returns to intraday queue -> press Esc to exit.
+        if app.anki_session.is_some() {
+            key(&mut app, KeyCode::Esc);
+        }
+        assert!(app.anki_session.is_none());
+
+        // Strategy Sheet sub-view [s].
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.anki_view, AnkiView::Strategy);
+        assert_eq!(app.anki_notes.len(), 1);
     }
 }

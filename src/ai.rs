@@ -2,6 +2,7 @@ use crate::{
     Result,
     config::{self, AiConfig, AiEffort, AiProvider, SENSITIVE_ENV_VARS},
     course::{CourseConfig, DayConfig, TaskConfig},
+    fsrs_engine::{self, CardKind, Flashcard},
     i18n::Lang,
     invalid, telegram,
 };
@@ -949,6 +950,303 @@ pub fn anki_tsv(topic_tag: &str, cards: &[Card]) -> String {
     anki_tsv_for("", topic_tag, cards)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CuotibenRoute {
+    AnkiCard,
+    StrategySheet,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiFlashcardItem {
+    pub card_type: String,
+    pub context_prefix: String,
+    pub front: String,
+    pub back: String,
+    pub extra_context: String,
+    pub mnemonic_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CuotibenPayload {
+    pub route: CuotibenRoute,
+    pub hierarchical_tag: String,
+    pub is_high_yield: bool,
+    pub strategy_note: Option<String>,
+    pub cards: Vec<AiFlashcardItem>,
+}
+
+fn cuotiben_card_item_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "card_type": { "type": "string", "enum": ["qa", "cloze", "contrastive"] },
+            "context_prefix": { "type": "string", "minLength": 1 },
+            "front": { "type": "string", "minLength": 1 },
+            "back": { "type": "string", "minLength": 1 },
+            "extra_context": { "type": "string" },
+            "mnemonic_hint": { "type": ["string", "null"] }
+        },
+        "required": ["card_type", "context_prefix", "front", "back", "extra_context", "mnemonic_hint"]
+    })
+}
+
+fn cuotiben_schema_with_cards(
+    routes: &[&str],
+    min_cards: usize,
+    max_cards: Option<usize>,
+) -> String {
+    let mut cards_schema = json!({
+        "type": "array",
+        "minItems": min_cards,
+        "items": cuotiben_card_item_schema()
+    });
+    if let Some(max) = max_cards {
+        cards_schema["maxItems"] = json!(max);
+    }
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "route": { "type": "string", "enum": routes },
+            "hierarchical_tag": { "type": "string", "minLength": 1 },
+            "is_high_yield": { "type": "boolean" },
+            "strategy_note": { "type": ["string", "null"] },
+            "cards": cards_schema
+        },
+        "required": ["route", "hierarchical_tag", "is_high_yield", "strategy_note", "cards"]
+    })
+    .to_string()
+}
+
+pub fn cuotiben_schema() -> String {
+    cuotiben_schema_with_cards(&["anki_card", "strategy_sheet"], 0, Some(3))
+}
+
+pub fn flashcards_topic_schema(count: usize) -> String {
+    cuotiben_schema_with_cards(&["anki_card"], count, Some(count))
+}
+
+pub fn leech_repair_schema() -> String {
+    cuotiben_schema_with_cards(&["anki_card"], 1, Some(1))
+}
+
+pub fn parse_cuotiben_payload(raw: &str) -> Result<CuotibenPayload> {
+    let cleaned = strip_code_fence(raw);
+    let mut payload: CuotibenPayload = serde_json::from_str(cleaned)
+        .map_err(|_| invalid("AI geçerli Cuotiben/Anki JSON üretmedi / AI returned invalid Anki JSON."))?;
+    payload.hierarchical_tag = crate::store::normalize_tag(&payload.hierarchical_tag);
+    match payload.route {
+        CuotibenRoute::StrategySheet => {
+            let note = payload
+                .strategy_note
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| invalid("AI strateji notu boş / AI strategy_note is empty."))?
+                .to_string();
+            payload.strategy_note = Some(note);
+            payload.cards.clear();
+        }
+        CuotibenRoute::AnkiCard => {
+            if payload.cards.is_empty() {
+                return Err(invalid("AI hiç kart üretmedi / AI returned no flashcards."));
+            }
+            for card in &mut payload.cards {
+                CardKind::parse(&card.card_type)?;
+                card.context_prefix = card.context_prefix.trim().to_string();
+                card.front = card.front.trim().to_string();
+                card.back = card.back.trim().to_string();
+                card.extra_context = card.extra_context.trim().to_string();
+                card.mnemonic_hint = card
+                    .mnemonic_hint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                if card.context_prefix.is_empty()
+                    || card.front.is_empty()
+                    || card.back.is_empty()
+                {
+                    return Err(invalid(
+                        "AI boş ön/arka yüzlü kart üretti / AI generated an incomplete flashcard.",
+                    ));
+                }
+            }
+            payload.strategy_note = None;
+        }
+    }
+    Ok(payload)
+}
+
+const FSRS_ENGINEER_RULES_TR: &str = "\
+Sen bilişsel psikoloji, Dr. Piotr Wozniak'ın 'Minimum Bilgi İlkesi' ve Andy Matuschak'ın istem (prompt) tasarım kurallarına göre çalışan uzman bir Aralıklı Tekrar (Anki) Mühendisisin.\n\
+KURALLAR:\n\
+1) ATOMİK KART & TEK NEFES TESTİ (< 5 SANİYE): Tek kartta asla birden fazla olgu veya uzun liste koyma. Arka yüz (back) yüksek sesle okunduğunda 5 saniyenin altında (en fazla 12-15 kelime) olmalıdır. En kritik 2 veya 3 anahtar kelimeyi **kalın** (bold) yaz.\n\
+2) BELLEK GİRİŞİMİNİ ÖNLEME: Yetim zamir ('Bunun nedeni nedir?') kullanma; her kart tek başına tam anlaşılır olsun. context_prefix alanında köşeli parantez içinde kısa bağlam etiketi ver (örn: '[YDS - Bağlaçlar]'). İki kavram sık karışıyorsa card_type='contrastive' ile ikisini karşılaştır.\n\
+3) BİLİŞSEL GÖREVE GÖRE KART TÜRÜ: Kesin olgu/tanım/kalıp için 'cloze' (front içinde {{c1::cevap}} biçimi; cümle cevabı ele vermesin); kavramsal 'Neden?/Hangi mekanizmayla?' için 'qa'; karışan iki kavram için 'contrastive' seç.\n\
+4) ETİKET: hierarchical_tag alanını '#Ders::Konu::AltKonu' biçiminde ver; sınavlarda sık çıkan yüksek getirili bilgilerde is_high_yield=true yap.\n\
+5) Yalnızca geçerli JSON döndür.";
+
+const FSRS_ENGINEER_RULES_EN: &str = "\
+You are an expert Spaced Repetition (Anki) Engineer following cognitive psychology, Piotr Wozniak's Minimum Information Principle, and Andy Matuschak's prompt design rules.\n\
+RULES:\n\
+1) ATOMIC CARD & SINGLE-BREATH TEST (< 5 SECONDS): Never put multiple facts or unordered lists on one card. The back must be speakable in under 5 seconds (max 12-15 words) with the 2-3 most critical keywords wrapped in **bold**.\n\
+2) PREVENT INTERFERENCE: Never use orphan pronouns ('Why does this happen?'). Every card must be self-contained. Provide a short bracketed context_prefix (e.g., '[Biology - Cell]'). If two concepts are easily confused, use card_type='contrastive'.\n\
+3) CARD TYPE BY COGNITIVE TASK: Use 'cloze' (with {{c1::answer}} inside front, avoiding giveaway phrasing) for exact facts/definitions/patterns; 'qa' for conceptual 'Why/How' mechanisms; 'contrastive' for confusable pairs.\n\
+4) TAGGING: Format hierarchical_tag as '#Course::Topic::Subtopic' and set is_high_yield=true for high-frequency exam concepts.\n\
+5) Return valid JSON only.";
+
+pub fn flashcards_topic_request(
+    course: &CourseConfig,
+    topic: &str,
+    count: usize,
+    lang: Lang,
+) -> String {
+    let title = course.display_title("Course");
+    match lang {
+        Lang::Tr => format!(
+            "{FSRS_ENGINEER_RULES_TR}\n\n\
+            GÖREV: '{title}' dersi '{topic}' konusu için tam {count} adet atomik FSRS kartı üret.\n\
+            route='anki_card', strategy_note=null olsun; cards dizisinde tam {count} benzersiz kart yer alsın."
+        ),
+        Lang::En => format!(
+            "{FSRS_ENGINEER_RULES_EN}\n\n\
+            TASK: Generate exactly {count} atomic FSRS flashcards for '{topic}' in '{title}'.\n\
+            Set route='anki_card', strategy_note=null, and return exactly {count} distinct cards."
+        ),
+    }
+}
+
+pub fn cuotiben_mistake_request(
+    course: &CourseConfig,
+    question: &Question,
+    chosen_idx: usize,
+    lang: Lang,
+) -> String {
+    let title = course.display_title("Course");
+    let chosen_text = question
+        .choices
+        .get(chosen_idx)
+        .map(|s| clean_choice(s))
+        .unwrap_or("-");
+    let correct_text = question
+        .choices
+        .get(question.answer_index)
+        .map(|s| clean_choice(s))
+        .unwrap_or("-");
+    let topic = question.topic.as_deref().unwrap_or("Genel");
+    match lang {
+        Lang::Tr => format!(
+            "{FSRS_ENGINEER_RULES_TR}\n\n\
+            CUOTIBEN (HATA DEFTERİ) ANALİZ KURALI:\n\
+            - Eğer öğrenci soruyu KAVRAM/OLGU/KURAL EKSİKLİĞİ yüzünden yanlış yaptıysa route='anki_card' seç ve 1-2 adet kuluçka (incubation) FSRS kartı üret (strategy_note=null).\n\
+            - Eğer hata DİKKAT HATASI, ÖNCÜLÜ/KÖKÜ YANLIŞ OKUMA, ZAMAN YÖNETİMİ veya SINAV TEKNİĞİ hatasıysa ASLA kart üretme (cards=[]); route='strategy_sheet' seç ve strategy_note alanına öğrencinin sonraki sınavda dikkat edeceği net metabilişsel kuralı yaz.\n\n\
+            DERS: {title} | KONU: {topic}\n\
+            SORU: {}\n\
+            ÖĞRENCİNİN YANLIŞ SEÇİMİ: {chosen_text}\n\
+            DOĞRU CEVAP: {correct_text}\n\
+            AÇIKLAMA: {}",
+            question.question, question.explanation
+        ),
+        Lang::En => format!(
+            "{FSRS_ENGINEER_RULES_EN}\n\n\
+            CUOTIBEN (ERROR NOTEBOOK) ROUTING RULE:\n\
+            - If the mistake stems from a KNOWLEDGE/CONCEPT/RULE GAP, choose route='anki_card' and generate 1-2 atomic incubation FSRS cards (strategy_note=null).\n\
+            - If the mistake stems from CARELESS READING, MISREADING NEGATIVES/CONSTRAINTS, TIME PRESSURE, or EXAM TECHNIQUE, NEVER create flashcards (cards=[]); choose route='strategy_sheet' and write a concrete metacognitive rule in strategy_note.\n\n\
+            COURSE: {title} | TOPIC: {topic}\n\
+            QUESTION: {}\n\
+            STUDENT CHOICE: {chosen_text}\n\
+            CORRECT ANSWER: {correct_text}\n\
+            EXPLANATION: {}",
+            question.question, question.explanation
+        ),
+    }
+}
+
+pub fn leech_repair_request(course: &CourseConfig, card: &Flashcard, lang: Lang) -> String {
+    let title = course.display_title("Course");
+    let mnemonic = card.mnemonic_hint.as_deref().unwrap_or("yok");
+    match lang {
+        Lang::Tr => format!(
+            "{FSRS_ENGINEER_RULES_TR}\n\n\
+            SÜLÜK KART (LEECH) ONARIM GÖREVİ:\n\
+            Bu kart öğrenci tarafından {lapses} kez unutuldu (is_leech=true). Mevcut anlatım hafızada tutunmuyor.\n\
+            Kartı AYNI KAVRAMI ölçen ama tamamen YENİ, akılda kalıcı bir örnek senaryoyla ('qa'/'cloze') VEYA karıştırılan kavramla kıyaslayan 'contrastive' soruyla yeniden yaz.\n\
+            Mutlaka güçlü bir çift kodlama / Bellek Sarayı (Loci) / etimoloji ipucunu mnemonic_hint alanında ver.\n\
+            route='anki_card', strategy_note=null, cards dizisinde tam 1 kart döndür.\n\n\
+            DERS: {title} | ETİKET: {}\n\
+            MEVCUT ÖN YÜZ: {}\n\
+            MEVCUT ARKA YÜZ: {}\n\
+            MEVCUT EK BAĞLAM: {}\n\
+            MEVCUT İPUCU: {mnemonic}",
+            card.tag,
+            card.front,
+            card.back,
+            card.extra_context,
+            lapses = card.lapses
+        ),
+        Lang::En => format!(
+            "{FSRS_ENGINEER_RULES_EN}\n\n\
+            LEECH CARD REPAIR TASK:\n\
+            The student has lapsed on this card {lapses} times (is_leech=true). The current phrasing fails to stick.\n\
+            Rewrite the card using EITHER a fresh memorable real-world scenario ('qa'/'cloze') OR a 'contrastive' comparison against its commonly confused twin.\n\
+            Provide a vivid dual-coding / Method-of-Loci / etymology cue in mnemonic_hint.\n\
+            Set route='anki_card', strategy_note=null, and return exactly 1 card.\n\n\
+            COURSE: {title} | TAG: {}\n\
+            CURRENT FRONT: {}\n\
+            CURRENT BACK: {}\n\
+            CURRENT EXTRA CONTEXT: {}\n\
+            CURRENT MNEMONIC: {mnemonic}",
+            card.tag,
+            card.front,
+            card.back,
+            card.extra_context,
+            lapses = card.lapses
+        ),
+    }
+}
+
+/// Export active FSRS flashcards to Anki-importable tab-separated text (`anki/*.txt`).
+pub fn flashcards_to_anki_tsv(subject: &str, cards: &[Flashcard]) -> String {
+    let subj = subject.trim();
+    let mut out = String::from("#separator:tab\n#html:true\n#tags column:3\n");
+    for card in cards {
+        let front = match card.card_type {
+            CardKind::Cloze => format!(
+                "{} {}",
+                anki_field(&card.context_prefix),
+                anki_field(&fsrs_engine::format_cloze_front(&card.front))
+            ),
+            _ => format!(
+                "{} {}",
+                anki_field(&card.context_prefix),
+                anki_field(&card.front)
+            ),
+        };
+        let mut back = anki_field(&card.back);
+        if !card.extra_context.trim().is_empty() {
+            back.push_str(&format!("<br><br>{}", anki_field(&card.extra_context)));
+        }
+        if let Some(hint) = card.mnemonic_hint.as_deref().filter(|s| !s.trim().is_empty()) {
+            back.push_str(&format!(
+                "<br><span style=\"color:gray\">💡 {}</span>",
+                anki_field(hint)
+            ));
+        }
+        let tag = if subj.is_empty() {
+            card.tag.replace('#', "")
+        } else {
+            format!("{subj} {}", card.tag.replace('#', ""))
+        };
+        out.push_str(&format!("{front}\t{back}\t{}\n", anki_field(&tag)));
+    }
+    out
+}
+
 pub fn parse_answer(raw: &str) -> Result<String> {
     let cleaned = strip_code_fence(raw);
     let value: Value = serde_json::from_str(cleaned)?;
@@ -965,7 +1263,9 @@ pub fn valid_for_schema(schema: &str, raw: &str) -> bool {
         return false;
     };
     let props = &schema["properties"];
-    if !props["lesson"].is_null() {
+    if !props["route"].is_null() {
+        parse_cuotiben_payload(raw).is_ok()
+    } else if !props["lesson"].is_null() {
         parse_lesson(raw).is_ok()
     } else if let Some(n) = props["cards"]["minItems"].as_u64() {
         parse_vocab(raw, n as usize).is_ok()
@@ -3223,5 +3523,58 @@ mod tests {
                 .unwrap()
                 .ready
         );
+    }
+
+    #[test]
+    fn cuotiben_payload_parses_both_routes_and_validates_schema() {
+        let anki_raw = r#"```json
+        {
+          "route": "anki_card",
+          "hierarchical_tag": "YDS::Baglac::Zitlik",
+          "is_high_yield": true,
+          "strategy_note": null,
+          "cards": [
+            {
+              "card_type": "contrastive",
+              "context_prefix": "[YDS - Bağlaçlar]",
+              "front": "Although ile Despite yapısal olarak nasıl ayrılır?",
+              "back": "**Although + cümle**, **Despite + isim** alır.",
+              "extra_context": "Despite asla özne+yüklem almaz; cümle için the fact that gerekir.",
+              "mnemonic_hint": "Despite 'D-isim', Although 'All-clause'"
+            }
+          ]
+        }
+        ```"#;
+        let parsed = parse_cuotiben_payload(anki_raw).unwrap();
+        assert_eq!(parsed.route, CuotibenRoute::AnkiCard);
+        assert_eq!(parsed.hierarchical_tag, "#YDS::Baglac::Zitlik");
+        assert!(parsed.is_high_yield);
+        assert_eq!(parsed.cards.len(), 1);
+        assert!(valid_for_schema(&cuotiben_schema(), anki_raw));
+        assert!(valid_for_schema(&flashcards_topic_schema(1), anki_raw));
+        assert!(valid_for_schema(&leech_repair_schema(), anki_raw));
+
+        let strat_raw = r##"{
+          "route": "strategy_sheet",
+          "hierarchical_tag": "#YDS::Okuma::Dikkat",
+          "is_high_yield": false,
+          "strategy_note": "Soru kökündeki NOT/EXCEPT ifadelerinin altını çiz.",
+          "cards": []
+        }"##;
+        let strat = parse_cuotiben_payload(strat_raw).unwrap();
+        assert_eq!(strat.route, CuotibenRoute::StrategySheet);
+        assert!(strat.cards.is_empty());
+        assert!(strat.strategy_note.unwrap().contains("NOT/EXCEPT"));
+        assert!(valid_for_schema(&cuotiben_schema(), strat_raw));
+
+        // Strategy sheet without note must fail
+        let bad_strat = r##"{
+          "route": "strategy_sheet",
+          "hierarchical_tag": "#YDS::Okuma",
+          "is_high_yield": false,
+          "strategy_note": "   ",
+          "cards": []
+        }"##;
+        assert!(parse_cuotiben_payload(bad_strat).is_err());
     }
 }

@@ -4,6 +4,7 @@ mod coach;
 mod config;
 mod course;
 mod exam;
+mod fsrs_engine;
 mod i18n;
 mod plan;
 mod sources;

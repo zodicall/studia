@@ -21,3 +21,4 @@ zip = { version = "7", default-features = false, features = ["deflate"] }
 quick-xml = "0.39"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "unstable-rendered-line-info"] }
 crossterm = "0.29"
+fsrs = "7"

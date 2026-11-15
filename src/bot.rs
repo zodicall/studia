@@ -1,8 +1,9 @@
 use crate::{
     Result, ai, config, course, exam,
+    fsrs_engine::{self, BinaryRating, CardKind, CardStatus, Flashcard},
     i18n::Lang,
     invalid, plan, sources,
-    store::{SessionStats, Store, StoredQuestion},
+    store::{NewFlashcard, SessionStats, Store, StoredQuestion},
     telegram,
 };
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -20,8 +21,8 @@ use std::{
 const MENU: &str = r#"{"keyboard":[[{"text":"📅 Bugün"},{"text":"📖 Konu anlat"}],[{"text":"📝 Quiz"},{"text":"🔁 Tekrar"}],[{"text":"🃏 Kelime"},{"text":"🧪 Deneme"}],[{"text":"📚 Ders Seç"},{"text":"❓ Yardım"}]],"resize_keyboard":true,"is_persistent":true}"#;
 const MENU_EN: &str = r#"{"keyboard":[[{"text":"📅 Today"},{"text":"📖 Explain"}],[{"text":"📝 Quiz"},{"text":"🔁 Review"}],[{"text":"🃏 Cards"},{"text":"🧪 Exam"}],[{"text":"📚 Courses"},{"text":"❓ Help"}]],"resize_keyboard":true,"is_persistent":true}"#;
 
-const COMMANDS: &str = r#"[{"command":"bugun","description":"Bugünün plan görevleri"},{"command":"plan","description":"Plan durumu, /plan baslat veya /plan olustur"},{"command":"anlat","description":"Konu anlatımı + kazanım testi"},{"command":"quiz","description":"Konudan soru üret: /quiz <konu> [n]"},{"command":"tekrar","description":"Zamanı gelen yanlışları tekrar et"},{"command":"kelime","description":"Kavram / kelime destesi: /kelime <konu> [n]"},{"command":"deneme","description":"Deneme sınavı: /deneme [n]"},{"command":"denemeler","description":"Geçmiş deneme puanları"},{"command":"yanlislar","description":"Tekrar sayıları"},{"command":"dersler","description":"Dersler ve ders seçimi"},{"command":"ders","description":"Aktif dersi seç"},{"command":"lang","description":"Dil değiştir: /lang tr|en"},{"command":"iptal","description":"Aktif oturumu bitir"},{"command":"yardim","description":"Menü ve yardım"}]"#;
-const COMMANDS_EN: &str = r#"[{"command":"today","description":"Today's study plan tasks"},{"command":"plan","description":"Plan status, /plan start, or /plan create"},{"command":"explain","description":"Lesson explanation + quick check"},{"command":"quiz","description":"Generate quiz: /quiz <topic> [n]"},{"command":"review","description":"Review due mistakes"},{"command":"cards","description":"Flashcards deck: /cards <topic> [n]"},{"command":"exam","description":"Mock exam: /exam [n]"},{"command":"exams","description":"Past exam scores and breakdown"},{"command":"mistakes","description":"Review counts per course"},{"command":"courses","description":"List and switch courses"},{"command":"course","description":"Select active course"},{"command":"lang","description":"Switch language: /lang tr|en"},{"command":"cancel","description":"Finish active session"},{"command":"help","description":"Menu and help"}]"#;
+const COMMANDS: &str = r#"[{"command":"bugun","description":"Bugünün plan görevleri"},{"command":"plan","description":"Plan durumu, /plan baslat veya /plan olustur"},{"command":"anlat","description":"Konu anlatımı + kazanım testi"},{"command":"quiz","description":"Konudan soru üret: /quiz <konu> [n]"},{"command":"tekrar","description":"Zamanı gelen yanlışları tekrar et"},{"command":"kartlar","description":"FSRS 2-buton akıllı kart tekrarı"},{"command":"kart","description":"FSRS kart üret: /kart <konu> [n]"},{"command":"kulucka","description":"Cuotiben kuluçka kartlarını onayla"},{"command":"strateji","description":"Sınav tekniği defteri notları"},{"command":"kelime","description":"Kavram / kelime destesi: /kelime <konu> [n]"},{"command":"deneme","description":"Deneme sınavı: /deneme [n]"},{"command":"denemeler","description":"Geçmiş deneme puanları"},{"command":"yanlislar","description":"Tekrar sayıları"},{"command":"dersler","description":"Dersler ve ders seçimi"},{"command":"ders","description":"Aktif dersi seç"},{"command":"lang","description":"Dil değiştir: /lang tr|en"},{"command":"iptal","description":"Aktif oturumu bitir"},{"command":"yardim","description":"Menü ve yardım"}]"#;
+const COMMANDS_EN: &str = r#"[{"command":"today","description":"Today's study plan tasks"},{"command":"plan","description":"Plan status, /plan start, or /plan create"},{"command":"explain","description":"Lesson explanation + quick check"},{"command":"quiz","description":"Generate quiz: /quiz <topic> [n]"},{"command":"review","description":"Review due mistakes"},{"command":"anki","description":"FSRS 2-button flashcard review"},{"command":"flashcards","description":"Generate FSRS cards: /flashcards <topic> [n]"},{"command":"incubation","description":"Approve Cuotiben incubation cards"},{"command":"strategy","description":"Exam technique strategy notes"},{"command":"cards","description":"Flashcards deck: /cards <topic> [n]"},{"command":"exam","description":"Mock exam: /exam [n]"},{"command":"exams","description":"Past exam scores and breakdown"},{"command":"mistakes","description":"Review counts per course"},{"command":"courses","description":"List and switch courses"},{"command":"course","description":"Select active course"},{"command":"lang","description":"Switch language: /lang tr|en"},{"command":"cancel","description":"Finish active session"},{"command":"help","description":"Menu and help"}]"#;
 
 pub fn menu_json(lang: Lang) -> &'static str {
     match lang {
@@ -905,6 +906,20 @@ pub enum JobKind {
         history: Vec<(String, String)>,
         draft: Option<Vec<course::DayConfig>>,
     },
+    /// İstenen konuda doğrudan aktif FSRS kartları üretir.
+    GenerateFlashcards {
+        topic: String,
+        count: usize,
+    },
+    /// Cuotiben (Hata Defteri): yanlış soruyu bilgi eksikliği (incubation) veya sınav tekniğine yönlendirir.
+    CuotibenAnalyze {
+        question_id: i64,
+        chosen: usize,
+    },
+    /// Sülük kart (is_leech) dinamik AI onarımı.
+    RepairLeech {
+        card_id: i64,
+    },
 }
 
 pub enum JobResult {
@@ -914,6 +929,19 @@ pub enum JobResult {
     Vocab(Vec<ai::Card>),
     Plan(Vec<course::DayConfig>),
     PlanChat(ai::PlanChatReply),
+    Flashcards {
+        cards: Vec<Flashcard>,
+        tag: String,
+    },
+    Cuotiben {
+        route: ai::CuotibenRoute,
+        cards: Vec<Flashcard>,
+        strategy_note: Option<String>,
+        tag: String,
+    },
+    LeechRepaired {
+        card: Box<Flashcard>,
+    },
 }
 
 impl Session {
@@ -1613,9 +1641,18 @@ pub fn prepare_job_in(
 
     let query = match kind {
         JobKind::Answer { question } => question.clone(),
-        JobKind::Quiz { topic, .. } | JobKind::Lesson { topic } | JobKind::Vocab { topic, .. } => {
-            topic.clone()
-        }
+        JobKind::Quiz { topic, .. }
+        | JobKind::Lesson { topic }
+        | JobKind::Vocab { topic, .. }
+        | JobKind::GenerateFlashcards { topic, .. } => topic.clone(),
+        JobKind::CuotibenAnalyze { question_id, .. } => store
+            .question_by_id(*question_id)?
+            .map(|(_, q)| q.value.topic.unwrap_or(q.value.question))
+            .unwrap_or_else(|| title.to_string()),
+        JobKind::RepairLeech { card_id } => store
+            .flashcard(*card_id)?
+            .map(|c| format!("{} {}", c.tag, c.front))
+            .unwrap_or_else(|| title.to_string()),
         JobKind::LessonChat {
             topic, question, ..
         } => format!("{topic} {question}"),
@@ -1956,6 +1993,28 @@ fn prepare_job_with_query(
             inner_nonce = nonce;
             (plan_prompt, ai::plan_chat_schema())
         }
+        JobKind::GenerateFlashcards { topic, count } => (
+            ai::flashcards_topic_request(course, topic, *count, lang),
+            ai::flashcards_topic_schema(*count),
+        ),
+        JobKind::CuotibenAnalyze { question_id, chosen } => {
+            let (_, q) = store
+                .question_by_id(*question_id)?
+                .ok_or_else(|| invalid(lang.pick("Soru bulunamadı.", "Question not found.")))?;
+            (
+                ai::cuotiben_mistake_request(course, &q.value, *chosen, lang),
+                ai::cuotiben_schema(),
+            )
+        }
+        JobKind::RepairLeech { card_id } => {
+            let card = store
+                .flashcard(*card_id)?
+                .ok_or_else(|| invalid(lang.pick("Kart bulunamadı.", "Card not found.")))?;
+            (
+                ai::leech_repair_request(course, &card, lang),
+                ai::leech_repair_schema(),
+            )
+        }
     };
     let request = if matches!(
         kind,
@@ -1966,6 +2025,9 @@ fn prepare_job_with_query(
             | JobKind::LessonChat { .. }
             | JobKind::GeneratePlan { .. }
             | JobKind::PlanChat { .. }
+            | JobKind::GenerateFlashcards { .. }
+            | JobKind::CuotibenAnalyze { .. }
+            | JobKind::RepairLeech { .. }
     ) {
         request
     } else {
@@ -2043,7 +2105,52 @@ pub fn failure_text_in(kind: &JobKind, lang: Lang) -> &'static str {
         (JobKind::PlanChat { .. }, Lang::En) => {
             "Plan assistant could not reply right now. Please try again shortly."
         }
+        (JobKind::GenerateFlashcards { .. }, Lang::Tr) => {
+            "FSRS kartları hazırlanamadı. Biraz sonra tekrar deneyin."
+        }
+        (JobKind::GenerateFlashcards { .. }, Lang::En) => {
+            "Could not generate FSRS flashcards. Please try again shortly."
+        }
+        (JobKind::CuotibenAnalyze { .. }, Lang::Tr) => {
+            "Hata defteri analizi tamamlanamadı. Biraz sonra tekrar deneyin."
+        }
+        (JobKind::CuotibenAnalyze { .. }, Lang::En) => {
+            "Could not analyze mistake for error notebook. Please try again shortly."
+        }
+        (JobKind::RepairLeech { .. }, Lang::Tr) => {
+            "Sülük kart AI onarımı tamamlanamadı. Biraz sonra tekrar deneyin."
+        }
+        (JobKind::RepairLeech { .. }, Lang::En) => {
+            "Could not repair leech card right now. Please try again shortly."
+        }
     }
+}
+
+fn payload_to_new_cards(
+    subject: &str,
+    payload: &ai::CuotibenPayload,
+    status: CardStatus,
+    source_question_id: Option<i64>,
+) -> Result<Vec<NewFlashcard>> {
+    payload
+        .cards
+        .iter()
+        .map(|item| {
+            Ok(NewFlashcard {
+                subject: subject.to_string(),
+                tag: payload.hierarchical_tag.clone(),
+                status,
+                card_type: CardKind::parse(&item.card_type)?,
+                context_prefix: item.context_prefix.clone(),
+                front: item.front.clone(),
+                back: item.back.clone(),
+                extra_context: item.extra_context.clone(),
+                mnemonic_hint: item.mnemonic_hint.clone(),
+                is_high_yield: payload.is_high_yield,
+                source_question_id,
+            })
+        })
+        .collect()
 }
 
 pub fn save_job_in(
@@ -2090,7 +2197,148 @@ pub fn save_job_in(
         }
         JobKind::GeneratePlan { days, .. } => Ok(JobResult::Plan(ai::parse_plan(raw, *days)?)),
         JobKind::PlanChat { .. } => Ok(JobResult::PlanChat(ai::parse_plan_chat(raw)?)),
+        JobKind::GenerateFlashcards { count, .. } => {
+            let payload = ai::parse_cuotiben_payload(raw)?;
+            if payload.route != ai::CuotibenRoute::AnkiCard || payload.cards.len() != *count {
+                return Err(invalid(lang.pick(
+                    "AI beklenen sayıda FSRS kartı üretmedi.",
+                    "AI did not return the expected number of FSRS flashcards.",
+                )));
+            }
+            let new_cards = payload_to_new_cards(subject, &payload, CardStatus::Active, None)?;
+            let cards = store.add_flashcards(new_cards, Utc::now())?;
+            Ok(JobResult::Flashcards {
+                cards,
+                tag: payload.hierarchical_tag,
+            })
+        }
+        JobKind::CuotibenAnalyze { question_id, .. } => {
+            let payload = ai::parse_cuotiben_payload(raw)?;
+            let now = Utc::now();
+            match payload.route {
+                ai::CuotibenRoute::AnkiCard => {
+                    let new_cards = payload_to_new_cards(
+                        subject,
+                        &payload,
+                        CardStatus::Incubation,
+                        Some(*question_id),
+                    )?;
+                    let cards = store.add_flashcards(new_cards, now)?;
+                    Ok(JobResult::Cuotiben {
+                        route: ai::CuotibenRoute::AnkiCard,
+                        cards,
+                        strategy_note: None,
+                        tag: payload.hierarchical_tag,
+                    })
+                }
+                ai::CuotibenRoute::StrategySheet => {
+                    let note = payload.strategy_note.clone().unwrap_or_default();
+                    store.add_exam_technique_note(
+                        subject,
+                        Some(*question_id),
+                        &payload.hierarchical_tag,
+                        &note,
+                        now,
+                    )?;
+                    Ok(JobResult::Cuotiben {
+                        route: ai::CuotibenRoute::StrategySheet,
+                        cards: vec![],
+                        strategy_note: Some(note),
+                        tag: payload.hierarchical_tag,
+                    })
+                }
+            }
+        }
+        JobKind::RepairLeech { card_id } => {
+            let payload = ai::parse_cuotiben_payload(raw)?;
+            let item = payload.cards.first().ok_or_else(|| {
+                invalid(lang.pick("AI onarım kartı üretmedi.", "AI returned no repair card."))
+            })?;
+            let kind = CardKind::parse(&item.card_type)?;
+            store.apply_leech_repair(
+                *card_id,
+                &crate::store::LeechRepair {
+                    card_type: kind,
+                    context_prefix: &item.context_prefix,
+                    front: &item.front,
+                    back: &item.back,
+                    extra_context: &item.extra_context,
+                    mnemonic_hint: item.mnemonic_hint.as_deref(),
+                },
+            )?;
+            let card = store
+                .flashcard(*card_id)?
+                .ok_or_else(|| invalid(lang.pick("Kart bulunamadı.", "Card not found.")))?;
+            Ok(JobResult::LeechRepaired {
+                card: Box::new(card),
+            })
+        }
     }
+}
+
+pub fn flashcard_request_in(args: &str, lang: Lang) -> Result<(String, usize)> {
+    let args = args.trim();
+    let last = args.split_whitespace().last().unwrap_or("");
+    let numeric = !last.is_empty() && last.bytes().all(|ch| ch.is_ascii_digit());
+    let (topic, count) = if numeric {
+        let count: usize = last.parse().map_err(|_| {
+            invalid(lang.pick(
+                "Kart sayısı 1–30 arasında olmalı.",
+                "Card count must be between 1 and 30.",
+            ))
+        })?;
+        (&args[..args.len() - last.len()], count)
+    } else {
+        (args, 10)
+    };
+    if topic.trim().is_empty() {
+        return Err(invalid(lang.pick(
+            "Kullanım: /kart <konu> [sayı]",
+            "Usage: /flashcards <topic> [count]",
+        )));
+    }
+    if !(1..=30).contains(&count) {
+        return Err(invalid(lang.pick(
+            "Kart sayısı 1–30 arasında olmalı.",
+            "Card count must be between 1 and 30.",
+        )));
+    }
+    Ok((topic.trim().into(), count))
+}
+
+pub fn write_anki_flashcards_in(
+    root: &Path,
+    subject: &str,
+    topic: &str,
+    cards: &[Flashcard],
+    lang: Lang,
+) -> Result<PathBuf> {
+    let mut slug = String::new();
+    for ch in sources::fold_tr(topic).chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug
+        .trim_matches('-')
+        .chars()
+        .take(40)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string();
+    let slug = if slug.is_empty() {
+        lang.pick("fsrs-kartlar", "fsrs-cards").to_string()
+    } else {
+        slug
+    };
+    let path = root.join("anki").join(format!(
+        "{}-{slug}-fsrs.txt",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    config::atomic_write_private(&path, ai::flashcards_to_anki_tsv(subject, cards).as_bytes())?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -2179,6 +2427,16 @@ struct Pending {
     plan_task: Option<(NaiveDate, usize, usize)>,
 }
 
+struct FlashcardSession {
+    subject: String,
+    cards: Vec<Flashcard>,
+    position: usize,
+    shown_at: DateTime<Utc>,
+    message_id: Option<i64>,
+    again_count: usize,
+    good_count: usize,
+}
+
 struct Bot {
     root: PathBuf,
     chat_id: String,
@@ -2186,6 +2444,7 @@ struct Bot {
     default_lang: Lang,
     cli_lang_override: Option<Lang>,
     session: Option<Session>,
+    fc_session: Option<FlashcardSession>,
     pending: Option<Pending>,
     /// `plan_callback` ile başlatılan görev; işe dönüşür ya da komut iş açmadan biterse işaretlenir.
     plan_task: Option<(NaiveDate, usize, usize)>,
@@ -3311,6 +3570,7 @@ impl Bot {
             default_lang,
             cli_lang_override: None,
             session: None,
+            fc_session: None,
             pending: None,
             plan_task: None,
         })
@@ -3559,6 +3819,7 @@ impl Bot {
         })?;
         let parsed = callback["data"].as_str().and_then(callback_data);
         let mut advance = false;
+        let mut wrong_cuotiben: Option<(i64, usize)> = None;
         let text = if let Some((id, choice)) = parsed
             && let Some(session) = self.session.as_mut()
             && session.message_id == Some(message_id)
@@ -3567,9 +3828,13 @@ impl Bot {
                 .get(session.position)
                 .is_some_and(|q| q.id == id)
         {
+            let is_exam = session.is_exam;
             match session.answer(&mut self.store, choice) {
                 Ok(text) => {
                     advance = true;
+                    if !is_exam && !session.answers.last().is_some_and(|(_, ok)| *ok) {
+                        wrong_cuotiben = Some((id, choice));
+                    }
                     text
                 }
                 Err(_) => lang
@@ -3588,7 +3853,14 @@ impl Bot {
                 lang.pick(STALE_BUTTON, STALE_BUTTON_EN)
             )
         };
-        let edited = self.edit(message_id, &text, caller);
+        let cuotiben_markup = wrong_cuotiben.map(|(qid, ch)| {
+            json!({"inline_keyboard": [[{
+                "text": lang.pick("🧪 Hata Defterine Analiz Et (Cuotiben)", "🧪 Analyze Mistake (Cuotiben)"),
+                "callback_data": format!("fc:cuo:{qid}:{ch}")
+            }]]})
+            .to_string()
+        });
+        let edited = self.edit_with_markup(message_id, &text, cuotiben_markup.as_deref(), caller);
         let next = if advance {
             self.next_question(caller)
         } else {
@@ -3597,6 +3869,340 @@ impl Bot {
         acknowledgement?;
         edited?;
         next
+    }
+
+    fn start_flashcard_session(
+        &mut self,
+        subject: &str,
+        tag_prefix: Option<&str>,
+        caller: &mut Caller<'_>,
+    ) -> Result<()> {
+        let lang = self.lang();
+        let now = Utc::now();
+        let queue = self
+            .store
+            .due_flashcards_queue(subject, tag_prefix, false, now)?;
+        if queue.cards.is_empty() {
+            let stats = self.store.flashcard_stats(subject, now)?;
+            let msg = if stats.backlog_paused {
+                lang.pick(
+                    "⚠️ Yığılma Koruması: Birikmiş tekrarlar ≥ 150 olduğu için yeni kartlar duraklatıldı ve bu filtrede bekleyen kart yok.",
+                    "⚠️ Backlog Protection: New cards paused (due reviews ≥ 150) and no cards match this filter.",
+                )
+            } else {
+                lang.pick(
+                    "🧠 Bugün tekrar edilecek FSRS kartı yok. Yeni kart üretmek için: /kart <konu> [sayı]",
+                    "🧠 No FSRS flashcards due right now. Generate new cards with: /flashcards <topic> [count]",
+                )
+            };
+            self.send(msg, None, caller)?;
+            return Ok(());
+        }
+        if queue.backlog_paused {
+            self.send(
+                lang.pick(
+                    "⚠️ **Yığılma Koruması Aktif:** Birikmiş tekrar sayısı ≥ 150; bugün yeni kart açılmıyor.",
+                    "⚠️ **Backlog Protection Active:** Due reviews ≥ 150; new cards are paused today.",
+                ),
+                None,
+                caller,
+            )?;
+        }
+        self.send(
+            &match lang {
+                Lang::Tr => format!(
+                    "🧠 **{subject} FSRS Oturumu** · Öğrenme: {} · Tekrar: {} · Yeni: {} (bugün {}/20)",
+                    queue.due_learning, queue.due_reviews, queue.new_available, queue.new_today
+                ),
+                Lang::En => format!(
+                    "🧠 **{subject} FSRS Session** · Learning: {} · Reviews: {} · New: {} (today {}/20)",
+                    queue.due_learning, queue.due_reviews, queue.new_available, queue.new_today
+                ),
+            },
+            None,
+            caller,
+        )?;
+        self.fc_session = Some(FlashcardSession {
+            subject: subject.into(),
+            cards: queue.cards,
+            position: 0,
+            shown_at: now,
+            message_id: None,
+            again_count: 0,
+            good_count: 0,
+        });
+        self.next_flashcard(caller)
+    }
+
+    fn next_flashcard(&mut self, caller: &mut Caller<'_>) -> Result<()> {
+        let lang = self.lang();
+        let now = Utc::now();
+        let (done, text, keyboard, summary) = {
+            let Some(session) = &mut self.fc_session else {
+                return Ok(());
+            };
+            if session.position >= session.cards.len() {
+                let msg = match lang {
+                    Lang::Tr => format!(
+                        "🎉 **{} · FSRS Kart Oturumu Tamamlandı!**\n✅ Hatırladım: {} · ❌ Hatırlamadım: {}",
+                        session.subject, session.good_count, session.again_count
+                    ),
+                    Lang::En => format!(
+                        "🎉 **{} · FSRS Review Complete!**\n✅ Pass: {} · ❌ Fail: {}",
+                        session.subject, session.good_count, session.again_count
+                    ),
+                };
+                (true, String::new(), String::new(), Some(msg))
+            } else {
+                session.shown_at = now;
+                let card = &session.cards[session.position];
+                let badges = [
+                    card.is_high_yield.then_some("★ HIGH-YIELD"),
+                    card.is_leech.then_some("🩸 LEECH"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+                let badge_line = if badges.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {badges}")
+                };
+                let front_body = match card.card_type {
+                    CardKind::Cloze => fsrs_engine::format_cloze_front(&card.front),
+                    _ => card.front.clone(),
+                };
+                let speed_limit = card.card_type.speed_focus_limit_secs();
+                let text = format!(
+                    "🧠 **{} {}/{}** · `{}`{badge_line}\n⏱ Speed Focus: {}s\n\n**{}** {}",
+                    lang.pick("Kart", "Card"),
+                    session.position + 1,
+                    session.cards.len(),
+                    card.tag,
+                    speed_limit,
+                    card.context_prefix,
+                    front_body
+                );
+                let kb = json!({"inline_keyboard": [[{
+                    "text": lang.pick("👀 Cevabı Göster", "👀 Show Answer"),
+                    "callback_data": format!("fc:show:{}", card.id)
+                }]]})
+                .to_string();
+                (false, text, kb, None)
+            }
+        };
+        if done {
+            self.fc_session = None;
+            if let Some(msg) = summary {
+                self.send(&msg, None, caller)?;
+            }
+            return Ok(());
+        }
+        let message_id = self.send(&text, Some(&keyboard), caller)?;
+        if let Some(session) = &mut self.fc_session {
+            session.message_id = Some(message_id);
+        }
+        Ok(())
+    }
+
+    fn flashcard_callback(
+        &mut self,
+        callback: &Value,
+        caller: &mut Caller<'_>,
+        ai: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        let lang = self.lang();
+        let callback_id = callback["id"].as_str().unwrap_or("");
+        let _ = caller("answerCallbackQuery", &[("callback_query_id", callback_id)]);
+        let Some(data) = callback["data"].as_str() else {
+            return Ok(());
+        };
+        let message_id = callback["message"]["message_id"].as_i64();
+        let parts: Vec<&str> = data.split(':').collect();
+        match parts.as_slice() {
+            ["fc", "show", id_str] => {
+                let Ok(card_id) = id_str.parse::<i64>() else {
+                    return Ok(());
+                };
+                let now = Utc::now();
+                let Some(card) = self.store.flashcard(card_id)? else {
+                    return Ok(());
+                };
+                let (again_lbl, good_lbl) = fsrs_engine::preview_ratings(&card, now, lang);
+                let front_body = match card.card_type {
+                    CardKind::Cloze => fsrs_engine::format_cloze_back(&card.front),
+                    _ => card.front.clone(),
+                };
+                let mut body = format!(
+                    "🧠 `{}`\n**{}** {front_body}\n\n**→** {}",
+                    card.tag, card.context_prefix, card.back
+                );
+                if !card.extra_context.trim().is_empty() {
+                    body.push_str(&format!("\n\n{}", card.extra_context));
+                }
+                if let Some(hint) = card.mnemonic_hint.as_deref().filter(|s| !s.trim().is_empty()) {
+                    body.push_str(&format!("\n💡 _{hint}_"));
+                }
+                let mut rows = vec![vec![
+                    json!({
+                        "text": format!("❌ {} ({again_lbl})", lang.pick("Hatırlamadım", "Again")),
+                        "callback_data": format!("fc:rate:{card_id}:1")
+                    }),
+                    json!({
+                        "text": format!("✅ {} ({good_lbl})", lang.pick("Hatırladım", "Good")),
+                        "callback_data": format!("fc:rate:{card_id}:3")
+                    }),
+                ]];
+                if card.is_leech {
+                    rows.push(vec![json!({
+                        "text": lang.pick("🔧 Sülük Kartı AI ile Onar", "🔧 Repair Leech with AI"),
+                        "callback_data": format!("fc:repair:{card_id}")
+                    })]);
+                }
+                let kb = json!({ "inline_keyboard": rows }).to_string();
+                if let Some(mid) = message_id {
+                    self.edit_with_markup(mid, &body, Some(&kb), caller)?;
+                }
+            }
+            ["fc", "rate", id_str, rating_str] => {
+                let (Ok(card_id), Ok(r_val)) = (id_str.parse::<i64>(), rating_str.parse::<i64>())
+                else {
+                    return Ok(());
+                };
+                let Ok(rating) = BinaryRating::from_i64(r_val) else {
+                    return Ok(());
+                };
+                let now = Utc::now();
+                let duration_ms = self
+                    .fc_session
+                    .as_ref()
+                    .map(|s| (now - s.shown_at).num_milliseconds().max(0))
+                    .unwrap_or(0);
+                let outcome = self
+                    .store
+                    .record_flashcard_review(card_id, rating, duration_ms, now)?;
+                let interval = match lang {
+                    Lang::Tr => &outcome.interval_label_tr,
+                    Lang::En => &outcome.interval_label_en,
+                };
+                let status_line = match rating {
+                    BinaryRating::Again => lang.pick("❌ Hatırlamadım", "❌ Again"),
+                    BinaryRating::Good => lang.pick("✅ Hatırladım", "✅ Good"),
+                };
+                if let Some(mid) = message_id {
+                    let msg = format!("{status_line} → {interval}");
+                    self.edit(mid, &msg, caller)?;
+                }
+                if outcome.became_leech {
+                    let kb = json!({"inline_keyboard": [[{
+                        "text": lang.pick("🔧 AI ile Onar", "🔧 Repair with AI"),
+                        "callback_data": format!("fc:repair:{card_id}")
+                    }]]})
+                    .to_string();
+                    self.send(
+                        lang.pick(
+                            "🩸 Bu kart **Sülük Kart (Leech)** oldu (3+ unutma). AI ile yeni bağlama veya Bellek Sarayı ipucuna dönüştürebilirsin:",
+                            "🩸 This card became a **Leech** (3+ lapses). Repair it with AI dynamic context or a Loci mnemonic:",
+                        ),
+                        Some(&kb),
+                        caller,
+                    )?;
+                }
+                if let Some(session) = &mut self.fc_session
+                    && session
+                        .cards
+                        .get(session.position)
+                        .is_some_and(|c| c.id == card_id)
+                {
+                    match rating {
+                        BinaryRating::Again => session.again_count += 1,
+                        BinaryRating::Good => session.good_count += 1,
+                    }
+                    session.position += 1;
+                    self.next_flashcard(caller)?;
+                }
+            }
+            ["fc", "repair", id_str] => {
+                let Ok(card_id) = id_str.parse::<i64>() else {
+                    return Ok(());
+                };
+                if self.pending.is_some() {
+                    self.send(
+                        lang.pick("Önceki istek sürüyor…", "Previous request still running…"),
+                        None,
+                        caller,
+                    )?;
+                    return Ok(());
+                }
+                let subject = match self.store.flashcard(card_id)? {
+                    Some(c) => c.subject,
+                    None => self.active_subject()?,
+                };
+                self.begin_job(subject, JobKind::RepairLeech { card_id }, caller, ai)?;
+            }
+            ["fc", "cuo", qid_str, ch_str] => {
+                let (Ok(question_id), Ok(chosen)) =
+                    (qid_str.parse::<i64>(), ch_str.parse::<usize>())
+                else {
+                    return Ok(());
+                };
+                if self.pending.is_some() {
+                    self.send(
+                        lang.pick("Önceki istek sürüyor…", "Previous request still running…"),
+                        None,
+                        caller,
+                    )?;
+                    return Ok(());
+                }
+                let subject = match self.store.question_by_id(question_id)? {
+                    Some((sub, _)) => sub,
+                    None => self.active_subject()?,
+                };
+                self.begin_job(
+                    subject,
+                    JobKind::CuotibenAnalyze {
+                        question_id,
+                        chosen,
+                    },
+                    caller,
+                    ai,
+                )?;
+            }
+            ["fc", "inc_ok", id_str] => {
+                let Ok(card_id) = id_str.parse::<i64>() else {
+                    return Ok(());
+                };
+                let ok = self.store.approve_incubation_card(card_id, Utc::now())?;
+                if let Some(mid) = message_id {
+                    let text = if ok {
+                        lang.pick(
+                            "✅ Kuluçka kartı aktif FSRS havuzuna eklendi.",
+                            "✅ Incubation card approved into active FSRS pool.",
+                        )
+                    } else {
+                        lang.pick(STALE_BUTTON, STALE_BUTTON_EN)
+                    };
+                    self.edit(mid, text, caller)?;
+                }
+            }
+            ["fc", "inc_del", id_str] => {
+                let Ok(card_id) = id_str.parse::<i64>() else {
+                    return Ok(());
+                };
+                let ok = self.store.reject_incubation_card(card_id)?;
+                if let Some(mid) = message_id {
+                    let text = if ok {
+                        lang.pick("🗑️ Kuluçka kartı silindi.", "🗑️ Incubation card deleted.")
+                    } else {
+                        lang.pick(STALE_BUTTON, STALE_BUTTON_EN)
+                    };
+                    self.edit(mid, text, caller)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Deneme isteği; kullanılmamış sınav bankası varsa AI çağrısı olmadan açılır.
@@ -3868,6 +4474,110 @@ impl Bot {
                     self.edit(pending.message_id, &msg, caller)
                 }
                 JobResult::PlanChat(reply) => self.edit(pending.message_id, &reply.reply, caller),
+                JobResult::Flashcards { cards, tag } => {
+                    let topic = match &pending.kind {
+                        JobKind::GenerateFlashcards { topic, .. } => topic.as_str(),
+                        _ => lang.pick("FSRS Kartlar", "FSRS Cards"),
+                    };
+                    let path = write_anki_flashcards_in(
+                        &self.root,
+                        &pending.subject,
+                        topic,
+                        &cards,
+                        lang,
+                    )?;
+                    let path_str = path.to_string_lossy().replace('\\', "/");
+                    let preview = cards
+                        .iter()
+                        .take(8)
+                        .map(|c| format!("• {} {}", c.context_prefix, c.front))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let msg = match lang {
+                        Lang::Tr => format!(
+                            "🧠 **{} FSRS kartı eklendi** ({tag})\nAktif havuza kaydedildi. /kartlar ile hemen çalışabilirsin.\n\n{preview}",
+                            cards.len()
+                        ),
+                        Lang::En => format!(
+                            "🧠 **{} FSRS flashcards added** ({tag})\nSaved to your active pool. Start reviewing with /anki.\n\n{preview}",
+                            cards.len()
+                        ),
+                    };
+                    self.edit(pending.message_id, &msg, caller)?;
+                    let caption = match lang {
+                        Lang::Tr => format!("FSRS Anki destesi: {topic}"),
+                        Lang::En => format!("FSRS Anki deck: {topic}"),
+                    };
+                    caller(
+                        "sendDocument",
+                        &[
+                            ("chat_id", self.chat_id.as_str()),
+                            ("document", path_str.as_str()),
+                            ("caption", caption.as_str()),
+                        ],
+                    )?;
+                    Ok(())
+                }
+                JobResult::Cuotiben {
+                    route,
+                    cards,
+                    strategy_note,
+                    tag,
+                } => {
+                    let msg = match route {
+                        ai::CuotibenRoute::AnkiCard => match lang {
+                            Lang::Tr => format!(
+                                "🧪 **Cuotiben (Bilgi Eksikliği → Kuluçka)** ({tag})\n{} atomik FSRS kartı kuluçkaya eklendi. Onaylamak için /kulucka.",
+                                cards.len()
+                            ),
+                            Lang::En => format!(
+                                "🧪 **Cuotiben (Knowledge Gap → Incubation)** ({tag})\n{} atomic FSRS card(s) added to incubation. Approve with /incubation.",
+                                cards.len()
+                            ),
+                        },
+                        ai::CuotibenRoute::StrategySheet => {
+                            let note = strategy_note.as_deref().unwrap_or("");
+                            match lang {
+                                Lang::Tr => format!(
+                                    "📋 **Cuotiben (Sınav Tekniği Defteri)** ({tag})\nFSRS kuyruğuna eklenmedi; strateji defterine kaydedildi:\n> {note}"
+                                ),
+                                Lang::En => format!(
+                                    "📋 **Cuotiben (Strategy Sheet)** ({tag})\nExcluded from FSRS queue; saved to exam technique notes:\n> {note}"
+                                ),
+                            }
+                        }
+                    };
+                    self.edit(pending.message_id, &msg, caller)
+                }
+                JobResult::LeechRepaired { card } => {
+                    let msg = match lang {
+                        Lang::Tr => format!(
+                            "🔧 **Sülük Kart AI ile Onarıldı** (#{}) — {}\n\n**Ön:** {} {}\n**Arka:** {}\n{}",
+                            card.id,
+                            card.tag,
+                            card.context_prefix,
+                            card.front,
+                            card.back,
+                            card.mnemonic_hint
+                                .as_deref()
+                                .map(|m| format!("💡 {m}"))
+                                .unwrap_or_default()
+                        ),
+                        Lang::En => format!(
+                            "🔧 **Leech Card Repaired by AI** (#{}) — {}\n\n**Front:** {} {}\n**Back:** {}\n{}",
+                            card.id,
+                            card.tag,
+                            card.context_prefix,
+                            card.front,
+                            card.back,
+                            card.mnemonic_hint
+                                .as_deref()
+                                .map(|m| format!("💡 {m}"))
+                                .unwrap_or_default()
+                        ),
+                    };
+                    self.edit(pending.message_id, &msg, caller)
+                }
             }
         })();
         match &result {
@@ -3966,6 +4676,12 @@ impl Bot {
             {
                 return self.subject_callback(callback, caller);
             }
+            if callback["data"]
+                .as_str()
+                .is_some_and(|data| data.starts_with("fc:"))
+            {
+                return self.flashcard_callback(callback, caller, ai);
+            }
             return self.callback(callback, caller);
         }
         let Some(text) = update["message"]["text"]
@@ -4034,6 +4750,7 @@ impl Bot {
                         • 📖 Konu anlat — anlatım + kazanım testi\n\
                         • 📝 Quiz — /quiz <konu> [n] (boş: kayıtlı sorular)\n\
                         • 🔁 Tekrar — zamanı gelen yanlışların varyasyonları\n\
+                        • 🧠 Kartlar (FSRS) — /kartlar [etiket], /kart <konu> [n], /kulucka, /strateji\n\
                         • 🃏 Kelime — /kelime <konu> [n]: Anki destesi / kavram kartları\n\
                         {plan_info}\n\
                         • 📚 Ders Seç — /dersler ile dersi değiştir\n\
@@ -4048,6 +4765,7 @@ impl Bot {
                         • 📝 Quiz — /quiz <topic> [n] (blank: saved questions)\n\
                         • 🎯 Practice — /practice <topic> [n]: focused quick-check practice\n\
                         • 🔁 Review — variations of due mistakes\n\
+                        • 🧠 Flashcards (FSRS) — /anki [tag], /flashcards <topic> [n], /incubation, /strategy\n\
                         • 🃏 Cards — /cards <topic> [n]: Anki flashcards deck\n\
                         {plan_info}\n\
                         • 📚 Courses — switch course with /courses\n\
@@ -4204,6 +4922,146 @@ impl Bot {
                         },
                         caller,
                         ai,
+                    )?;
+                }
+            }
+            "/kartlar" | "/anki" => {
+                if self.session.is_some() {
+                    self.send(
+                        lang.pick(
+                            "Aktif quiz/deneme var. Önce /iptal ile bitirin.",
+                            "A quiz or exam is active. Finish it first with /cancel.",
+                        ),
+                        None,
+                        caller,
+                    )?;
+                } else {
+                    let subject = match self.active_subject() {
+                        Ok(subject) => subject,
+                        Err(error) => {
+                            self.send_error(&error, caller)?;
+                            return Ok(());
+                        }
+                    };
+                    let tag = (!args.trim().is_empty()).then_some(args.trim());
+                    self.start_flashcard_session(&subject, tag, caller)?;
+                }
+            }
+            "/kart" | "/flashcards" => {
+                if self.pending.is_some() {
+                    self.send(
+                        lang.pick(
+                            "Önceki istek sürüyor…",
+                            "Previous request is still running…",
+                        ),
+                        None,
+                        caller,
+                    )?;
+                } else if self.session.is_some() {
+                    self.send(
+                        lang.pick(
+                            "Aktif quiz/deneme var. Önce /iptal ile bitirin.",
+                            "A quiz or exam is active. Finish it first with /cancel.",
+                        ),
+                        None,
+                        caller,
+                    )?;
+                } else if args.trim().is_empty() {
+                    self.store.set_state("awaiting", "kart")?;
+                    self.send(
+                        lang.pick(
+                            "🧠 Hangi konu için atomik FSRS kartları üreteyim? Konuyu yaz (örn. Bağlaçlar 10).",
+                            "🧠 Which topic should I generate atomic FSRS flashcards for? Reply with topic [count] (e.g. Clauses 10).",
+                        ),
+                        None,
+                        caller,
+                    )?;
+                } else {
+                    let (topic, count) = match flashcard_request_in(args, lang) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            self.send_error(&error, caller)?;
+                            return Ok(());
+                        }
+                    };
+                    let subject = match self.active_subject() {
+                        Ok(subject) => subject,
+                        Err(error) => {
+                            self.send_error(&error, caller)?;
+                            return Ok(());
+                        }
+                    };
+                    self.begin_job(
+                        subject,
+                        JobKind::GenerateFlashcards { topic, count },
+                        caller,
+                        ai,
+                    )?;
+                }
+            }
+            "/kulucka" | "/incubation" => {
+                let subject = match self.active_subject() {
+                    Ok(subject) => subject,
+                    Err(error) => {
+                        self.send_error(&error, caller)?;
+                        return Ok(());
+                    }
+                };
+                let cards = self.store.incubation_cards(&subject)?;
+                if cards.is_empty() {
+                    self.send(
+                        lang.pick(
+                            "🐣 Kuluçkada bekleyen kart yok.",
+                            "🐣 No pending incubation cards.",
+                        ),
+                        None,
+                        caller,
+                    )?;
+                } else {
+                    for card in cards.iter().take(5) {
+                        let msg = format!(
+                            "🐣 **Kuluçka / Incubation** (#{}) · {}\n{} {}\n**→** {}",
+                            card.id, card.tag, card.context_prefix, card.front, card.back
+                        );
+                        let kb = json!({"inline_keyboard": [[
+                            {"text": lang.pick("✅ Onayla", "✅ Approve"), "callback_data": format!("fc:inc_ok:{}", card.id)},
+                            {"text": lang.pick("🗑️ Sil", "🗑️ Delete"), "callback_data": format!("fc:inc_del:{}", card.id)}
+                        ]]}).to_string();
+                        self.send(&msg, Some(&kb), caller)?;
+                    }
+                }
+            }
+            "/strateji" | "/strategy" => {
+                let subject = match self.active_subject() {
+                    Ok(subject) => subject,
+                    Err(error) => {
+                        self.send_error(&error, caller)?;
+                        return Ok(());
+                    }
+                };
+                let notes = self.store.exam_technique_notes(&subject, 10)?;
+                if notes.is_empty() {
+                    self.send(
+                        lang.pick(
+                            "📋 Sınav Tekniği Defteri henüz boş.",
+                            "📋 Exam Technique Strategy Sheet is empty.",
+                        ),
+                        None,
+                        caller,
+                    )?;
+                } else {
+                    let body = notes
+                        .iter()
+                        .map(|n| format!("• [{}] {}", n.tag, n.note))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.send(
+                        &format!(
+                            "📋 **{}**\n\n{body}",
+                            lang.pick("Sınav Tekniği Defteri", "Exam Technique Notes")
+                        ),
+                        None,
+                        caller,
                     )?;
                 }
             }
@@ -4399,6 +5257,12 @@ impl Bot {
             "/iptal" | "/cancel" => {
                 if self.session.is_some() {
                     self.finish_session(true, caller)?;
+                } else if self.fc_session.take().is_some() {
+                    self.send(
+                        lang.pick("FSRS kart oturumu bitirildi.", "FSRS flashcard session ended."),
+                        None,
+                        caller,
+                    )?;
                 } else if let Some(pending) = &mut self.pending
                     && matches!(
                         pending.kind,
@@ -4599,6 +5463,22 @@ impl Bot {
                                     return self.begin_job(
                                         subject,
                                         JobKind::Vocab { topic, count },
+                                        caller,
+                                        ai,
+                                    );
+                                }
+                                Err(error) => {
+                                    self.send_error(&error, caller)?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        if awaiting == "kart" {
+                            match flashcard_request_in(text, lang) {
+                                Ok((topic, count)) => {
+                                    return self.begin_job(
+                                        subject,
+                                        JobKind::GenerateFlashcards { topic, count },
                                         caller,
                                         ai,
                                     );
@@ -5049,7 +5929,9 @@ mod tests {
         serde_json::from_str::<Value>(MENU).unwrap();
         let commands: Value = serde_json::from_str(COMMANDS).unwrap();
         let commands = commands.as_array().unwrap();
-        assert_eq!(commands.len(), 14);
+        assert_eq!(commands.len(), 18);
+        let commands_en: Value = serde_json::from_str(COMMANDS_EN).unwrap();
+        assert_eq!(commands_en.as_array().unwrap().len(), 18);
         assert!(commands.iter().all(|c| {
             let name = c["command"].as_str().unwrap();
             !name.is_empty() && name.chars().all(|ch| ch.is_ascii_lowercase())
@@ -7496,5 +8378,179 @@ mod tests {
         assert_eq!(reloaded.plan.len(), 2);
         assert_eq!(reloaded.plan[0].tasks[0].command, "/anlat Zamanlar");
         assert_eq!(plan::start_date(&bot.store, "Ders").unwrap(), Some(today));
+    }
+
+    #[test]
+    fn fsrs_flashcards_command_review_cuotiben_and_leech_repair() {
+        let (root, mut bot) = setup();
+        let mut calls = vec![];
+        let fc_cb = |data: &str| {
+            json!({
+                "update_id": 21,
+                "callback_query": {
+                    "id": "fc-cb",
+                    "from": {"id": 42},
+                    "data": data,
+                    "message": {"message_id": 1, "chat": {"id": 42, "type": "private"}}
+                }
+            })
+        };
+
+        // 1. /kart <konu> [adet] generates FSRS cards into the pool and exports TSV.
+        let fake_cards = r##"{
+            "route": "anki_card",
+            "hierarchical_tag": "#Ders::Baglac::Zitlik",
+            "is_high_yield": true,
+            "strategy_note": null,
+            "cards": [
+                {
+                    "card_type": "cloze",
+                    "context_prefix": "[YDS - Bağlaç]",
+                    "front": "{{c1::Although}} zıtlık bildirir ve tam cümle alır.",
+                    "back": "**Although** + tam cümle (**SVO**)",
+                    "extra_context": "Despite ise isim öbeği alır.",
+                    "mnemonic_hint": null
+                }
+            ]
+        }"##
+        .to_string();
+        bot.handle_update(
+            &message("/kart Bağlaçlar 1"),
+            &mut caller(&mut calls),
+            move |_, _| Ok(fake_cards),
+        )
+        .unwrap();
+        complete(&mut bot, &mut calls);
+        assert_eq!(
+            bot.store
+                .flashcard_stats("Ders", Utc::now())
+                .unwrap()
+                .total_active,
+            1
+        );
+        assert!(root.path().join("anki").exists());
+
+        // 2. /kartlar opens 2-button review -> fc:show -> ONLY Again (1) / Good (3) buttons -> fc:rate.
+        calls.clear();
+        bot.handle_update(&message("/kartlar"), &mut caller(&mut calls), no_ai)
+            .unwrap();
+        let card_id = bot.store.active_flashcards("Ders", None).unwrap()[0].id;
+        bot.handle_update(
+            &fc_cb(&format!("fc:show:{card_id}")),
+            &mut caller(&mut calls),
+            no_ai,
+        )
+        .unwrap();
+        let markup = calls
+            .last()
+            .unwrap()
+            .get("fields")
+            .and_then(|f| f.get("reply_markup"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(markup.contains(&format!("fc:rate:{card_id}:1")));
+        assert!(markup.contains(&format!("fc:rate:{card_id}:3")));
+        assert!(!markup.contains(&format!("fc:rate:{card_id}:2")));
+        assert!(!markup.contains(&format!("fc:rate:{card_id}:4")));
+
+        bot.handle_update(
+            &fc_cb(&format!("fc:rate:{card_id}:3")),
+            &mut caller(&mut calls),
+            no_ai,
+        )
+        .unwrap();
+        assert_eq!(bot.store.flashcard(card_id).unwrap().unwrap().reps, 1);
+
+        // 3. Cuotiben: strategy_sheet route writes ONLY to exam_technique_notes, never FSRS pool.
+        let q = bot
+            .store
+            .add_questions(
+                "Ders",
+                "Test",
+                vec![ai::Question {
+                    question: "Which connector fits here?".into(),
+                    choices: vec!["Although".into(), "Despite".into(), "However".into()],
+                    answer_index: 0,
+                    explanation: "Full clause follows.".into(),
+                    source: "".into(),
+                    topic: Some("Baglac".into()),
+                }],
+            )
+            .unwrap()[0]
+            .clone();
+        let strategy_json = r##"{
+            "route": "strategy_sheet",
+            "hierarchical_tag": "#Ders::Teknik::Okuma",
+            "is_high_yield": false,
+            "strategy_note": "Soru kökündeki yüklemi görmeden Despite şıkkına atlama.",
+            "cards": []
+        }"##
+        .to_string();
+        bot.handle_update(
+            &fc_cb(&format!("fc:cuo:{}:1", q.id)),
+            &mut caller(&mut calls),
+            move |_, _| Ok(strategy_json),
+        )
+        .unwrap();
+        complete(&mut bot, &mut calls);
+        assert_eq!(bot.store.exam_technique_notes("Ders", 10).unwrap().len(), 1);
+        assert_eq!(bot.store.incubation_cards("Ders").unwrap().len(), 0);
+
+        // 4. Graduate to Review and lapse 3 times (Review -> Again -> Good) to trigger Leech, then repair.
+        let mut t = Utc::now() + chrono::Duration::minutes(35);
+        bot.store
+            .record_flashcard_review(card_id, crate::fsrs_engine::BinaryRating::Good, 3000, t)
+            .unwrap();
+        for _ in 0..3 {
+            t += chrono::Duration::days(2);
+            bot.store
+                .record_flashcard_review(card_id, crate::fsrs_engine::BinaryRating::Again, 4000, t)
+                .unwrap();
+            if bot.store.flashcard(card_id).unwrap().unwrap().state
+                == crate::fsrs_engine::CardState::Relearning
+            {
+                t += chrono::Duration::minutes(15);
+                bot.store
+                    .record_flashcard_review(
+                        card_id,
+                        crate::fsrs_engine::BinaryRating::Good,
+                        3000,
+                        t,
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(bot.store.flashcard(card_id).unwrap().unwrap().is_leech);
+        let repair_json = r##"{
+            "route": "anki_card",
+            "hierarchical_tag": "#Ders::Baglac::Zitlik",
+            "is_high_yield": true,
+            "strategy_note": null,
+            "cards": [
+                {
+                    "card_type": "contrastive",
+                    "context_prefix": "[YDS - Contrastive]",
+                    "front": "Although vs Despite: hangisi fiilli cümle ister?",
+                    "back": "**Although** tam cümle (**fiil**), Despite ise **isim** ister.",
+                    "extra_context": "Fiil varsa Although seç.",
+                    "mnemonic_hint": "ALTHOUGH = ALL-Sentence (tam cümle)"
+                }
+            ]
+        }"##
+        .to_string();
+        bot.handle_update(
+            &fc_cb(&format!("fc:repair:{card_id}")),
+            &mut caller(&mut calls),
+            move |_, _| Ok(repair_json),
+        )
+        .unwrap();
+        complete(&mut bot, &mut calls);
+        let repaired = bot.store.flashcard(card_id).unwrap().unwrap();
+        assert!(!repaired.is_leech);
+        assert_eq!(
+            repaired.card_type,
+            crate::fsrs_engine::CardKind::Contrastive
+        );
+        assert!(repaired.mnemonic_hint.is_some());
     }
 }

@@ -1,5 +1,13 @@
-use crate::{Result, ai::Question, invalid};
-use chrono::{DateTime, Days, Utc};
+use crate::{
+    Result,
+    ai::Question,
+    fsrs_engine::{
+        self, BACKLOG_PROTECTION_THRESHOLD, BinaryRating, CardKind, CardState, CardStatus,
+        DAILY_NEW_CARD_LIMIT, Flashcard, ScheduleOutcome,
+    },
+    invalid,
+};
+use chrono::{DateTime, Days, NaiveTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, time::Duration};
 
@@ -25,6 +33,75 @@ pub struct SessionStats {
     pub correct: i64,
     pub total: i64,
     pub minutes: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewFlashcard {
+    pub subject: String,
+    pub tag: String,
+    pub status: CardStatus,
+    pub card_type: CardKind,
+    pub context_prefix: String,
+    pub front: String,
+    pub back: String,
+    pub extra_context: String,
+    pub mnemonic_hint: Option<String>,
+    pub is_high_yield: bool,
+    pub source_question_id: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlashcardQueue {
+    pub cards: Vec<Flashcard>,
+    pub due_learning: usize,
+    pub due_reviews: usize,
+    pub new_available: usize,
+    pub new_today: usize,
+    pub backlog_paused: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FlashcardStats {
+    pub total_active: usize,
+    pub due_learning: usize,
+    pub due_reviews: usize,
+    pub new_total: usize,
+    pub new_today: usize,
+    pub new_remaining_today: usize,
+    pub backlog_paused: bool,
+    pub incubation_count: usize,
+    pub leech_count: usize,
+    pub strategy_notes_count: usize,
+    pub avg_stability: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagSummary {
+    pub tag: String,
+    pub total: usize,
+    pub due: usize,
+    pub new_count: usize,
+    pub leech_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExamTechniqueNote {
+    pub id: i64,
+    pub subject: String,
+    pub question_id: Option<i64>,
+    pub tag: String,
+    pub note: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LeechRepair<'a> {
+    pub card_type: CardKind,
+    pub context_prefix: &'a str,
+    pub front: &'a str,
+    pub back: &'a str,
+    pub extra_context: &'a str,
+    pub mnemonic_hint: Option<&'a str>,
 }
 
 pub fn now() -> String {
@@ -91,7 +168,57 @@ impl Store {
                  CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, question TEXT NOT NULL, choices_json TEXT NOT NULL, answer_index INTEGER NOT NULL CHECK(answer_index BETWEEN 0 AND 4), explanation TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL, is_exam INTEGER NOT NULL DEFAULT 0);
                  CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id), choice INTEGER NOT NULL CHECK(choice BETWEEN 0 AND 4), correct INTEGER NOT NULL, at TEXT NOT NULL);
                  CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, correct INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'quiz');
-                 CREATE TABLE IF NOT EXISTS reviews(question_id INTEGER PRIMARY KEY REFERENCES questions(id), box INTEGER NOT NULL CHECK(box BETWEEN 1 AND 5), due_at TEXT NOT NULL);",
+                 CREATE TABLE IF NOT EXISTS reviews(question_id INTEGER PRIMARY KEY REFERENCES questions(id), box INTEGER NOT NULL CHECK(box BETWEEN 1 AND 5), due_at TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS flashcards(
+                    id INTEGER PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','incubation','suspended')),
+                    card_type TEXT NOT NULL CHECK(card_type IN ('qa','cloze','contrastive')),
+                    context_prefix TEXT NOT NULL,
+                    front TEXT NOT NULL,
+                    back TEXT NOT NULL,
+                    extra_context TEXT NOT NULL DEFAULT '',
+                    mnemonic_hint TEXT,
+                    is_high_yield INTEGER NOT NULL DEFAULT 0,
+                    is_leech INTEGER NOT NULL DEFAULT 0,
+                    source_question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
+                    state INTEGER NOT NULL DEFAULT 0 CHECK(state BETWEEN 0 AND 3),
+                    stability REAL NOT NULL DEFAULT 0.0,
+                    stability_fast REAL NOT NULL DEFAULT 0.0,
+                    difficulty REAL NOT NULL DEFAULT 0.0,
+                    elapsed_days REAL NOT NULL DEFAULT 0.0,
+                    scheduled_days INTEGER NOT NULL DEFAULT 0,
+                    learning_step INTEGER NOT NULL DEFAULT 0,
+                    reps INTEGER NOT NULL DEFAULT 0,
+                    lapses INTEGER NOT NULL DEFAULT 0,
+                    last_review TEXT,
+                    due TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_flashcards_queue ON flashcards(subject, status, state, due);
+                 CREATE INDEX IF NOT EXISTS idx_flashcards_tag ON flashcards(subject, tag);
+                 CREATE TABLE IF NOT EXISTS review_logs(
+                    id INTEGER PRIMARY KEY,
+                    card_id INTEGER NOT NULL REFERENCES flashcards(id) ON DELETE CASCADE,
+                    rating INTEGER NOT NULL CHECK(rating IN (1,3)),
+                    state INTEGER NOT NULL,
+                    stability REAL NOT NULL,
+                    difficulty REAL NOT NULL,
+                    elapsed_days REAL NOT NULL,
+                    scheduled_days INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    reviewed_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_review_logs_card ON review_logs(card_id, reviewed_at);
+                 CREATE TABLE IF NOT EXISTS exam_technique_notes(
+                    id INTEGER PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
+                    tag TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );",
             )?;
             if !has_column(&conn, "sessions", "kind")? {
                 conn.execute_batch(
@@ -809,6 +936,548 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn question_by_id(&self, id: i64) -> Result<Option<(String, StoredQuestion)>> {
+        let row: Option<(String, String, String, String, i64, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT subject,topic,question,choices_json,answer_index,explanation,source FROM questions WHERE id=?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((subject, topic, question, choices_json, answer_index, explanation, source)) = row
+        else {
+            return Ok(None);
+        };
+        let choices: Vec<String> = serde_json::from_str(&choices_json)?;
+        let answer_index = usize::try_from(answer_index)
+            .map_err(|_| invalid("Kayıtlı soru geçersiz / Stored question is invalid."))?;
+        if answer_index >= choices.len() {
+            return Err(invalid(
+                "Kayıtlı soru geçersiz / Stored question is invalid.",
+            ));
+        }
+        Ok(Some((
+            subject,
+            StoredQuestion {
+                id,
+                value: Question {
+                    question,
+                    choices,
+                    answer_index,
+                    explanation,
+                    source,
+                    topic: Some(topic),
+                },
+                review_target: None,
+            },
+        )))
+    }
+
+    pub fn add_flashcards(
+        &mut self,
+        cards: Vec<NewFlashcard>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Flashcard>> {
+        let tx = self.conn.transaction()?;
+        let now_str = now.to_rfc3339();
+        let mut saved = Vec::with_capacity(cards.len());
+        for card in cards {
+            let tag = normalize_tag(&card.tag);
+            tx.execute(
+                "INSERT INTO flashcards(subject,tag,status,card_type,context_prefix,front,back,extra_context,mnemonic_hint,is_high_yield,is_leech,source_question_id,state,stability,stability_fast,difficulty,elapsed_days,scheduled_days,learning_step,reps,lapses,last_review,due,created_at) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,0,0.0,0.0,0.0,0.0,0,0,0,0,NULL,?12,?12)",
+                params![
+                    card.subject,
+                    tag,
+                    card.status.as_str(),
+                    card.card_type.as_str(),
+                    card.context_prefix.trim(),
+                    card.front.trim(),
+                    card.back.trim(),
+                    card.extra_context.trim(),
+                    card.mnemonic_hint.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                    i64::from(card.is_high_yield),
+                    card.source_question_id,
+                    now_str,
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            saved.push(Flashcard {
+                id,
+                subject: card.subject,
+                tag,
+                status: card.status,
+                card_type: card.card_type,
+                context_prefix: card.context_prefix.trim().to_string(),
+                front: card.front.trim().to_string(),
+                back: card.back.trim().to_string(),
+                extra_context: card.extra_context.trim().to_string(),
+                mnemonic_hint: card
+                    .mnemonic_hint
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                is_high_yield: card.is_high_yield,
+                is_leech: false,
+                source_question_id: card.source_question_id,
+                state: CardState::New,
+                stability: 0.0,
+                stability_fast: 0.0,
+                difficulty: 0.0,
+                elapsed_days: 0.0,
+                scheduled_days: 0,
+                learning_step: 0,
+                reps: 0,
+                lapses: 0,
+                last_review: None,
+                due: now,
+                created_at: now,
+            });
+        }
+        tx.commit()?;
+        Ok(saved)
+    }
+
+    pub fn flashcard(&self, id: i64) -> Result<Option<Flashcard>> {
+        let mut stmt = self.conn.prepare(FLASHCARD_SELECT_BY_ID)?;
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row_to_flashcard(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn active_flashcards(
+        &self,
+        subject: &str,
+        tag_prefix: Option<&str>,
+    ) -> Result<Vec<Flashcard>> {
+        let mut cards = self.load_flashcards_by_status(subject, CardStatus::Active)?;
+        if let Some(prefix) = tag_prefix.map(normalize_tag).filter(|t| !t.is_empty()) {
+            cards.retain(|c| tag_matches_prefix(&c.tag, &prefix));
+        }
+        Ok(cards)
+    }
+
+    pub fn incubation_cards(&self, subject: &str) -> Result<Vec<Flashcard>> {
+        self.load_flashcards_by_status(subject, CardStatus::Incubation)
+    }
+
+    pub fn approve_incubation_card(&self, card_id: i64, now: DateTime<Utc>) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE flashcards SET status='active', due=?1 WHERE id=?2 AND status='incubation'",
+            params![now.to_rfc3339(), card_id],
+        )? == 1)
+    }
+
+    pub fn reject_incubation_card(&self, card_id: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM flashcards WHERE id=?1 AND status='incubation'",
+            [card_id],
+        )? == 1)
+    }
+
+    pub fn apply_leech_repair(&self, card_id: i64, repair: &LeechRepair<'_>) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE flashcards SET card_type=?1, context_prefix=?2, front=?3, back=?4, extra_context=?5, mnemonic_hint=?6, is_leech=0 WHERE id=?7",
+            params![
+                repair.card_type.as_str(),
+                repair.context_prefix.trim(),
+                repair.front.trim(),
+                repair.back.trim(),
+                repair.extra_context.trim(),
+                repair
+                    .mnemonic_hint
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+                card_id,
+            ],
+        )? == 1)
+    }
+
+    /// Builds today's FSRS study queue:
+    /// 1) Due intraday Learning/Relearning cards (earliest due first)
+    /// 2) Due Review cards sorted by Descending Retrievability (highest R first)
+    /// 3) New cards capped by daily quota (20), automatically paused if subject due reviews >= 150.
+    pub fn due_flashcards_queue(
+        &self,
+        subject: &str,
+        tag_prefix: Option<&str>,
+        high_yield_only: bool,
+        now: DateTime<Utc>,
+    ) -> Result<FlashcardQueue> {
+        let all_active = self.load_flashcards_by_status(subject, CardStatus::Active)?;
+        let total_due_reviews = all_active
+            .iter()
+            .filter(|c| c.state == CardState::Review && c.due <= now)
+            .count();
+        let backlog_paused = total_due_reviews >= BACKLOG_PROTECTION_THRESHOLD;
+        let new_today = self.new_flashcards_studied_today(subject, now)?;
+        let new_quota_left = if backlog_paused {
+            0
+        } else {
+            DAILY_NEW_CARD_LIMIT.saturating_sub(new_today)
+        };
+
+        let prefix = tag_prefix.map(normalize_tag).filter(|t| !t.is_empty());
+        let mut learning = Vec::new();
+        let mut reviews = Vec::new();
+        let mut new_cards = Vec::new();
+
+        for card in all_active {
+            if let Some(ref p) = prefix
+                && !tag_matches_prefix(&card.tag, p)
+            {
+                continue;
+            }
+            if high_yield_only && !card.is_high_yield {
+                continue;
+            }
+            match card.state {
+                CardState::Learning | CardState::Relearning if card.due <= now => {
+                    learning.push(card);
+                }
+                CardState::Review if card.due <= now => {
+                    let r = fsrs_engine::retrievability(&card, now, None);
+                    reviews.push((r, card));
+                }
+                CardState::New => new_cards.push(card),
+                _ => {}
+            }
+        }
+
+        learning.sort_by_key(|c| (c.due, c.id));
+        // Descending Retrievability: preserve cards closest to threshold before deep backlog.
+        reviews.sort_by(|a, b| {
+            b.0.total_cmp(&a.0)
+                .then_with(|| b.1.is_high_yield.cmp(&a.1.is_high_yield))
+                .then_with(|| a.1.due.cmp(&b.1.due))
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+        new_cards.sort_by(|a, b| {
+            b.is_high_yield
+                .cmp(&a.is_high_yield)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        new_cards.truncate(new_quota_left);
+
+        let due_learning = learning.len();
+        let due_reviews = reviews.len();
+        let new_available = new_cards.len();
+
+        let mut cards = Vec::with_capacity(due_learning + due_reviews + new_available);
+        cards.extend(learning);
+        cards.extend(reviews.into_iter().map(|(_, c)| c));
+        cards.extend(new_cards);
+
+        Ok(FlashcardQueue {
+            cards,
+            due_learning,
+            due_reviews,
+            new_available,
+            new_today,
+            backlog_paused,
+        })
+    }
+
+    pub fn record_flashcard_review(
+        &mut self,
+        card_id: i64,
+        rating: BinaryRating,
+        duration_ms: i64,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduleOutcome> {
+        let tx = self.conn.transaction()?;
+        let card = {
+            let mut stmt = tx.prepare(FLASHCARD_SELECT_BY_ID)?;
+            let mut rows = stmt.query([card_id])?;
+            let Some(row) = rows.next()? else {
+                return Err(invalid("Kart bulunamadı / Flashcard not found."));
+            };
+            row_to_flashcard(row)?
+        };
+
+        let outcome = fsrs_engine::schedule_card(&card, rating, now, None)?;
+        let u = &outcome.updated;
+
+        tx.execute(
+            "INSERT INTO review_logs(card_id,rating,state,stability,difficulty,elapsed_days,scheduled_days,duration_ms,reviewed_at) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                card.id,
+                rating.as_i64(),
+                card.state.as_i64(),
+                u.stability,
+                u.difficulty,
+                u.elapsed_days,
+                u.scheduled_days,
+                duration_ms.max(0),
+                now.to_rfc3339(),
+            ],
+        )?;
+
+        tx.execute(
+            "UPDATE flashcards SET state=?1, stability=?2, stability_fast=?3, difficulty=?4, elapsed_days=?5, scheduled_days=?6, learning_step=?7, reps=?8, lapses=?9, is_leech=?10, last_review=?11, due=?12 WHERE id=?13",
+            params![
+                u.state.as_i64(),
+                u.stability,
+                u.stability_fast,
+                u.difficulty,
+                u.elapsed_days,
+                u.scheduled_days,
+                i64::from(u.learning_step),
+                u.reps,
+                u.lapses,
+                i64::from(u.is_leech),
+                u.last_review.map(|d| d.to_rfc3339()),
+                u.due.to_rfc3339(),
+                u.id,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn flashcard_stats(&self, subject: &str, now: DateTime<Utc>) -> Result<FlashcardStats> {
+        let active = self.load_flashcards_by_status(subject, CardStatus::Active)?;
+        let total_active = active.len();
+        let due_learning = active
+            .iter()
+            .filter(|c| matches!(c.state, CardState::Learning | CardState::Relearning) && c.due <= now)
+            .count();
+        let due_reviews = active
+            .iter()
+            .filter(|c| c.state == CardState::Review && c.due <= now)
+            .count();
+        let new_total = active.iter().filter(|c| c.state == CardState::New).count();
+        let leech_count = active.iter().filter(|c| c.is_leech).count();
+        let stability_sum: f64 = active
+            .iter()
+            .filter(|c| c.stability > 0.0)
+            .map(|c| c.stability)
+            .sum();
+        let stability_n = active.iter().filter(|c| c.stability > 0.0).count();
+        let avg_stability = if stability_n > 0 {
+            stability_sum / stability_n as f64
+        } else {
+            0.0
+        };
+        let new_today = self.new_flashcards_studied_today(subject, now)?;
+        let backlog_paused = due_reviews >= BACKLOG_PROTECTION_THRESHOLD;
+        let new_remaining_today = if backlog_paused {
+            0
+        } else {
+            DAILY_NEW_CARD_LIMIT.saturating_sub(new_today).min(new_total)
+        };
+        let incubation_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM flashcards WHERE subject=?1 AND status='incubation'",
+            [subject],
+            |r| r.get(0),
+        )?;
+        let strategy_notes_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM exam_technique_notes WHERE subject=?1",
+            [subject],
+            |r| r.get(0),
+        )?;
+
+        Ok(FlashcardStats {
+            total_active,
+            due_learning,
+            due_reviews,
+            new_total,
+            new_today,
+            new_remaining_today,
+            backlog_paused,
+            incubation_count: usize::try_from(incubation_count).unwrap_or(0),
+            leech_count,
+            strategy_notes_count: usize::try_from(strategy_notes_count).unwrap_or(0),
+            avg_stability,
+        })
+    }
+
+    pub fn flashcard_tag_tree(&self, subject: &str, now: DateTime<Utc>) -> Result<Vec<TagSummary>> {
+        use std::collections::BTreeMap;
+        let active = self.load_flashcards_by_status(subject, CardStatus::Active)?;
+        let mut by_tag: BTreeMap<String, TagSummary> = BTreeMap::new();
+        for card in &active {
+            let mut prefix = String::new();
+            for part in card.tag.split("::").filter(|p| !p.is_empty()) {
+                if prefix.is_empty() {
+                    prefix.push_str(part);
+                } else {
+                    prefix.push_str("::");
+                    prefix.push_str(part);
+                }
+                let entry = by_tag.entry(prefix.clone()).or_insert_with(|| TagSummary {
+                    tag: prefix.clone(),
+                    total: 0,
+                    due: 0,
+                    new_count: 0,
+                    leech_count: 0,
+                });
+                entry.total += 1;
+                if card.state == CardState::New {
+                    entry.new_count += 1;
+                } else if card.due <= now {
+                    entry.due += 1;
+                }
+                if card.is_leech {
+                    entry.leech_count += 1;
+                }
+            }
+        }
+        Ok(by_tag.into_values().collect())
+    }
+
+    pub fn add_exam_technique_note(
+        &self,
+        subject: &str,
+        question_id: Option<i64>,
+        tag: &str,
+        note: &str,
+        now: DateTime<Utc>,
+    ) -> Result<i64> {
+        let tag = normalize_tag(tag);
+        self.conn.execute(
+            "INSERT INTO exam_technique_notes(subject,question_id,tag,note,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![subject, question_id, tag, note.trim(), now.to_rfc3339()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn exam_technique_notes(
+        &self,
+        subject: &str,
+        limit: usize,
+    ) -> Result<Vec<ExamTechniqueNote>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,subject,question_id,tag,note,created_at FROM exam_technique_notes WHERE subject=?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![subject, i64::try_from(limit)?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, subject, question_id, tag, note, created_at) = row?;
+            out.push(ExamTechniqueNote {
+                id,
+                subject,
+                question_id,
+                tag,
+                note,
+                created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+            });
+        }
+        Ok(out)
+    }
+
+    fn new_flashcards_studied_today(&self, subject: &str, now: DateTime<Utc>) -> Result<usize> {
+        let today_start = now
+            .date_naive()
+            .and_time(NaiveTime::MIN)
+            .and_utc()
+            .to_rfc3339();
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT l.card_id) FROM review_logs l JOIN flashcards f ON f.id = l.card_id \
+             WHERE f.subject=?1 AND l.state=0 AND l.reviewed_at>=?2",
+            params![subject, today_start],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    fn load_flashcards_by_status(
+        &self,
+        subject: &str,
+        status: CardStatus,
+    ) -> Result<Vec<Flashcard>> {
+        let mut stmt = self.conn.prepare(FLASHCARD_SELECT_BY_SUBJECT_STATUS)?;
+        let mut rows = stmt.query(params![subject, status.as_str()])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row_to_flashcard(row)?);
+        }
+        Ok(out)
+    }
+}
+
+const FLASHCARD_COLS: &str = "id,subject,tag,status,card_type,context_prefix,front,back,extra_context,mnemonic_hint,is_high_yield,is_leech,source_question_id,state,stability,stability_fast,difficulty,elapsed_days,scheduled_days,learning_step,reps,lapses,last_review,due,created_at";
+const FLASHCARD_SELECT_BY_ID: &str = "SELECT id,subject,tag,status,card_type,context_prefix,front,back,extra_context,mnemonic_hint,is_high_yield,is_leech,source_question_id,state,stability,stability_fast,difficulty,elapsed_days,scheduled_days,learning_step,reps,lapses,last_review,due,created_at FROM flashcards WHERE id=?1";
+const FLASHCARD_SELECT_BY_SUBJECT_STATUS: &str = "SELECT id,subject,tag,status,card_type,context_prefix,front,back,extra_context,mnemonic_hint,is_high_yield,is_leech,source_question_id,state,stability,stability_fast,difficulty,elapsed_days,scheduled_days,learning_step,reps,lapses,last_review,due,created_at FROM flashcards WHERE subject=?1 AND status=?2 ORDER BY id";
+
+fn row_to_flashcard(row: &rusqlite::Row<'_>) -> Result<Flashcard> {
+    let _ = FLASHCARD_COLS;
+    let last_review: Option<String> = row.get(22)?;
+    let due: String = row.get(23)?;
+    let created_at: String = row.get(24)?;
+    Ok(Flashcard {
+        id: row.get(0)?,
+        subject: row.get(1)?,
+        tag: row.get(2)?,
+        status: CardStatus::parse(&row.get::<_, String>(3)?)?,
+        card_type: CardKind::parse(&row.get::<_, String>(4)?)?,
+        context_prefix: row.get(5)?,
+        front: row.get(6)?,
+        back: row.get(7)?,
+        extra_context: row.get(8)?,
+        mnemonic_hint: row.get(9)?,
+        is_high_yield: row.get::<_, i64>(10)? != 0,
+        is_leech: row.get::<_, i64>(11)? != 0,
+        source_question_id: row.get(12)?,
+        state: CardState::from_i64(row.get(13)?)?,
+        stability: row.get(14)?,
+        stability_fast: row.get(15)?,
+        difficulty: row.get(16)?,
+        elapsed_days: row.get(17)?,
+        scheduled_days: row.get(18)?,
+        learning_step: u8::try_from(row.get::<_, i64>(19)?).unwrap_or(0),
+        reps: row.get(20)?,
+        lapses: row.get(21)?,
+        last_review: last_review
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|d| d.with_timezone(&Utc)),
+        due: DateTime::parse_from_rfc3339(&due)?.with_timezone(&Utc),
+        created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+    })
+}
+
+pub fn normalize_tag(raw: &str) -> String {
+    let cleaned = raw.trim();
+    if cleaned.is_empty() {
+        "#Genel".into()
+    } else if cleaned.starts_with('#') {
+        cleaned.to_string()
+    } else {
+        format!("#{cleaned}")
+    }
+}
+
+fn tag_matches_prefix(tag: &str, prefix: &str) -> bool {
+    tag == prefix
+        || tag
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with("::"))
 }
 
 fn has_column(conn: &Connection, table: &str, col: &str) -> Result<bool> {
@@ -1468,5 +2137,167 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn new_flashcard(tag: &str, front: &str, high_yield: bool) -> NewFlashcard {
+        NewFlashcard {
+            subject: "yds".into(),
+            tag: tag.into(),
+            status: CardStatus::Active,
+            card_type: CardKind::Qa,
+            context_prefix: "[YDS - Grammar]".into(),
+            front: front.into(),
+            back: "**anahtar** cevap".into(),
+            extra_context: "Açıklama".into(),
+            mnemonic_hint: None,
+            is_high_yield: high_yield,
+            source_question_id: None,
+        }
+    }
+
+    #[test]
+    fn flashcard_queue_respects_quota_backlog_threshold_and_descending_retrievability() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let t0 = at("2026-05-10T10:00:00Z");
+
+        // 25 new cards -> daily new quota caps at 20, prioritizing high-yield
+        let mut batch = Vec::new();
+        for i in 0..25 {
+            batch.push(new_flashcard(
+                if i % 2 == 0 {
+                    "#YDS::Grammar::Passive"
+                } else {
+                    "#YDS::Vocabulary::Verbs"
+                },
+                &format!("Card {i}?"),
+                i == 24,
+            ));
+        }
+        let saved = store.add_flashcards(batch, t0).unwrap();
+        let q = store.due_flashcards_queue("yds", None, false, t0).unwrap();
+        assert_eq!(q.new_available, 20);
+        assert!(!q.backlog_paused);
+        assert_eq!(q.cards[0].id, saved[24].id); // high-yield first
+
+        // Tag hierarchy prefix filtering
+        let grammar_q = store
+            .due_flashcards_queue("yds", Some("#YDS::Grammar"), false, t0)
+            .unwrap();
+        assert!(grammar_q.cards.iter().all(|c| c.tag.starts_with("#YDS::Grammar")));
+
+        // Review 1 new card -> remaining daily quota becomes 19
+        store
+            .record_flashcard_review(saved[0].id, BinaryRating::Good, 3200, t0)
+            .unwrap();
+        let q_after = store.due_flashcards_queue("yds", None, false, t0).unwrap();
+        assert_eq!(q_after.new_today, 1);
+        assert_eq!(q_after.new_available, 19);
+
+        // Create 2 due Review cards with different elapsed times -> higher R comes first
+        let r_cards = store
+            .add_flashcards(
+                vec![
+                    new_flashcard("#YDS::Test", "Staler?", false),
+                    new_flashcard("#YDS::Test", "Fresher?", false),
+                ],
+                t0,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE flashcards SET state=2, stability=10.0, stability_fast=10.0, difficulty=5.0, last_review=?1, due=?2 WHERE id=?3",
+                params![
+                    (t0 - chrono::Duration::days(15)).to_rfc3339(),
+                    (t0 - chrono::Duration::days(1)).to_rfc3339(),
+                    r_cards[0].id
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE flashcards SET state=2, stability=10.0, stability_fast=10.0, difficulty=5.0, last_review=?1, due=?2 WHERE id=?3",
+                params![
+                    (t0 - chrono::Duration::days(3)).to_rfc3339(),
+                    (t0 - chrono::Duration::hours(2)).to_rfc3339(),
+                    r_cards[1].id
+                ],
+            )
+            .unwrap();
+        let ordered = store.due_flashcards_queue("yds", None, false, t0).unwrap();
+        assert_eq!(ordered.due_reviews, 2);
+        assert_eq!(ordered.cards[0].id, r_cards[1].id);
+        assert_eq!(ordered.cards[1].id, r_cards[0].id);
+
+        // Backlog protection: >= 150 due reviews pauses new cards
+        let extra: Vec<NewFlashcard> = (0..148)
+            .map(|i| new_flashcard("#YDS::Backlog", &format!("B{i}"), false))
+            .collect();
+        let extra_ids = store.add_flashcards(extra, t0).unwrap();
+        for c in extra_ids {
+            store
+                .conn
+                .execute(
+                    "UPDATE flashcards SET state=2, stability=5.0, stability_fast=5.0, difficulty=5.0, last_review=?1, due=?2 WHERE id=?3",
+                    params![
+                        (t0 - chrono::Duration::days(6)).to_rfc3339(),
+                        (t0 - chrono::Duration::days(1)).to_rfc3339(),
+                        c.id
+                    ],
+                )
+                .unwrap();
+        }
+        let backlog_q = store.due_flashcards_queue("yds", None, false, t0).unwrap();
+        assert!(backlog_q.backlog_paused);
+        assert_eq!(backlog_q.due_reviews, 150);
+        assert_eq!(backlog_q.new_available, 0);
+    }
+
+    #[test]
+    fn incubation_strategy_notes_and_leech_repair_roundtrip() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let t0 = at("2026-05-10T10:00:00Z");
+
+        let mut inc = new_flashcard("#YDS::Clauses", "Yetim zamirsiz soru?", true);
+        inc.status = CardStatus::Incubation;
+        let saved = store.add_flashcards(vec![inc], t0).unwrap();
+        assert_eq!(store.incubation_cards("yds").unwrap().len(), 1);
+        assert!(store.due_flashcards_queue("yds", None, false, t0).unwrap().cards.is_empty());
+
+        assert!(store.approve_incubation_card(saved[0].id, t0).unwrap());
+        assert!(store.incubation_cards("yds").unwrap().is_empty());
+        assert_eq!(store.due_flashcards_queue("yds", None, false, t0).unwrap().cards.len(), 1);
+
+        // Strategy note stays out of flashcards queue
+        store
+            .add_exam_technique_note("yds", None, "#YDS::Strategy", "Öncülleri sondan oku.", t0)
+            .unwrap();
+        assert_eq!(store.exam_technique_notes("yds", 10).unwrap().len(), 1);
+
+        // Leech flag & repair
+        store
+            .conn
+            .execute("UPDATE flashcards SET is_leech=1, lapses=3 WHERE id=?1", [saved[0].id])
+            .unwrap();
+        assert!(
+            store
+                .apply_leech_repair(
+                    saved[0].id,
+                    &LeechRepair {
+                        card_type: CardKind::Contrastive,
+                        context_prefix: "[YDS - Contrast]",
+                        front: "Although vs Despite farkı nedir?",
+                        back: "**Although + cümle**, **Despite + isim** alır.",
+                        extra_context: "Bağlaç vs edat ayrımı.",
+                        mnemonic_hint: Some("Although = All-clause, Despite = D-isim"),
+                    },
+                )
+                .unwrap()
+        );
+        let repaired = store.flashcard(saved[0].id).unwrap().unwrap();
+        assert!(!repaired.is_leech);
+        assert_eq!(repaired.card_type, CardKind::Contrastive);
+        assert_eq!(repaired.lapses, 3);
     }
 }
