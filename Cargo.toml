@@ -1,0 +1,23 @@
+[package]
+name = "studia"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Bilingual (TR/EN), cross-platform AI study assistant (TUI + Telegram bot) with spaced repetition and local material indexing"
+license = "MIT"
+repository = "https://github.com/zodicall/studia"
+readme = "README.md"
+keywords = ["study", "flashcards", "tui", "telegram-bot", "spaced-repetition"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+tempfile = "3"
+lopdf = { version = "0.39", default-features = false }
+zip = { version = "7", default-features = false, features = ["deflate"] }
+quick-xml = "0.39"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "unstable-rendered-line-info"] }
+crossterm = "0.29"

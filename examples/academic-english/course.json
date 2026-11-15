@@ -1,0 +1,73 @@
+{
+  "title": "Academic English Exam Study Plan (Template)",
+  "persona": "You are a concise academic English exam coach. Focus on sentence structure, discourse markers, academic vocabulary, and reading inference without inventing external rules.",
+  "exam": {
+    "question_count": 80,
+    "choices_count": 5,
+    "categories": [
+      { "name": "Vocabulary & Grammar", "count": 16 },
+      { "name": "Cloze Test", "count": 10 },
+      { "name": "Sentence Completion", "count": 10 },
+      { "name": "Translation", "count": 6 },
+      { "name": "Reading Comprehension", "count": 20 },
+      { "name": "Dialogue & Restatement", "count": 9 },
+      { "name": "Paragraph Flow", "count": 9 }
+    ],
+    "rules": "Each question has 5 comparable academic options (A-E) with a single unambiguous answer."
+  },
+  "plan": [
+    {
+      "day": 1,
+      "title": "Tense, Aspect & Passive Voice",
+      "tasks": [
+        { "command": "/lesson Tense and Passive Voice", "label": "Lesson: Tenses and passive structures" },
+        { "command": "/cards Academic Verbs", "label": "Flashcards: High-frequency academic verbs" },
+        { "command": "/quiz Tense and Passive Voice", "label": "Quiz: Grammar checkpoint" }
+      ]
+    },
+    {
+      "day": 2,
+      "title": "Modals & Conditionals",
+      "tasks": [
+        { "command": "/review", "label": "Review: Due flashcards & mistakes" },
+        { "command": "/lesson Modals and Conditionals", "label": "Lesson: Modals and conditional clauses" },
+        { "command": "/quiz Modals and Conditionals", "label": "Quiz: Clause transformations" }
+      ]
+    },
+    {
+      "day": 3,
+      "title": "Conjunctions & Discourse Markers",
+      "tasks": [
+        { "command": "/review", "label": "Review: Due items" },
+        { "command": "/lesson Conjunctions and Clauses", "label": "Lesson: Contrast, cause, and relative clauses" },
+        { "command": "/quiz Conjunctions and Clauses", "label": "Quiz: Sentence completion" }
+      ]
+    },
+    {
+      "day": 4,
+      "title": "Academic Vocabulary & Collocations",
+      "tasks": [
+        { "command": "/review", "label": "Review: Due items" },
+        { "command": "/cards Academic Vocabulary", "label": "Flashcards: Connectors and phrasal verbs" },
+        { "command": "/quiz Academic Vocabulary", "label": "Quiz: Contextual vocabulary" }
+      ]
+    },
+    {
+      "day": 5,
+      "title": "Reading Comprehension & Inference",
+      "tasks": [
+        { "command": "/review", "label": "Review: Due items" },
+        { "command": "/lesson Reading Comprehension", "label": "Lesson: Main idea & paragraph coherence" },
+        { "command": "/quiz Reading Comprehension", "label": "Quiz: Passage analysis" }
+      ]
+    },
+    {
+      "day": 6,
+      "title": "Full Mock Exam & Mistake Review",
+      "tasks": [
+        { "command": "/review", "label": "Review: Final weak areas" },
+        { "command": "/exam", "label": "Mock exam: Full timed simulation" }
+      ]
+    }
+  ]
+}

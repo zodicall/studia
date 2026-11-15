@@ -1,0 +1,13 @@
+target/
+target_test/
+data/
+kaynaklar/
+anki/
+.cargo/
+tools/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-test:
+    name: Build & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust 1.89+
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run test suite (locked)
+        run: cargo test --locked
+
+  security-and-hygiene:
+    name: Security Audit & Release Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
+
+      - name: Static release hygiene scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reject leaked personal paths or legacy artifacts in shipped source/docs/examples.
+          if git grep -nE '(C:\\Users\\|/Users/|/home/)' -- \
+            src/ examples/ README.md README.tr.md CONTRIBUTING.md SECURITY.md .env.example Cargo.toml; then
+            echo "::error::Personal filesystem path found in tracked files."
+            exit 1
+          fi
+          # Ensure no tracked secret files or runtime databases exist.
+          if git ls-files | grep -E '(^|/)\.env$|\.db$|^kaynaklar/|^data/|^anki/'; then
+            echo "::error::Runtime or secret file committed to git."
+            exit 1
+          fi

@@ -1,0 +1,42 @@
+{
+  "title": "General Study Course (Template)",
+  "persona": "You are a clear, rigorous academic tutor. Explain underlying principles step by step, cite only verified concepts from the provided course notes, and keep feedback concise.",
+  "exam": {
+    "question_count": 20,
+    "choices_count": 4,
+    "categories": [
+      { "name": "Core Concepts", "count": 8 },
+      { "name": "Applied Problem Solving", "count": 8 },
+      { "name": "Edge Cases & Analysis", "count": 4 }
+    ],
+    "rules": "Write standalone multiple-choice questions that test understanding rather than rote memorization."
+  },
+  "plan": [
+    {
+      "day": 1,
+      "title": "Foundations & Key Terms",
+      "tasks": [
+        { "command": "/lesson Core Concepts", "label": "Lesson: Core concepts overview" },
+        { "command": "/cards Key Terms", "label": "Flashcards: Essential definitions" },
+        { "command": "/quiz Core Concepts", "label": "Quiz: Check baseline understanding" }
+      ]
+    },
+    {
+      "day": 2,
+      "title": "Applied Practice & Spaced Review",
+      "tasks": [
+        { "command": "/review", "label": "Review: Due spaced-repetition items" },
+        { "command": "/lesson Applied Methods", "label": "Lesson: Applied problem solving" },
+        { "command": "/quiz Applied Methods", "label": "Quiz: Practice questions" }
+      ]
+    },
+    {
+      "day": 3,
+      "title": "Checkpoint Assessment",
+      "tasks": [
+        { "command": "/review", "label": "Review: Weakest topics" },
+        { "command": "/exam", "label": "Mock exam: Timed checkpoint" }
+      ]
+    }
+  ]
+}

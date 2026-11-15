@@ -1,0 +1,159 @@
+[English](README.md) · [Türkçe](README.tr.md)
+
+# studia
+
+`studia`, Rust ile geliştirilmiş çift dilli (Türkçe / İngilizce), çapraz platform yapay zeka destekli çalışma asistanıdır. Yerel ders materyallerinizi (`pdf`, `docx`, `md`, `txt`) indeksler, isteğe bağlı `course.json` dosyalarıyla derse özel çalışma planları yönetir, etkileşimli quiz/deneme sınavları ve Leitner aralıklı tekrar (kutu 1–5) oturumları yürütür, Anki bilgi kartı desteleri üretir ve aynı SQLite veritabanı (`data/studia.db`) üzerinden hem terminal **TUI** hem de **Telegram botu** olarak çalışır.
+
+## Özellikler
+
+- **Terminal Arayüzü (TUI) ve Telegram Botu**: Klavye odaklı terminal arayüzünden (`ratatui`) veya Telegram üzerinden (`studia listen`) aynı ilerleme ve veritabanıyla çalışın.
+- **Canlı Çift Dil Desteği (`tr` / `en`)**: Başlangıçta sistem dilini otomatik algılar (`--lang > veritabanı > STUDIA_LANG > sistem dili > en`); çalışma sırasında TUI'da `F4` tuşuyla veya bot/TUI komut satırında `/lang tr|en` ile anında değiştirilebilir.
+- **Dersten Bağımsız Yapı**: `kaynaklar/<ders>/` altına notlarınızı ekleyin; isterseniz `course.json` ile eğitmen kimliği, deneme sınavı soru/şık sayısı, kategori dağılımı ve günlük çalışma planı tanımlayın.
+- **Esnek Yapay Zeka Sağlayıcıları**: Gemini HTTP API, OpenAI (veya `STUDIA_AI_BASE_URL` üzerinden Ollama gibi OpenAI uyumlu sunucular), CLI araçları (`agy`, `claude`, `codex`, `gemini`) ve özel komut şablonları (`STUDIA_AI_PROVIDER=custom`) desteklenir.
+- **Aralıklı Tekrar ve Anki Kartları**: Yanlış yanıtlanan sorular 5 kutulu Leitner tekrar kuyruğuna alınır ve tekrarda aynı kuralı farklı bağlamda test eden taze varyasyonlar üretilir; kavram kartları `anki/` altına `.txt` olarak kaydedilir.
+- **Çevrimdışı Sistem Kontrolü**: `studia doctor` komutu `kaynaklar/`, `curl`, `pdftotext`, AI ayarları, `.env` dosya izinleri ve SQLite bütünlüğünü (`PRAGMA quick_check`) denetler.
+
+## Hızlı Başlangıç
+
+### Gereksinimler
+
+- **Rust 1.89+** (`cargo build --release --locked`) veya hazır release ikilisi
+- `PATH` içinde **`curl`** (Telegram ve HTTP AI istekleri için)
+- **`pdftotext`** (Poppler, isteğe bağlı — yalnızca `.pdf` dosyalarını indekslemek için gereklidir; `.md`, `.txt` ve `.docx` ek araç gerektirmeden çalışır)
+
+### Kurulum ve Çalıştırma
+
+```bash
+git clone https://github.com/zodicall/studia.git
+cd studia
+cargo build --release --locked
+```
+
+1. Örnek ortam dosyasını kopyalayın ve AI sağlayıcınızı ayarlayın:
+
+   ```bash
+   cp .env.example .env
+   chmod 600 .env   # Unix/macOS üzerinde önerilir
+   ```
+
+2. Bir ders klasörü oluşturup kaynak belgelerinizi ekleyin (isterseniz [`examples/`](examples/) içindeki şablonlardan birini kopyalayın):
+
+   ```bash
+   mkdir -p kaynaklar/Matematik
+   # kaynaklar/Matematik/ içine .md, .txt, .docx veya .pdf dosyaları ekleyin
+   cp examples/general-course/course.json kaynaklar/Matematik/course.json
+   ```
+
+3. Sistem kontrolünü çalıştırın, kaynakları indeksleyin ve TUI'yı başlatın:
+
+   ```bash
+   cargo run --release -- doctor
+   cargo run --release -- index
+   cargo run --release -- --lang tr
+   ```
+
+## Yapay Zeka Sağlayıcı Ayarları
+
+Öncelik sırası: **İşletim sistemi ortam değişkenleri > `<root>/.env` > `<root>/data/.env`**.
+
+| Değişken | Açıklama | Varsayılan |
+| :--- | :--- | :--- |
+| `STUDIA_AI_PROVIDER` | `auto`, `gemini`, `openai`, `agy`, `claude`, `codex`, `gemini-cli`, `custom` | `auto` |
+| `STUDIA_AI_MODEL` | İsteğe bağlı model adı | `gemini-2.5-flash` / `gpt-4o-mini` |
+| `STUDIA_AI_BASE_URL` | Özel API adresi (örn. yerel Ollama için `http://localhost:11434/v1`) | Sağlayıcı varsayılanı |
+| `GEMINI_API_KEY` | Gemini API anahtarı (`STUDIA_GEMINI_API_KEY` de desteklenir) | — |
+| `OPENAI_API_KEY` | OpenAI / uyumlu API anahtarı (`STUDIA_OPENAI_API_KEY`, `STUDIA_AI_API_KEY`) | — |
+| `STUDIA_AI_CMD` | `custom` sağlayıcı için komut şablonu (`{prompt_file}`, `{schema_file}`) | — |
+| `STUDIA_AI_TIMEOUT_SECS` | Alt süreç AI zaman aşımı saniyesi (`0` devre dışı bırakır) | `180` |
+| `STUDIA_LANG` | Başlangıç dili (`tr` \| `en`) | Otomatik |
+
+`STUDIA_AI_PROVIDER=auto` iken kontrol sırası: `GEMINI_API_KEY` → `OPENAI_API_KEY` → `PATH` üzerinde `agy` → `claude` → `codex` → `gemini`.
+
+## Telegram Bot Kurulumu
+
+1. `@BotFather` ile bot oluşturup bot token'ını ve sayısal sohbet kimliğinizi (`chat_id`) alın.
+2. `.env` dosyanıza ekleyin:
+
+   ```env
+   STUDIA_TELEGRAM_TOKEN=123456:bot-token
+   STUDIA_TELEGRAM_CHAT_ID=123456789
+   STUDIA_MORNING=08:30
+   ```
+
+3. Dinleyiciyi doğrudan veya TUI içinde `F2` ile başlatın:
+
+   ```bash
+   studia listen
+   ```
+
+   Bot yalnızca `STUDIA_TELEGRAM_CHAT_ID` ile eşleşen sohbetten gelen mesajları işler; diğer sohbetler sessizce yok sayılır.
+
+## Ders Özelleştirme (`course.json`)
+
+İsteğe bağlı olarak `kaynaklar/<ders>/course.json` ekleyerek şunları tanımlayabilirsiniz:
+
+- `title` & `persona`: Görünen ders adı ve yapay zeka eğitmen yönergesi.
+- `exam`: Soru sayısı (`1..=200`), şık sayısı (`4` veya `5`), kategori dağılımı ve sınav kuralları.
+- `plan`: Sıralı günlük çalışma planı (`day`, `title`, `tasks`: komut + etiket).
+
+Hazır, telif hakkı içermeyen örnek şablonlar:
+- [`examples/general-course/course.json`](examples/general-course/course.json)
+- [`examples/academic-english/course.json`](examples/academic-english/course.json)
+
+## CLI, TUI ve Bot Komutları
+
+### CLI Kullanımı
+
+```text
+studia [--root <dizin>] [--lang tr|en] [tui|listen|index|doctor]
+studia --help | -h
+studia --version | -V
+```
+
+### TUI Kısayolları
+
+| Tuş | İşlev |
+| :--- | :--- |
+| `1`–`6` / `Tab` / `Shift+Tab` | Sekme değiştir (`Sor`, `Quiz`, `Tekrar`, `İstatistik`, `Bugün`, `Denemeler`) |
+| `↑` / `↓` | Aktif dersi değiştir (veya Bugün/Denemeler listesinde gezin) |
+| `F1` / `?` | Yardım penceresini aç/kapat |
+| `F2` | Telegram dinleyicisini başlat/durdur |
+| `F3` | AI Koçu aç/kapat (bir sonraki çalışma adımını seçip başlatır) |
+| `F4` | Arayüz ve AI dilini canlı değiştir (`TR` ↔ `EN`) |
+| `Enter` | Komut çalıştır, görevi başlat veya girdi aç |
+| `Esc` | Girdiyi iptal et / aktif quiz veya arka plan AI işini sonlandır |
+
+### Çift Dilli Komutlar
+
+Tüm komutların hem Türkçe hem İngilizce biçimi geçerlidir:
+
+| Türkçe | İngilizce | Açıklama |
+| :--- | :--- | :--- |
+| `/yardim` | `/help` | Komut özeti ve menü |
+| `/dersler` | `/courses` | Dersleri istatistiklerle listele |
+| `/ders <ad>` | `/course <name>` | Aktif dersi değiştir |
+| `/anlat <konu>` | `/explain <topic>` *(ve `/lesson`)* | Konu anlatımı + 5 soruluk kazanım testi |
+| `/quiz [konu] [n]` | `/quiz [topic] [n]` | Yeni quiz üret veya kayıtlı soruları çöz |
+| `/kazanim <konu> [n]` | `/practice <topic> [n]` | Odaklı pekiştirme testi |
+| `/tekrar [n] [orijinal]` | `/review [n] [exact]` | Zamanı gelen yanlışları tekrar et |
+| `/kelime <konu> [n]` | `/cards <topic> [n]` | Anki için kavram/kelime kartı destesi üret |
+| `/deneme [n]` | `/exam [n]` | Tam deneme sınavı başlat |
+| `/denemeler [sıra]` | `/exams [index]` | Geçmiş denemeler ve AI koç analizi |
+| `/yanlislar` | `/mistakes` | Derslere göre tekrar sayıları |
+| `/bugun` | `/today` | Bugünün çalışma planı görevleri |
+| `/plan [baslat\|gun\|gec]` | `/plan [start\|day\|goto]` | Çalışma planını başlat veya incele |
+| `/lang <tr\|en>` | `/lang <tr\|en>` | Dili kalıcı olarak değiştir |
+| `/test` | `/test` | Çevrimdışı örnek soru dene |
+| `/iptal` | `/cancel` | Çalışan AI işini veya quizi iptal et |
+
+## Sorun Giderme (`doctor`)
+
+Kurulum sorunlarını çevrimdışı incelemek için `studia doctor` çalıştırın:
+- **`curl bulunamadı`**: `curl` kurup `PATH` dizinine ekleyin.
+- **`pdftotext bulunamadı`**: PDF dosyalarından çalışıyorsanız Poppler (`pdftotext`) kurun.
+- **`Ortam dosyası izinleri çok açık`**: Unix/macOS'ta `chmod 600 .env` uygulayın.
+- **`non-loopback http://`**: Uzak sunucu adreslerinde mümkünse `https://` kullanın.
+
+## Güvenlik ve Lisans
+
+Güvenlik sınırları ve bildirim süreci için [SECURITY.md](SECURITY.md), lisans koşulları için [LICENSE](LICENSE) dosyasına bakın.
