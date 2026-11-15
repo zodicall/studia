@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -34,27 +38,33 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Setup Rust target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
 
       - name: Stage release bundle (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          PKG="studia-${{ github.ref_name }}-${{ matrix.target }}"
+          PKG="studia-${RELEASE_TAG}-${TARGET}"
           mkdir -p "dist/${PKG}"
-          cp "target/${{ matrix.target }}/release/studia" "dist/${PKG}/"
-          cp README.md README.tr.md LICENSE .env.example "dist/${PKG}/"
+          cp "target/${TARGET}/release/studia" "dist/${PKG}/"
+          cp README.md README.tr.md LICENSE THIRD_PARTY_NOTICES.txt .env.example "dist/${PKG}/"
           cp -r examples "dist/${PKG}/"
           tar -C dist -czf "${PKG}.tar.gz" "${PKG}"
           shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
@@ -62,19 +72,22 @@ jobs:
       - name: Stage release bundle (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $pkg = "studia-${{ github.ref_name }}-${{ matrix.target }}"
+          $pkg = "studia-$env:RELEASE_TAG-$env:TARGET"
           New-Item -ItemType Directory -Force -Path "dist/$pkg" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/studia.exe" "dist/$pkg/"
-          Copy-Item README.md, README.tr.md, LICENSE, .env.example "dist/$pkg/"
+          Copy-Item "target/$env:TARGET/release/studia.exe" "dist/$pkg/"
+          Copy-Item README.md, README.tr.md, LICENSE, THIRD_PARTY_NOTICES.txt, .env.example "dist/$pkg/"
           Copy-Item -Recurse examples "dist/$pkg/"
           Compress-Archive -Path "dist/$pkg" -DestinationPath "$pkg.zip" -Force
           $hash = (Get-FileHash -Algorithm SHA256 "$pkg.zip").Hash.ToLowerInvariant()
-          "$hash  $pkg.zip" | Out-File -Encoding ascii "$pkg.zip.sha256"
+          [System.IO.File]::WriteAllText((Join-Path $PWD "$pkg.zip.sha256"), "$hash  $pkg.zip`n", [System.Text.UTF8Encoding]::new($false))
 
       - name: Upload target artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -91,20 +104,21 @@ jobs:
       contents: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Combine SHA-256 checksums
+      - name: Combine and verify SHA-256 checksums
         shell: bash
         run: |
           set -euo pipefail
           cd artifacts
-          cat *.sha256 > SHA256SUMS.txt
+          cat *.sha256 | tr -d '\r' > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           files: |

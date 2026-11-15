@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   check-and-test:
     name: Build & Test (${{ matrix.os }})
@@ -18,12 +22,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Setup Rust 1.89+
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
 
@@ -36,17 +40,34 @@ jobs:
       - name: Run test suite (locked)
         run: cargo test --locked
 
+  msrv:
+    name: MSRV Check (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust 1.89
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.89"
+
+      - name: Check MSRV compatibility
+        run: cargo check --locked
+
   security-and-hygiene:
     name: Security Audit & Release Hygiene
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@4a6b319cfdbbef217de010107f48bb9a4d8d0025 # cargo-audit
 
       - name: Run cargo audit
         run: cargo audit
@@ -57,7 +78,8 @@ jobs:
           set -euo pipefail
           # Reject leaked personal paths or legacy artifacts in shipped source/docs/examples.
           if git grep -nE '(C:\\Users\\|/Users/|/home/)' -- \
-            src/ examples/ README.md README.tr.md CONTRIBUTING.md SECURITY.md .env.example Cargo.toml; then
+            src/ examples/ docs/ .github/ README.md README.tr.md CHANGELOG.md CONTRIBUTING.md SECURITY.md .env.example Cargo.toml \
+            ':!.github/workflows/ci.yml'; then
             echo "::error::Personal filesystem path found in tracked files."
             exit 1
           fi
