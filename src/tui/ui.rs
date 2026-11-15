@@ -70,7 +70,63 @@ Today    ←/→ change day · ↑/↓ task · Enter run · b start plan
          F3 toggle coach: AI chooses and launches next step
 Everywhere PgUp / PgDn scroll · Esc cancel AI · F1 / ? help";
 
+/// Terminal kontrol karakterlerini ve ANSI CSI/OSC kaçış dizilerini temizler.
+pub(crate) fn sanitize_tui_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(ch) = rest.chars().next() {
+        if let Some(after_csi) = rest.strip_prefix("\x1b[") {
+            let mut end = 0;
+            for (idx, b) in after_csi.bytes().enumerate() {
+                if (0x40..=0x7E).contains(&b) {
+                    end = idx + 1;
+                    break;
+                }
+                if !(0x20..=0x3F).contains(&b) {
+                    end = idx;
+                    break;
+                }
+                end = idx + 1;
+            }
+            rest = &after_csi[end..];
+            continue;
+        }
+        if let Some(after_osc) = rest.strip_prefix("\x1b]") {
+            let mut end = after_osc.len();
+            let bytes = after_osc.as_bytes();
+            let mut idx = 0;
+            while idx < bytes.len() {
+                if bytes[idx] == 0x07 {
+                    end = idx + 1;
+                    break;
+                }
+                if bytes[idx] == 0x1B && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
+                    end = idx + 2;
+                    break;
+                }
+                idx += 1;
+            }
+            rest = &after_osc[end..];
+            continue;
+        }
+        if let Some(after_crlf) = rest.strip_prefix("\r\n") {
+            out.push('\n');
+            rest = after_crlf;
+            continue;
+        }
+        rest = &rest[ch.len_utf8()..];
+        match ch {
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn panel(title: &str) -> Block<'static> {
+    let title = sanitize_tui_text(title);
     Block::bordered()
         .border_type(BorderType::Rounded)
         .title(Line::styled(
@@ -151,6 +207,14 @@ fn inline_spans(text: &str, style: Style) -> Vec<Span<'static>> {
     if text.is_empty() {
         return vec![];
     }
+    let clean = sanitize_tui_text(text);
+    inline_spans_clean(&clean, style)
+}
+
+fn inline_spans_clean(text: &str, style: Style) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return vec![];
+    }
     let mut spans = Vec::new();
     let mut remaining = text;
     while !remaining.is_empty() {
@@ -169,7 +233,7 @@ fn inline_spans(text: &str, style: Style) -> Vec<Span<'static>> {
             if literal {
                 spans.push(Span::styled(inner.to_string(), inner_style));
             } else {
-                spans.extend(inline_spans(inner, inner_style));
+                spans.extend(inline_spans_clean(inner, inner_style));
             }
             remaining = &remaining[start + marker * 2 + len..];
         } else {
@@ -184,13 +248,18 @@ fn inline_spans(text: &str, style: Style) -> Vec<Span<'static>> {
 }
 
 fn markdown_line(line: &str) -> Line<'static> {
+    let clean = sanitize_tui_text(line);
+    markdown_line_clean(&clean)
+}
+
+fn markdown_line_clean(line: &str) -> Line<'static> {
     let trimmed = line.trim_start();
     if trimmed == "---" {
         return Line::default();
     }
     if let Some(rest) = trimmed.strip_prefix('#') {
         let heading = rest.trim_start_matches('#').trim();
-        return Line::from(inline_spans(
+        return Line::from(inline_spans_clean(
             heading,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
@@ -204,17 +273,18 @@ fn markdown_line(line: &str) -> Line<'static> {
             format!("{indent}• "),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )];
-        spans.extend(inline_spans(rest.trim_start(), Style::default()));
+        spans.extend(inline_spans_clean(rest.trim_start(), Style::default()));
         return Line::from(spans);
     }
-    Line::from(inline_spans(line, Style::default()))
+    Line::from(inline_spans_clean(line, Style::default()))
 }
 
 fn markdown(text: &str) -> Text<'static> {
     if text.is_empty() {
         return Text::default();
     }
-    Text::from(text.lines().map(markdown_line).collect::<Vec<_>>())
+    let clean = sanitize_tui_text(text);
+    Text::from(clean.lines().map(markdown_line_clean).collect::<Vec<_>>())
 }
 
 fn panel_text(frame: &mut Frame, area: Rect, title: &str, text: Text<'static>, scroll: u16) {
@@ -410,9 +480,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     let activity = app.spinner();
     let (line, color) = match &activity {
-        Some(text) => (text.clone(), ACCENT),
-        None if app.status.starts_with('✓') => (app.status.clone(), GOOD),
-        None => (app.status.clone(), WARN),
+        Some(text) => (sanitize_tui_text(text), ACCENT),
+        None => {
+            let clean = sanitize_tui_text(&app.status);
+            let color = if clean.starts_with('✓') { GOOD } else { WARN };
+            (clean, color)
+        }
     };
     frame.render_widget(
         Paragraph::new(Line::styled(format!(" {line}"), Style::default().fg(color))),
@@ -455,7 +528,7 @@ fn draw_subjects(frame: &mut Frame, area: Rect, app: &App) {
             };
             ListItem::new(Text::from(vec![
                 Line::styled(
-                    subject.name.clone(),
+                    sanitize_tui_text(&subject.name),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Line::styled(counts, Style::default().fg(MUTED)),
@@ -984,7 +1057,7 @@ fn draw_plan(frame: &mut Frame, content: Rect, app: &App) {
                     } else {
                         "⬜"
                     };
-                    ListItem::new(format!("{mark} {}", task.label))
+                    ListItem::new(format!("{mark} {}", sanitize_tui_text(&task.label)))
                 })
                 .collect()
         })
@@ -1171,8 +1244,8 @@ fn draw_stats(frame: &mut Frame, content: Rect, app: &App) {
     let rows = app.stats.iter().map(|session| {
         Row::new([
             session.started.format("%Y-%m-%d %H:%M").to_string(),
-            session.subject.clone(),
-            session.topic.clone(),
+            sanitize_tui_text(&session.subject),
+            sanitize_tui_text(&session.topic),
             format!("{}/{}", session.correct, session.total),
             format!("{:.1}", session.minutes),
         ])
@@ -1653,5 +1726,58 @@ mod tests {
         app.help = true;
         let help_screen = render(&app, 100, 30);
         assert!(help_screen.contains("Help"), "{help_screen}");
+    }
+
+    #[test]
+    fn spec_tui_control_char_and_escape_sanitization() {
+        // CSI renk ve imleç kaçışları temizlenir.
+        assert_eq!(
+            sanitize_tui_text("\x1b[31mKırmızı\x1b[0m \x1b[2J\x1b[10;20H\x1b[?25hMetin"),
+            "Kırmızı Metin"
+        );
+
+        // OSC başlık (BEL ile) ve köprü (ST ile) kaçışları temizlenir.
+        assert_eq!(
+            sanitize_tui_text(
+                "\x1b]0;Sahte Başlık\x07Normal \x1b]8;;https://example.com\x1b\\Bağlantı\x1b]8;;\x1b\\"
+            ),
+            "Normal Bağlantı"
+        );
+
+        // BEL, NUL, BS, C1 (\u{009b}) ve \r üzerine yazma denemeleri temizlenir; \r\n -> \n, \t -> 4 boşluk.
+        assert_eq!(
+            sanitize_tui_text("ilk\r\nüzerine\ryaz\t\x07\x00\x08\u{007f}\u{009b}31mson"),
+            "ilk\nüzerineyaz    31mson"
+        );
+
+        // Türkçe UTF-8 karakterler korunur.
+        let turkish = "ğüşiöçİĞÜŞÖÇ";
+        assert_eq!(sanitize_tui_text(turkish), turkish);
+
+        // Markdown sözdizimi korunur ve kaçış dizileri sızmaz.
+        let md = markdown("### \x1b[31m**Başlık**\x1b[0m\n- *Öğe\x07* `kod\r`\tğüşiöçİĞÜŞÖÇ");
+        let rendered_lines: Vec<String> = md
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(rendered_lines[0], "Başlık");
+        assert_eq!(rendered_lines[1], "• Öğe kod    ğüşiöçİĞÜŞÖÇ");
+
+        // Tam TUI render yolunda durum çubuğu, yanıt ve ders adları temizlenir.
+        let (_root, mut app) = app_with_subject();
+        app.status = "\x1b[32m✓ Hazır\x07\r\x1b]0;pwn\x07".into();
+        app.answer = "Yanıt\x1b[2J **kalın**\u{009b} ğüşiöç".into();
+        let screen = render(&app, 100, 30);
+        assert!(screen.contains("✓ Hazır"));
+        assert!(screen.contains("Yanıt kalın ğüşiöç"));
+        assert!(!screen.contains('\x1b'));
+        assert!(!screen.contains('\x07'));
+        assert!(!screen.contains('\u{009b}'));
     }
 }
