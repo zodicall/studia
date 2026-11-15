@@ -1,9 +1,8 @@
 name: CI
 
+# Manual trigger only so pushes/PRs do not consume GitHub Actions quota automatically.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

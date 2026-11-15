@@ -6,7 +6,6 @@
 
 [English](README.md) · **Türkçe**
 
-[![CI](https://github.com/zodicall/studia/actions/workflows/ci.yml/badge.svg)](https://github.com/zodicall/studia/actions/workflows/ci.yml)
 [![Lisans: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-orange.svg)](Cargo.toml)
 [![Platformlar](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](https://github.com/zodicall/studia/releases)
