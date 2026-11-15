@@ -5,7 +5,11 @@ use std::{
     io::{self, Read, Write},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -146,6 +150,12 @@ pub fn parse_http_status_and_body(raw: &str) -> Result<(u16, String)> {
     Ok((code, body.to_string()))
 }
 
+fn curl_command() -> Command {
+    let mut cmd = Command::new(CURL_BIN);
+    cmd.args(["--disable", "-sS", "-K", "-"]);
+    cmd
+}
+
 pub fn http_post_json(
     url: &str,
     headers: &[(&str, &str)],
@@ -154,8 +164,7 @@ pub fn http_post_json(
     secrets: &[&str],
 ) -> Result<(u16, String)> {
     let cfg = build_http_post_config(url, headers, body_file, timeout_secs)?;
-    let mut cmd = Command::new(CURL_BIN);
-    cmd.args(["-sS", "-K", "-"]);
+    let mut cmd = curl_command();
     let timeout = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs.saturating_add(5)));
     let raw = command_output_with_timeout(&mut cmd, &cfg, timeout, MAX_HTTP_BYTES, secrets)
         .map_err(|err| invalid(config::redact_secrets(&err.to_string(), secrets)))?;
@@ -163,6 +172,16 @@ pub fn http_post_json(
 }
 
 fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pgid = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .args(["-KILL", &pgid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -186,6 +205,11 @@ pub fn command_output_with_timeout(
     max_bytes: usize,
     secrets: &[&str],
 ) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -214,6 +238,8 @@ pub fn command_output_with_timeout(
         Err(err) => Err(err),
     });
 
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let exceeded_flag = Arc::clone(&exceeded);
     let (tx, rx) = mpsc::sync_channel::<io::Result<(Vec<u8>, bool)>>(1);
     let _reader = thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -226,6 +252,7 @@ pub fn command_output_with_timeout(
                 }
                 Ok(n) => {
                     if out.len().saturating_add(n) > max_bytes {
+                        exceeded_flag.store(true, Ordering::Release);
                         let _ = tx.send(Ok((out, true)));
                         break;
                     }
@@ -246,6 +273,12 @@ pub fn command_output_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if exceeded.load(Ordering::Acquire) {
+                    terminate_child(&mut child);
+                    return Err(invalid(
+                        "Alt süreç çıktısı boyut sınırını aştı / Subprocess output exceeded size cap.",
+                    ));
+                }
                 if let Some(limit) = deadline
                     && Instant::now() >= limit
                 {
@@ -305,8 +338,7 @@ pub fn telegram_call_with_token(
     fields: &[(&str, &str)],
 ) -> Result<Value> {
     let cfg = telegram_request(token, method, fields)?;
-    let mut cmd = Command::new(CURL_BIN);
-    cmd.args(["-sS", "-K", "-"]);
+    let mut cmd = curl_command();
     parse_response(command_output_with_timeout(
         &mut cmd,
         &cfg,
@@ -336,7 +368,7 @@ pub fn accepted(update: &Value, chat_id: &str) -> bool {
 
 pub fn open_listener_lock(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        config::ensure_private_dir(parent)?;
     }
     let file = OpenOptions::new()
         .read(true)
@@ -350,6 +382,7 @@ pub fn open_listener_lock(path: &Path) -> Result<File> {
         }
         TryLockError::Error(io_err) => io_err.into(),
     })?;
+    config::set_private_file_permissions(path)?;
     Ok(file)
 }
 
@@ -371,7 +404,7 @@ pub fn log(root: &Path, message: &str) {
 pub fn log_file(root: &Path, message: &str) {
     // Callers supply fixed messages only; never log incoming text, tokens, or process output.
     let data_dir = root.join("data");
-    if fs::create_dir_all(&data_dir).is_err() {
+    if config::ensure_private_dir(&data_dir).is_err() {
         return;
     }
     let log_path = data_dir.join("bot.log");
@@ -380,9 +413,12 @@ pub fn log_file(root: &Path, message: &str) {
     {
         let backup = data_dir.join("bot.log.1");
         let _ = fs::remove_file(&backup);
-        let _ = fs::rename(&log_path, &backup);
+        if fs::rename(&log_path, &backup).is_ok() {
+            let _ = config::set_private_file_permissions(&backup);
+        }
     }
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = config::set_private_file_permissions(&log_path);
         let _ = writeln!(file, "{} {message}", chrono::Utc::now().to_rfc3339());
     }
 }
@@ -601,5 +637,92 @@ mod tests {
             }
         }
         assert!(!accepted(&json!({}), "42"));
+    }
+
+    #[test]
+    fn spec_sec_curl_disable_first_and_immediate_size_cap() {
+        let cmd = curl_command();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args.first().copied(),
+            Some(std::ffi::OsStr::new("--disable"))
+        );
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsStr::new("--disable"),
+                std::ffi::OsStr::new("-sS"),
+                std::ffi::OsStr::new("-K"),
+                std::ffi::OsStr::new("-"),
+            ]
+        );
+
+        let start = Instant::now();
+        #[cfg(windows)]
+        let mut flood = {
+            let mut c = Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-Command",
+                "1..200 | % { 'x' * 200 }; Start-Sleep -Seconds 15",
+            ]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut flood = {
+            let mut c = Command::new("sh");
+            c.args(["-c", "yes 1234567890 | head -n 500; sleep 15"]);
+            c
+        };
+        let err =
+            command_output_with_timeout(&mut flood, "", Some(Duration::from_secs(15)), 1024, &[])
+                .unwrap_err()
+                .to_string();
+        let elapsed = start.elapsed();
+        assert!(
+            err.contains("size cap") || err.contains("boyut sınırını"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "size-cap termination stalled: {elapsed:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("priv/listen.lock");
+        let _guard = open_listener_lock(&lock_path).unwrap();
+        log_file(dir.path(), "security test event");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.path().join("priv"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(dir.path().join("data"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(dir.path().join("data/bot.log"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 }

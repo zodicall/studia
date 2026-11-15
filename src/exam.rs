@@ -349,6 +349,30 @@ fn resource_bank_path(root: &Path, subject: &str, slug: &str) -> Result<PathBuf>
         .join(format!("{slug}.json")))
 }
 
+fn validate_bank(bank: &Bank) -> Result<()> {
+    if bank.title.trim().is_empty() {
+        return Err(invalid("Sınav bankası başlığı boş olamaz."));
+    }
+    for (idx, q) in bank.questions.iter().enumerate() {
+        if q.question.trim().is_empty() {
+            return Err(invalid(format!("{}. soru metni boş.", idx + 1)));
+        }
+        if !(4..=5).contains(&q.choices.len()) {
+            return Err(invalid(format!(
+                "{}. sorunun şık sayısı 4 veya 5 olmalıdır.",
+                idx + 1
+            )));
+        }
+        if q.answer_index >= q.choices.len() {
+            return Err(invalid(format!(
+                "{}. soru için cevap indeksi şık sayısı dışında.",
+                idx + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn load_file(path: &Path) -> Result<Option<Bank>> {
     if !path.is_file() {
         return Ok(None);
@@ -360,16 +384,15 @@ fn load_file(path: &Path) -> Result<Option<Bank>> {
             path.display()
         )));
     }
-    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+    let bank: Bank = serde_json::from_str(&fs::read_to_string(path)?)?;
+    validate_bank(&bank)?;
+    Ok(Some(bank))
 }
 
 #[cfg(test)]
 pub fn save(root: &Path, subject: &str, slug: &str, bank: &Bank) -> Result<PathBuf> {
     let path = saved_bank_path(root, subject, slug)?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    fs::write(&path, serde_json::to_string_pretty(bank)?)?;
+    crate::config::atomic_write_private(&path, serde_json::to_string_pretty(bank)?.as_bytes())?;
     Ok(path)
 }
 
@@ -383,14 +406,32 @@ pub fn load(root: &Path, subject: &str, slug: &str) -> Result<Option<Bank>> {
     load_file(&resource)
 }
 
-fn collect_banks_in_dir(dir: &Path, out: &mut BTreeMap<String, DiscoveredBank>) -> Result<()> {
+fn collect_banks_in_dir(
+    base_root: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, DiscoveredBank>,
+) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
+    }
+    let canon_base = fs::canonicalize(base_root)?;
+    let canon_dir = fs::canonicalize(dir)?;
+    if canon_dir == canon_base || !canon_dir.starts_with(&canon_base) {
+        return Err(invalid(format!(
+            "Sınav dizini izin verilen kök dışına taşıyor: {}",
+            dir.display()
+        )));
     }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(canon_file) = fs::canonicalize(&path) else {
+            continue;
+        };
+        if !canon_file.starts_with(&canon_dir) {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -419,14 +460,12 @@ fn collect_banks_in_dir(dir: &Path, out: &mut BTreeMap<String, DiscoveredBank>) 
 pub fn discover_banks(root: &Path, subject: &str) -> Result<Vec<DiscoveredBank>> {
     let subject = course::validate_identifier(subject)?;
     let mut found = BTreeMap::new();
-    collect_banks_in_dir(
-        &root.join("kaynaklar").join(subject).join("exams"),
-        &mut found,
-    )?;
-    collect_banks_in_dir(
-        &root.join("data").join("denemeler").join(subject),
-        &mut found,
-    )?;
+    let kaynaklar_root = root.join("kaynaklar");
+    let exams_dir = kaynaklar_root.join(subject).join("exams");
+    collect_banks_in_dir(&kaynaklar_root, &exams_dir, &mut found)?;
+    let denemeler_root = root.join("data").join("denemeler");
+    let denemeler_dir = denemeler_root.join(subject);
+    collect_banks_in_dir(&denemeler_root, &denemeler_dir, &mut found)?;
     Ok(found.into_values().collect())
 }
 
@@ -441,6 +480,9 @@ pub fn next_unused_bank(
             continue;
         }
         if let Some(bank) = load_file(&meta.path)? {
+            if bank.questions.is_empty() {
+                continue;
+            }
             return Ok(Some((meta, bank)));
         }
     }
@@ -592,7 +634,21 @@ mod tests {
 
         let practice = Bank {
             title: "Biology Practice 1".into(),
-            questions: vec![],
+            questions: vec![ai::Question {
+                question: "DNA stands for?".into(),
+                choices: [
+                    "Deoxyribonucleic acid",
+                    "Ribonucleic acid",
+                    "Amino acid",
+                    "Fatty acid",
+                ]
+                .map(String::from)
+                .into(),
+                answer_index: 0,
+                explanation: "Correct answer: 'Deoxyribonucleic acid'.".into(),
+                source: "practice".into(),
+                topic: Some("Genetics".into()),
+            }],
         };
         save(root, "Biology", "practice_1", &practice).unwrap();
 
@@ -655,5 +711,107 @@ mod tests {
         }]})
         .to_string();
         assert!(parse_items(&oob_raw, &(1..=1), &[4], "Quiz", 4).is_err());
+    }
+
+    #[test]
+    fn spec_sec_bank_invariants_and_canonical_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let bad_title = Bank {
+            title: "   ".into(),
+            questions: vec![],
+        };
+        let bad_title_path = save(root, "Bio", "bad_title", &bad_title).unwrap();
+        assert!(load_file(&bad_title_path).is_err());
+
+        let bad_q = Bank {
+            title: "Bad Q".into(),
+            questions: vec![ai::Question {
+                question: "  ".into(),
+                choices: ["a", "b", "c", "d"].map(String::from).into(),
+                answer_index: 0,
+                explanation: "e".into(),
+                source: "s".into(),
+                topic: None,
+            }],
+        };
+        let bad_q_path = save(root, "Bio", "bad_q", &bad_q).unwrap();
+        assert!(load_file(&bad_q_path).is_err());
+
+        let bad_choices = Bank {
+            title: "Bad Choices".into(),
+            questions: vec![ai::Question {
+                question: "Q?".into(),
+                choices: ["a", "b", "c"].map(String::from).into(),
+                answer_index: 0,
+                explanation: "e".into(),
+                source: "s".into(),
+                topic: None,
+            }],
+        };
+        let bad_choices_path = save(root, "Bio", "bad_choices", &bad_choices).unwrap();
+        assert!(load_file(&bad_choices_path).is_err());
+
+        let bad_ans = Bank {
+            title: "Bad Ans".into(),
+            questions: vec![ai::Question {
+                question: "Q?".into(),
+                choices: ["a", "b", "c", "d"].map(String::from).into(),
+                answer_index: 4,
+                explanation: "e".into(),
+                source: "s".into(),
+                topic: None,
+            }],
+        };
+        let bad_ans_path = save(root, "Bio", "bad_ans", &bad_ans).unwrap();
+        assert!(load_file(&bad_ans_path).is_err());
+
+        // Empty-questions bank is still discoverable (for legacy deletion) but skipped by next_unused_bank.
+        let empty_bank = Bank {
+            title: "Empty Bank".into(),
+            questions: vec![],
+        };
+        save(root, "Bio", "empty_bank", &empty_bank).unwrap();
+        let discovered = discover_banks(root, "Bio").unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].slug, "empty_bank");
+
+        let store = Store::open(&root.join("data/studia.db")).unwrap();
+        assert!(next_unused_bank(&store, root, "Bio").unwrap().is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = root.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            let escaped = Bank {
+                title: "Escaped".into(),
+                questions: vec![ai::Question {
+                    question: "Q?".into(),
+                    choices: ["a", "b", "c", "d"].map(String::from).into(),
+                    answer_index: 0,
+                    explanation: "e".into(),
+                    source: "s".into(),
+                    topic: None,
+                }],
+            };
+            fs::write(
+                outside.join("leak.json"),
+                serde_json::to_string(&escaped).unwrap(),
+            )
+            .unwrap();
+            fs::create_dir_all(root.join("kaynaklar/EscapeDir")).unwrap();
+            symlink(&outside, root.join("kaynaklar/EscapeDir/exams")).unwrap();
+            assert!(discover_banks(root, "EscapeDir").is_err());
+
+            symlink(
+                outside.join("leak.json"),
+                root.join("data/denemeler/Bio/leak.json"),
+            )
+            .unwrap();
+            let bio = discover_banks(root, "Bio").unwrap();
+            assert!(bio.iter().all(|b| b.slug != "leak"));
+        }
     }
 }

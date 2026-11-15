@@ -75,7 +75,7 @@ pub fn validate_identifier(name: &str) -> Result<&str> {
         || name == "."
         || name == ".."
         || name.starts_with('-')
-        || name.contains(['/', '\\', '\0'])
+        || name.contains(['/', '\\', ':', '\0'])
         || name.chars().any(char::is_control)
     {
         return Err(invalid(format!("Invalid identifier: {name:?}")));
@@ -158,12 +158,29 @@ impl CourseConfig {
 
     pub fn load_or_default(root: &Path, subject: &str) -> Result<Self> {
         validate_identifier(subject)?;
-        let path = root.join("kaynaklar").join(subject).join("course.json");
+        let sources_root = root.join("kaynaklar");
+        let path = sources_root.join(subject).join("course.json");
         let meta = match fs::metadata(&path) {
             Ok(meta) => meta,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(err.into()),
         };
+        let canon_root = match fs::canonicalize(&sources_root) {
+            Ok(canon) => canon,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err.into()),
+        };
+        let canon_path = match fs::canonicalize(&path) {
+            Ok(canon) => canon,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err.into()),
+        };
+        if canon_path == canon_root || !canon_path.starts_with(&canon_root) {
+            return Err(invalid(format!(
+                "course.json escapes kaynaklar root: {}",
+                path.display()
+            )));
+        }
         if meta.len() > MAX_COURSE_JSON_BYTES {
             return Err(invalid(format!(
                 "course.json exceeds 2 MiB limit: {}",
@@ -234,5 +251,41 @@ mod tests {
         )
         .unwrap();
         assert!(CourseConfig::load_or_default(dir.path(), "Bad").is_err());
+    }
+
+    #[test]
+    fn spec_sec_colon_identifier_and_canonical_containment() {
+        for bad in ["C:secret", "foo:bar", ":ads", "C:\\Windows"] {
+            assert!(
+                validate_identifier(bad).is_err(),
+                "expected colon/traversal error for {bad:?}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // Missing kaynaklar returns default safely.
+        let missing = CourseConfig::load_or_default(dir.path(), "Physics").unwrap();
+        assert_eq!(missing, CourseConfig::default());
+
+        let kaynaklar = dir.path().join("kaynaklar");
+        fs::create_dir_all(&kaynaklar).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("course.json"), r#"{"title":"Escaped"}"#).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&outside, kaynaklar.join("Escaped")).unwrap();
+            assert!(CourseConfig::load_or_default(dir.path(), "Escaped").is_err());
+
+            fs::create_dir_all(kaynaklar.join("LinkedFile")).unwrap();
+            symlink(
+                outside.join("course.json"),
+                kaynaklar.join("LinkedFile/course.json"),
+            )
+            .unwrap();
+            assert!(CourseConfig::load_or_default(dir.path(), "LinkedFile").is_err());
+        }
     }
 }

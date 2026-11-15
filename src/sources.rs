@@ -8,6 +8,8 @@ use std::{
 
 const MAX_BYTES: usize = 25 * 1024 * 1024;
 const MAX_CHARS: usize = 50_000;
+const MAX_PDF_CACHE_CHARS: usize = 500_000;
+const MAX_PDF_OBJECTS: usize = 50_000;
 const MAX_DIR_DEPTH: usize = 16;
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -36,6 +38,9 @@ fn extract(name: &str, bytes: &[u8]) -> Result<Option<String>> {
         "txt" | "md" => Ok(Some(truncate(&String::from_utf8_lossy(bytes), MAX_CHARS))),
         "pdf" => {
             let document = lopdf::Document::load_mem(bytes)?;
+            if document.objects.len() > MAX_PDF_OBJECTS {
+                return Err(invalid("PDF çok karmaşık (50.000 nesne sınırını aşıyor)."));
+            }
             let pages = document.get_pages();
             let mut output = String::new();
             let mut output_chars = 0usize;
@@ -112,17 +117,25 @@ fn extract(name: &str, bytes: &[u8]) -> Result<Option<String>> {
 
 pub fn subjects(root: &Path) -> Result<Vec<String>> {
     let directory = root.join("kaynaklar");
-    if !directory.exists() {
+    let Ok(canon_root) = fs::canonicalize(&directory) else {
         return Ok(vec![]);
-    }
+    };
     let mut subjects = vec![];
-    for entry in fs::read_dir(directory)? {
+    for entry in fs::read_dir(&directory)? {
         let Ok(entry) = entry else { continue };
-        let Ok(meta) = fs::metadata(entry.path()) else {
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
-        // metadata follows junctions/symlinks, so a linked material folder counts while broken links skip safely.
+        // metadata follows junctions/symlinks inside kaynaklar while broken links skip safely;
+        // canonical containment ensures targets cannot escape the kaynaklar root.
         if !meta.is_dir() {
+            continue;
+        }
+        let Ok(canon_entry) = fs::canonicalize(&path) else {
+            continue;
+        };
+        if canon_entry == canon_root || !canon_entry.starts_with(&canon_root) {
             continue;
         }
         let Ok(name) = entry.file_name().into_string() else {
@@ -142,6 +155,7 @@ const SKIPPED_DIRECTORIES: [&str; 3] = ["_duplicates", "99_ARCHIVE", "exams"];
 
 fn files(
     directory: &Path,
+    canon_root: &Path,
     depth: usize,
     visited: &mut BTreeSet<PathBuf>,
     output: &mut Vec<PathBuf>,
@@ -149,7 +163,7 @@ fn files(
     let Ok(canon) = fs::canonicalize(directory) else {
         return Ok(());
     };
-    if !visited.insert(canon) {
+    if !canon.starts_with(canon_root) || !visited.insert(canon) {
         return Ok(());
     }
     for entry in fs::read_dir(directory)? {
@@ -164,7 +178,7 @@ fn files(
         }
         if kind.is_dir() {
             if depth < MAX_DIR_DEPTH && !SKIPPED_DIRECTORIES.contains(&name.as_str()) {
-                files(&path, depth + 1, visited, output)?;
+                files(&path, canon_root, depth + 1, visited, output)?;
             }
         } else if kind.is_file()
             && !name.eq_ignore_ascii_case("course.json")
@@ -173,7 +187,12 @@ fn files(
                     .contains(&extension.to_string_lossy().to_lowercase().as_str())
             })
         {
-            output.push(path);
+            let Ok(canon_file) = fs::canonicalize(&path) else {
+                continue;
+            };
+            if canon_file.starts_with(canon_root) {
+                output.push(path);
+            }
         }
     }
     if depth == 0 {
@@ -193,17 +212,19 @@ fn cache_name(relative: &Path) -> String {
 }
 
 pub fn index(root: &Path, force: bool) -> Result<usize> {
-    fs::create_dir_all(root.join("kaynaklar"))?;
-    fs::create_dir_all(root.join("data/metin"))?;
+    let sources_root = root.join("kaynaklar");
+    fs::create_dir_all(&sources_root)?;
+    let canon_kaynaklar = fs::canonicalize(&sources_root)?;
+    crate::config::ensure_private_dir(&root.join("data/metin"))?;
     let mut updated = 0;
     let subjects = subjects(root)?;
     for subject in &subjects {
-        let source = root.join("kaynaklar").join(subject);
+        let source = sources_root.join(subject);
         let cache = root.join("data/metin").join(subject);
-        fs::create_dir_all(&cache)?;
+        crate::config::ensure_private_dir(&cache)?;
         let mut paths = vec![];
         let mut visited = BTreeSet::new();
-        files(&source, 0, &mut visited, &mut paths)?;
+        files(&source, &canon_kaynaklar, 0, &mut visited, &mut paths)?;
         let mut expected = BTreeSet::new();
         for path in paths {
             let name = cache_name(path.strip_prefix(&source)?);
@@ -242,7 +263,7 @@ pub fn index(root: &Path, force: bool) -> Result<usize> {
                 };
                 match extracted {
                     Ok(Some(text)) => {
-                        fs::write(target, text)?;
+                        crate::config::atomic_write_private(&target, text.as_bytes())?;
                         updated += 1;
                     }
                     Ok(None) => {}
@@ -340,10 +361,9 @@ fn run_pdftotext(path: &Path) -> Option<String> {
             MAX_BYTES,
             &[],
         ) {
-            let text = clean_extracted(&stdout);
+            let text = truncate(&clean_extracted(&stdout), MAX_PDF_CACHE_CHARS);
             if !text.trim().is_empty() {
-                // The full text is cached: a cut here would hide the rest of a book from every
-                // later search. Chunk selection keeps each prompt small.
+                // Cached up to MAX_PDF_CACHE_CHARS so chunk selection covers large books safely.
                 return Some(text);
             }
         }
@@ -376,6 +396,25 @@ fn words(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn for_each_char_chunk(text: &str, chunk_chars: usize, mut f: impl FnMut(&str)) {
+    if text.is_empty() || chunk_chars == 0 {
+        return;
+    }
+    let mut start = 0usize;
+    let mut count = 0usize;
+    for (idx, _) in text.char_indices() {
+        if count == chunk_chars {
+            f(&text[start..idx]);
+            start = idx;
+            count = 0;
+        }
+        count += 1;
+    }
+    if start < text.len() {
+        f(&text[start..]);
+    }
+}
+
 /// Source text for one prompt: the chunks sharing the most words with `query`, capped at
 /// `PROMPT_CHARS`, so a large subject still fits in the AI context window.
 pub fn text(root: &Path, subject: &str, query: &str) -> Result<String> {
@@ -384,15 +423,27 @@ pub fn text(root: &Path, subject: &str, query: &str) -> Result<String> {
     if !subjects(root)?.iter().any(|name| name == subject) {
         return Err(invalid("Ders bulunamadı."));
     }
-    let directory = root.join("data/metin").join(subject);
+    let cache_root = root.join("data/metin");
+    let directory = cache_root.join(subject);
     let mut paths = vec![];
     if directory.exists() {
-        for entry in fs::read_dir(directory)? {
+        let canon_cache_root = fs::canonicalize(&cache_root)?;
+        let canon_dir = fs::canonicalize(&directory)?;
+        if !canon_dir.starts_with(&canon_cache_root) {
+            return Err(invalid("Önbellek dizini geçersiz."));
+        }
+        for entry in fs::read_dir(&directory)? {
             let entry = entry?;
-            if entry.file_type()?.is_file()
-                && entry.path().extension().is_some_and(|ext| ext == "txt")
+            let path = entry.path();
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_file()
+                && path.extension().is_some_and(|ext| ext == "txt")
+                && let Ok(canon_file) = fs::canonicalize(&path)
+                && canon_file.starts_with(&canon_cache_root)
             {
-                paths.push(entry.path());
+                paths.push(path);
             }
         }
     }
@@ -420,18 +471,16 @@ pub fn text(root: &Path, subject: &str, query: &str) -> Result<String> {
             .count()
             * 4;
         let content = fs::read_to_string(&path)?;
-        let chars: Vec<char> = content.chars().collect();
-        for piece in chars.chunks(CHUNK_CHARS) {
-            let piece: String = piece.iter().collect();
-            if piece.trim().is_empty() || !seen.insert(piece.clone()) {
-                continue;
+        for_each_char_chunk(&content, CHUNK_CHARS, |piece| {
+            if piece.trim().is_empty() || !seen.insert(piece.to_string()) {
+                return;
             }
             let raw_hits = words(&format!("{name} {piece}"))
                 .intersection(&wanted)
                 .count();
             let hits = raw_hits + name_bonus;
-            chunks.push((hits, chunks.len(), name.clone(), piece));
-        }
+            chunks.push((hits, chunks.len(), name.clone(), piece.to_string()));
+        });
     }
     if chunks.is_empty() {
         return Err(invalid(
@@ -682,6 +731,91 @@ mod tests {
             symlink(&subject, subject.join("notes/loop_back")).unwrap();
             assert_eq!(subjects(root.path()).unwrap(), vec!["Ders".to_string()]);
             index(root.path(), false).unwrap();
+        }
+    }
+
+    #[test]
+    fn spec_sec_canonical_containment_pdf_caps_and_streaming_chunks() {
+        // Streaming char_indices chunking preserves multibyte Turkish text across boundaries.
+        let sample = "şğüıöçİabc";
+        let mut pieces = Vec::new();
+        for_each_char_chunk(sample, 4, |chunk| pieces.push(chunk.to_string()));
+        assert_eq!(pieces, vec!["şğüı", "öçİa", "bc"]);
+        assert_eq!(pieces.concat(), sample);
+
+        // PDF with > MAX_PDF_OBJECTS is rejected cleanly.
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(MAX_PDF_OBJECTS + 1);
+        for i in 1..=(MAX_PDF_OBJECTS + 1) {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{i} 0 obj\nnull\nendobj\n").as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes());
+        for off in offsets {
+            pdf.extend(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend(
+            format!(
+                "trailer\n<< /Size {} >>\nstartxref\n{xref}\n%%EOF\n",
+                MAX_PDF_OBJECTS + 2
+            )
+            .as_bytes(),
+        );
+        let err = extract("bomb.pdf", &pdf).unwrap_err().to_string();
+        assert!(err.contains("50.000"), "unexpected error: {err}");
+
+        // Symlinks pointing outside kaynaklar / data/metin must be skipped/rejected.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let root = tempfile::tempdir().unwrap();
+            let kaynaklar = root.path().join("kaynaklar");
+            let outside = root.path().join("outside");
+            fs::create_dir_all(kaynaklar.join("Safe")).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(kaynaklar.join("Safe/ok.txt"), "safe content").unwrap();
+            fs::write(outside.join("secret.txt"), "leaked secret").unwrap();
+
+            symlink(&outside, kaynaklar.join("EscapedSubject")).unwrap();
+            symlink(
+                outside.join("secret.txt"),
+                kaynaklar.join("Safe/escaped.txt"),
+            )
+            .unwrap();
+
+            assert_eq!(subjects(root.path()).unwrap(), vec!["Safe".to_string()]);
+            assert_eq!(index(root.path(), false).unwrap(), 1);
+            let ctx = text(root.path(), "Safe", "").unwrap();
+            assert!(ctx.contains("safe content"));
+            assert!(!ctx.contains("leaked secret"));
+
+            let cache_dir = root.path().join("data/metin/Safe");
+            assert_eq!(
+                fs::metadata(root.path().join("data/metin"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&cache_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let cached_file = cache_dir.join("ok.txt.txt");
+            assert_eq!(
+                fs::metadata(&cached_file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+
+            symlink(outside.join("secret.txt"), cache_dir.join("evil_cache.txt")).unwrap();
+            let ctx2 = text(root.path(), "Safe", "").unwrap();
+            assert!(!ctx2.contains("leaked secret"));
+
+            fs::remove_dir_all(&cache_dir).unwrap();
+            symlink(&outside, &cache_dir).unwrap();
+            assert!(text(root.path(), "Safe", "").is_err());
         }
     }
 }

@@ -33,58 +33,86 @@ pub fn now() -> String {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
         let is_memory =
             path == Path::new(":memory:") || path.to_string_lossy().contains("mode=memory");
+        if !is_memory && let Some(parent) = path.parent() {
+            crate::config::ensure_private_dir(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         if !is_memory {
-            conn.pragma_update(None, "journal_mode", "WAL")?;
+            crate::config::set_private_file_permissions(path)?;
+            for attempt in 0..10 {
+                match conn.pragma_update(None, "journal_mode", "WAL") {
+                    Ok(()) => break,
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if err.code == rusqlite::ErrorCode::DatabaseBusy && attempt < 9 =>
+                    {
+                        std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
         }
         // Support up to 5 choices (A–E); rebuild tables created with the old 0–3 CHECK.
-        let old: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ('questions','answers') AND sql LIKE '%BETWEEN 0 AND 3%')",
-            [],
-            |row| row.get(0),
-        )?;
-        if old {
-            conn.execute_batch(
-                "PRAGMA foreign_keys=OFF;
-                 BEGIN IMMEDIATE;
-                 CREATE TABLE questions_new(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, question TEXT NOT NULL, choices_json TEXT NOT NULL, answer_index INTEGER NOT NULL CHECK(answer_index BETWEEN 0 AND 4), explanation TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL);
-                 INSERT INTO questions_new SELECT * FROM questions;
-                 DROP TABLE questions;
-                 ALTER TABLE questions_new RENAME TO questions;
-                 CREATE TABLE answers_new(id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id), choice INTEGER NOT NULL CHECK(choice BETWEEN 0 AND 4), correct INTEGER NOT NULL, at TEXT NOT NULL);
-                 INSERT INTO answers_new SELECT * FROM answers;
-                 DROP TABLE answers;
-                 ALTER TABLE answers_new RENAME TO answers;
-                 COMMIT;",
+        conn.execute_batch("PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;")?;
+        let rebuild = (|| -> Result<()> {
+            let old: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN ('questions','answers') AND sql LIKE '%BETWEEN 0 AND 3%')",
+                [],
+                |row| row.get(0),
             )?;
+            if old {
+                conn.execute_batch(
+                    "CREATE TABLE questions_new(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, question TEXT NOT NULL, choices_json TEXT NOT NULL, answer_index INTEGER NOT NULL CHECK(answer_index BETWEEN 0 AND 4), explanation TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL);
+                     INSERT INTO questions_new SELECT * FROM questions;
+                     DROP TABLE questions;
+                     ALTER TABLE questions_new RENAME TO questions;
+                     CREATE TABLE answers_new(id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id), choice INTEGER NOT NULL CHECK(choice BETWEEN 0 AND 4), correct INTEGER NOT NULL, at TEXT NOT NULL);
+                     INSERT INTO answers_new SELECT * FROM answers;
+                     DROP TABLE answers;
+                     ALTER TABLE answers_new RENAME TO answers;",
+                )?;
+            }
+            Ok(())
+        })();
+        match rebuild {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(err);
+            }
         }
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, question TEXT NOT NULL, choices_json TEXT NOT NULL, answer_index INTEGER NOT NULL CHECK(answer_index BETWEEN 0 AND 4), explanation TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL, is_exam INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id), choice INTEGER NOT NULL CHECK(choice BETWEEN 0 AND 4), correct INTEGER NOT NULL, at TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, correct INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'quiz');
-             CREATE TABLE IF NOT EXISTS reviews(question_id INTEGER PRIMARY KEY REFERENCES questions(id), box INTEGER NOT NULL CHECK(box BETWEEN 1 AND 5), due_at TEXT NOT NULL);"
-        )?;
-        if !has_column(&conn, "sessions", "kind")? {
+        conn.execute_batch("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;")?;
+        let migrate = (|| -> Result<()> {
             conn.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'quiz';
-                 UPDATE sessions SET kind = 'exam' WHERE topic LIKE '%Deneme%';
-                 COMMIT;",
+                "CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, question TEXT NOT NULL, choices_json TEXT NOT NULL, answer_index INTEGER NOT NULL CHECK(answer_index BETWEEN 0 AND 4), explanation TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL, is_exam INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE IF NOT EXISTS answers(id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id), choice INTEGER NOT NULL CHECK(choice BETWEEN 0 AND 4), correct INTEGER NOT NULL, at TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, correct INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'quiz');
+                 CREATE TABLE IF NOT EXISTS reviews(question_id INTEGER PRIMARY KEY REFERENCES questions(id), box INTEGER NOT NULL CHECK(box BETWEEN 1 AND 5), due_at TEXT NOT NULL);",
             )?;
-        }
-        if !has_column(&conn, "questions", "is_exam")? {
-            conn.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE questions ADD COLUMN is_exam INTEGER NOT NULL DEFAULT 0;
-                 UPDATE questions SET is_exam = 1 WHERE topic LIKE '%Deneme%';
-                 COMMIT;",
-            )?;
+            if !has_column(&conn, "sessions", "kind")? {
+                conn.execute_batch(
+                    "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'quiz';
+                     UPDATE sessions SET kind = 'exam' WHERE topic LIKE '%Deneme%';",
+                )?;
+            }
+            if !has_column(&conn, "questions", "is_exam")? {
+                conn.execute_batch(
+                    "ALTER TABLE questions ADD COLUMN is_exam INTEGER NOT NULL DEFAULT 0;
+                     UPDATE questions SET is_exam = 1 WHERE topic LIKE '%Deneme%';",
+                )?;
+            }
+            Ok(())
+        })();
+        match migrate {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(err);
+            }
         }
         Ok(Self { conn })
     }
@@ -615,10 +643,18 @@ impl Store {
             if at < from || at > to {
                 continue;
             }
+            let choices_vec: Vec<String> = serde_json::from_str(&choices)?;
+            let answer_idx =
+                usize::try_from(answer_index).map_err(|_| invalid("Kayıtlı soru geçersiz."))?;
+            let choice_idx =
+                usize::try_from(choice).map_err(|_| invalid("Kayıtlı cevap geçersiz."))?;
+            if answer_idx >= choices_vec.len() || choice_idx >= choices_vec.len() {
+                return Err(invalid("Kayıtlı soru veya cevap geçersiz."));
+            }
             let value = Question {
                 question,
-                choices: serde_json::from_str(&choices)?,
-                answer_index: answer_index as usize,
+                choices: choices_vec,
+                answer_index: answer_idx,
                 explanation,
                 source,
                 topic: Some(stored_topic),
@@ -629,7 +665,7 @@ impl Store {
                     value,
                     review_target: None,
                 },
-                choice as usize,
+                choice_idx,
                 correct != 0,
             ));
         }
@@ -1357,6 +1393,67 @@ mod tests {
             store
                 .record_answer_at(sess, qid, 1, at("2026-05-01T10:01:00Z"))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn spec_sec_store_permissions_concurrent_open_and_deneme_answers_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("priv_db");
+        let db_path = db_dir.join("legacy_concurrent.db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE history(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, at TEXT NOT NULL);
+                 CREATE TABLE questions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, question TEXT NOT NULL, choices_json TEXT NOT NULL, answer_index INTEGER NOT NULL CHECK(answer_index BETWEEN 0 AND 4), explanation TEXT NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL);
+                 CREATE TABLE answers(id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id), choice INTEGER NOT NULL CHECK(choice BETWEEN 0 AND 4), correct INTEGER NOT NULL, at TEXT NOT NULL);
+                 CREATE TABLE sessions(id INTEGER PRIMARY KEY, subject TEXT NOT NULL, topic TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, correct INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE reviews(question_id INTEGER PRIMARY KEY REFERENCES questions(id), box INTEGER NOT NULL CHECK(box BETWEEN 1 AND 5), due_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let p = db_path.clone();
+            handles.push(std::thread::spawn(move || Store::open(&p).map(|_| ())));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&db_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO questions(id,subject,topic,question,choices_json,answer_index,explanation,source,created_at,is_exam) VALUES(1,'D','Deneme','Q?','[\"a\",\"b\",\"c\",\"d\"]',4,'e','s','2026-01-01T00:00:00Z',1);
+                 INSERT INTO answers(id,question_id,choice,correct,at) VALUES(1,1,1,0,'2026-01-01T00:01:00Z');",
+            )
+            .unwrap();
+        assert!(
+            store
+                .deneme_answers(
+                    1,
+                    "Deneme",
+                    at("2026-01-01T00:00:00Z"),
+                    at("2026-01-01T01:00:00Z")
+                )
+                .is_err()
         );
     }
 }
