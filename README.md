@@ -1,23 +1,51 @@
-[English](README.md) · [Türkçe](README.tr.md)
+<div align="center">
 
 # studia
 
-`studia` is a bilingual (English / Turkish), cross-platform AI study assistant built in Rust. It indexes your local study files (`pdf`, `docx`, `md`, `txt`), organizes course-specific study plans via `course.json`, runs interactive quizzes and spaced-repetition reviews (Leitner boxes 1–5), exports Anki flashcard decks, and works identically from a terminal **TUI** or a **Telegram bot**.
+**Bilingual (`EN` / `TR`), local-first AI study assistant for your own notes — with a Terminal TUI, Telegram Bot, Leitner spaced repetition, and Anki export in one Rust binary.**
+
+**English** · [Türkçe](README.tr.md)
+
+[![CI](https://github.com/zodicall/studia/actions/workflows/ci.yml/badge.svg)](https://github.com/zodicall/studia/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-orange.svg)](Cargo.toml)
+[![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](https://github.com/zodicall/studia/releases)
+
+[Features](#features) · [Architecture](#how-it-works) · [Quickstart](#quickstart) · [AI Backends](#ai-backend-configuration) · [Telegram Bot](#telegram-bot-setup) · [Commands](#cli-tui--bot-commands) · [Security](SECURITY.md)
+
+</div>
+
+---
+
+`studia` indexes your local study materials (`pdf`, `docx`, `md`, `txt`), organizes optional course plans and mock exams via `course.json`, runs interactive quizzes and 5-box Leitner spaced-repetition reviews, exports Anki flashcard decks, and stays synchronized across a **terminal TUI** (`ratatui`) and a **Telegram bot** (`studia listen`) backed by a single local SQLite database (`data/studia.db`).
 
 ## Features
 
-- **Terminal TUI & Telegram Bot**: Study locally in a keyboard-driven terminal UI (`ratatui`) or remotely via Telegram (`studia listen`), backed by the same SQLite database (`data/studia.db`).
-- **Live Bilingual UI (`en` / `tr`)**: Auto-detects OS language (`cli > stored > env > locale > en`), switchable live via `F4` in TUI or `/lang tr|en` in Telegram/TUI.
+- **Terminal TUI & Telegram Bot**: Study locally in a 6-tab keyboard-driven terminal UI (`Ask`, `Quiz`, `Review`, `Stats`, `Today`, `Exams`) or remotely via Telegram using the same SQLite database (`data/studia.db`).
+- **Live Bilingual Experience (`en` / `tr`)**: Auto-detects OS language (`--lang > stored > STUDIA_LANG > OS locale > en`), switchable live with `F4` in the TUI or `/lang tr|en` in Telegram/TUI.
 - **Course-Agnostic Design**: Drop notes under `kaynaklar/<course>/` and optionally customize persona, mock exam question counts/categories/rules, and multi-day study plans in `course.json`.
 - **Flexible AI Backends**: Works with Gemini HTTP API, OpenAI (or Ollama / any OpenAI-compatible endpoint via `STUDIA_AI_BASE_URL`), AI CLIs (`agy`, `claude`, `codex`, `gemini`), or custom command templates (`STUDIA_AI_PROVIDER=custom`).
 - **Spaced Repetition & Anki**: Incorrect answers enter a 5-box Leitner schedule and generate fresh AI variation questions on review; flashcards export directly to tab-separated `.txt` decks under `anki/`.
 - **Offline Diagnostics**: `studia doctor` verifies `kaynaklar/`, `curl`, `pdftotext`, AI configuration, `.env` file permissions, and SQLite integrity (`PRAGMA quick_check`).
 
+## How It Works
+
+```mermaid
+flowchart LR
+  Notes["kaynaklar/course/\npdf · docx · md · txt · course.json"] --> Indexer["Local Indexer"]
+  Indexer --> DB[("SQLite (data/studia.db)\nLeitner 1-5 · Plans · History")]
+  DB <--> TUI["Terminal TUI (ratatui)"]
+  DB <--> Bot["Telegram Bot (studia listen)"]
+  TUI <--> AI["AI Backends\nGemini · OpenAI/Ollama · CLIs · Custom"]
+  Bot <--> AI
+  DB --> Anki["Anki Decks (anki/*.txt)"]
+```
+
 ## Quickstart
 
 ### Prerequisites
 
-- **Rust 1.89+** (`cargo build --release --locked`) or a prebuilt release binary
+- **Prebuilt Binary** from [GitHub Releases](https://github.com/zodicall/studia/releases) (`windows-msvc`, `linux-gnu`, `macos-intel`, `macos-apple-silicon`), **or Rust 1.89+** to build from source (`cargo build --release --locked`)
 - **`curl`** on `PATH` (for Telegram API & HTTP AI requests)
 - **`pdftotext`** (Poppler, optional fallback — a built-in PDF text extractor is included; `.md`, `.txt`, `.docx`, and standard `.pdf` files work out of the box)
 
@@ -54,7 +82,8 @@ cargo build --release --locked
 
 ## AI Backend Configuration
 
-`EnvLookup` resolves configuration with precedence: **OS environment > `<root>/.env` > `<root>/data/.env`**.
+> [!NOTE]
+> Configuration precedence is **OS environment > `<root>/.env` > `<root>/data/.env`**. Secrets are scrubbed from error logs and stripped before launching external AI CLI subprocesses.
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
@@ -86,17 +115,18 @@ When `STUDIA_AI_PROVIDER=auto`, the order checked is: `GEMINI_API_KEY` → `OPEN
    studia listen
    ```
 
-   Only messages/callbacks matching `STUDIA_TELEGRAM_CHAT_ID` are processed; others are ignored silently.
+> [!IMPORTANT]
+> Only messages and inline callbacks matching `STUDIA_TELEGRAM_CHAT_ID` are processed; updates from any other chat or group are silently ignored.
 
 ## Customizing Courses (`course.json`)
 
 Place an optional `course.json` inside `kaynaklar/<course>/` to tailor:
 
-- `title` & `persona`: Display name and AI tutor instructions.
-- `exam`: Question count (`1..=200`), choices count (`4` or `5`), weighted categories, and exam rules.
-- `plan`: Sequential day-by-day checklist (`day`, `title`, `tasks` with optional slash `command` + `label`).
+- **`title` & `persona`**: Display name and AI tutor instructions.
+- **`exam`**: Question count (`1..=200`), choices count (`4` or `5`), weighted categories, and exam rules.
+- **`plan`**: Sequential day-by-day checklist (`day`, `title`, `tasks` with optional slash `command` + `label`).
 
-Ready-to-use templates are included in:
+Ready-to-use, copyright-free templates are included in:
 - [`examples/general-course/course.json`](examples/general-course/course.json)
 - [`examples/academic-english/course.json`](examples/academic-english/course.json)
 
@@ -160,6 +190,8 @@ Run `studia doctor` to diagnose setup issues offline:
 - **Non-Affiliation & Trademarks**: `studia` is an independent open-source project. Telegram, Google Gemini, OpenAI, Anthropic Claude, Anki, Ollama, and other referenced names/services are trademarks of their respective owners; users are solely responsible for complying with the Terms of Service of any external provider they configure.
 - **Self-Hosted Privacy (KVKK / GDPR)**: `studia` runs locally on your machine, sends indexed note excerpts and prompts only to the AI and Telegram APIs you configure, and stores study history and runtime logs locally in `data/studia.db` and `data/bot.log`. Operators must avoid uploading personal, confidential, or copyrighted third-party materials without proper authorization.
 
-## Security & License
+## Security, Contributing & License
 
-See [SECURITY.md](SECURITY.md) for the security model, local-first data guarantees, and vulnerability reporting, [LICENSE](LICENSE) for the MIT License, and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for third-party crate license and copyright notices.
+- **Security:** See [SECURITY.md](SECURITY.md) for the local-first threat model, secret isolation guarantees, and private vulnerability reporting.
+- **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for specs, checks, and localization guidelines, and [CHANGELOG.md](CHANGELOG.md) for release notes.
+- **License:** Distributed under the [MIT License](LICENSE). Third-party dependency notices are bundled in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).

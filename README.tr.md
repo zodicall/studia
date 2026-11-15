@@ -1,23 +1,51 @@
-[English](README.md) · [Türkçe](README.tr.md)
+<div align="center">
 
 # studia
 
-`studia`, Rust ile geliştirilmiş çift dilli (Türkçe / İngilizce), çapraz platform yapay zeka destekli çalışma asistanıdır. Yerel ders materyallerinizi (`pdf`, `docx`, `md`, `txt`) indeksler, isteğe bağlı `course.json` dosyalarıyla derse özel çalışma planları yönetir, etkileşimli quiz/deneme sınavları ve Leitner aralıklı tekrar (kutu 1–5) oturumları yürütür, Anki bilgi kartı desteleri üretir ve aynı SQLite veritabanı (`data/studia.db`) üzerinden hem terminal **TUI** hem de **Telegram botu** olarak çalışır.
+**Kendi notlarınızla çalışan, çift dilli (`TR` / `EN`), yerel öncelikli yapay zeka çalışma asistanı — tek Rust ikilisinde Terminal TUI, Telegram Botu, Leitner aralıklı tekrar ve Anki dışa aktarımı.**
+
+[English](README.md) · **Türkçe**
+
+[![CI](https://github.com/zodicall/studia/actions/workflows/ci.yml/badge.svg)](https://github.com/zodicall/studia/actions/workflows/ci.yml)
+[![Lisans: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-orange.svg)](Cargo.toml)
+[![Platformlar](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](https://github.com/zodicall/studia/releases)
+
+[Özellikler](#özellikler) · [Mimari](#nasıl-çalışır) · [Hızlı Başlangıç](#hızlı-başlangıç) · [Yapay Zeka](#yapay-zeka-sağlayıcı-ayarları) · [Telegram Botu](#telegram-bot-kurulumu) · [Komutlar](#cli-tui-ve-bot-komutları) · [Güvenlik](SECURITY.md)
+
+</div>
+
+---
+
+`studia`, yerel ders materyallerinizi (`pdf`, `docx`, `md`, `txt`) indeksler, isteğe bağlı `course.json` dosyalarıyla derse özel çalışma planları ve deneme sınavları yönetir, etkileşimli quizler ve 5 kutulu Leitner aralıklı tekrar oturumları yürütür, Anki bilgi kartı desteleri üretir ve tek bir yerel SQLite veritabanı (`data/studia.db`) üzerinden hem **terminal TUI** (`ratatui`) hem de **Telegram botu** (`studia listen`) olarak çalışır.
 
 ## Özellikler
 
-- **Terminal Arayüzü (TUI) ve Telegram Botu**: Klavye odaklı terminal arayüzünden (`ratatui`) veya Telegram üzerinden (`studia listen`) aynı ilerleme ve veritabanıyla çalışın.
+- **Terminal Arayüzü (TUI) ve Telegram Botu**: 6 sekmeli klavye odaklı terminal arayüzünden (`Sor`, `Quiz`, `Tekrar`, `İstatistik`, `Bugün`, `Denemeler`) veya Telegram üzerinden (`studia listen`) aynı ilerleme ve veritabanıyla (`data/studia.db`) çalışın.
 - **Canlı Çift Dil Desteği (`tr` / `en`)**: Başlangıçta sistem dilini otomatik algılar (`--lang > veritabanı > STUDIA_LANG > sistem dili > en`); çalışma sırasında TUI'da `F4` tuşuyla veya bot/TUI komut satırında `/lang tr|en` ile anında değiştirilebilir.
 - **Dersten Bağımsız Yapı**: `kaynaklar/<ders>/` altına notlarınızı ekleyin; isterseniz `course.json` ile eğitmen kimliği, deneme sınavı soru/şık sayısı, kategori dağılımı ve günlük çalışma planı tanımlayın.
 - **Esnek Yapay Zeka Sağlayıcıları**: Gemini HTTP API, OpenAI (veya `STUDIA_AI_BASE_URL` üzerinden Ollama gibi OpenAI uyumlu sunucular), CLI araçları (`agy`, `claude`, `codex`, `gemini`) ve özel komut şablonları (`STUDIA_AI_PROVIDER=custom`) desteklenir.
 - **Aralıklı Tekrar ve Anki Kartları**: Yanlış yanıtlanan sorular 5 kutulu Leitner tekrar kuyruğuna alınır ve tekrarda aynı kuralı farklı bağlamda test eden taze varyasyonlar üretilir; kavram kartları `anki/` altına `.txt` olarak kaydedilir.
 - **Çevrimdışı Sistem Kontrolü**: `studia doctor` komutu `kaynaklar/`, `curl`, `pdftotext`, AI ayarları, `.env` dosya izinleri ve SQLite bütünlüğünü (`PRAGMA quick_check`) denetler.
 
+## Nasıl Çalışır?
+
+```mermaid
+flowchart LR
+  Notes["kaynaklar/ders/\npdf · docx · md · txt · course.json"] --> Indexer["Yerel İndeksleyici"]
+  Indexer --> DB[("SQLite (data/studia.db)\nLeitner 1-5 · Planlar · Geçmiş")]
+  DB <--> TUI["Terminal TUI (ratatui)"]
+  DB <--> Bot["Telegram Botu (studia listen)"]
+  TUI <--> AI["AI Sağlayıcıları\nGemini · OpenAI/Ollama · CLI · Özel"]
+  Bot <--> AI
+  DB --> Anki["Anki Desteleri (anki/*.txt)"]
+```
+
 ## Hızlı Başlangıç
 
 ### Gereksinimler
 
-- **Rust 1.89+** (`cargo build --release --locked`) veya hazır release ikilisi
+- [GitHub Releases](https://github.com/zodicall/studia/releases) üzerinden **hazır sürüm ikilisi** (`windows-msvc`, `linux-gnu`, `macos-intel`, `macos-apple-silicon`) **veya kaynak koddan derleme için Rust 1.89+** (`cargo build --release --locked`)
 - `PATH` içinde **`curl`** (Telegram ve HTTP AI istekleri için)
 - **`pdftotext`** (Poppler, isteğe bağlı fallback — gömülü PDF metin okuyucu dahildir; `.md`, `.txt`, `.docx` ve standart `.pdf` dosyaları ek araç gerektirmeden çalışır)
 
@@ -54,7 +82,8 @@ cargo build --release --locked
 
 ## Yapay Zeka Sağlayıcı Ayarları
 
-Öncelik sırası: **İşletim sistemi ortam değişkenleri > `<root>/.env` > `<root>/data/.env`**.
+> [!NOTE]
+> Öncelik sırası: **İşletim sistemi ortam değişkenleri > `<root>/.env` > `<root>/data/.env`**. Gizli anahtarlar hata loglarından temizlenir ve harici AI CLI alt süreçleri başlatılmadan önce ortamdan kaldırılır.
 
 | Değişken | Açıklama | Varsayılan |
 | :--- | :--- | :--- |
@@ -86,15 +115,16 @@ cargo build --release --locked
    studia listen
    ```
 
-   Bot yalnızca `STUDIA_TELEGRAM_CHAT_ID` ile eşleşen sohbetten gelen mesajları işler; diğer sohbetler sessizce yok sayılır.
+> [!IMPORTANT]
+> Bot yalnızca `STUDIA_TELEGRAM_CHAT_ID` ile eşleşen sohbetten gelen mesajları ve buton basımlarını işler; diğer sohbet veya gruplardan gelen güncellemeler sessizce yok sayılır.
 
 ## Ders Özelleştirme (`course.json`)
 
 İsteğe bağlı olarak `kaynaklar/<ders>/course.json` ekleyerek şunları tanımlayabilirsiniz:
 
-- `title` & `persona`: Görünen ders adı ve yapay zeka eğitmen yönergesi.
-- `exam`: Soru sayısı (`1..=200`), şık sayısı (`4` veya `5`), kategori dağılımı ve sınav kuralları.
-- `plan`: Sıralı günlük çalışma planı (`day`, `title`, `tasks`: komut + etiket).
+- **`title` & `persona`**: Görünen ders adı ve yapay zeka eğitmen yönergesi.
+- **`exam`**: Soru sayısı (`1..=200`), şık sayısı (`4` veya `5`), kategori dağılımı ve sınav kuralları.
+- **`plan`**: Sıralı günlük çalışma planı (`day`, `title`, `tasks`: komut + etiket).
 
 Hazır, telif hakkı içermeyen örnek şablonlar:
 - [`examples/general-course/course.json`](examples/general-course/course.json)
@@ -160,6 +190,8 @@ Kurulum sorunlarını çevrimdışı incelemek için `studia doctor` çalıştı
 - **Bağlantısızlık ve Ticari Markalar**: `studia` bağımsız bir açık kaynak projesidir. Telegram, Google Gemini, OpenAI, Anthropic Claude, Anki, Ollama ve anılan diğer ad/hizmetler ilgili sahiplerinin ticari markalarıdır; yapılandırdığınız harici sağlayıcıların Kullanım Koşullarına uymak tamamen kullanıcının sorumluluğundadır.
 - **Kendi Sunucunuzda Gizlilik (KVKK / GDPR)**: `studia` makinenizde yerel olarak çalışır; yalnızca yapılandırdığınız AI ve Telegram API'lerine indekslenmiş not kesitlerini ve istemleri gönderir, çalışma geçmişi ile çalışma günlüklerini yerel olarak `data/studia.db` ve `data/bot.log` içinde saklar. İşleticiler, izinsiz kişisel veri, gizli bilgi veya telif hakkıyla korunan üçüncü taraf materyalleri yüklemekten kaçınmalıdır.
 
-## Güvenlik ve Lisans
+## Güvenlik, Katkı ve Lisans
 
-Güvenlik sınırları ve bildirim süreci için [SECURITY.md](SECURITY.md), lisans koşulları için [LICENSE](LICENSE) ve üçüncü taraf bağımlılık bildirimleri için [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) dosyasına bakın.
+- **Güvenlik:** Yerel öncelikli tehdit modeli, gizli anahtar izolasyonu ve özel güvenlik açığı bildirimi için [SECURITY.md](SECURITY.md) dosyasına bakın.
+- **Katkı:** Şartnameler, kontroller ve yerelleştirme yönergeleri için [CONTRIBUTING.md](CONTRIBUTING.md), sürüm notları için [CHANGELOG.md](CHANGELOG.md) dosyasına bakın.
+- **Lisans:** [MIT Lisansı](LICENSE) ile dağıtılır. Üçüncü taraf bağımlılık bildirimleri [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) içindedir.
