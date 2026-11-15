@@ -1,7 +1,7 @@
 use crate::{
     Result,
-    config::{self, AiConfig, AiProvider, SENSITIVE_ENV_VARS},
-    course::CourseConfig,
+    config::{self, AiConfig, AiEffort, AiProvider, SENSITIVE_ENV_VARS},
+    course::{CourseConfig, DayConfig, TaskConfig},
     i18n::Lang,
     invalid, telegram,
 };
@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::Builder;
 
@@ -291,6 +291,234 @@ pub fn vocab_request(course: &CourseConfig, topic: &str, count: usize, lang: Lan
             Each card must have distinct, non-empty word, meaning, synonyms, example, and example_tr fields."
         ),
     }
+}
+
+pub fn plan_schema(days: usize) -> String {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "days": {
+                "type": "array",
+                "minItems": days,
+                "maxItems": days,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "day": { "type": "integer", "minimum": 1 },
+                        "title": { "type": "string", "minLength": 1 },
+                        "tasks": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": crate::plan::MAX_TASKS_PER_DAY,
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "command": { "type": "string" },
+                                    "label": { "type": "string", "minLength": 1 }
+                                },
+                                "required": ["command", "label"]
+                            }
+                        }
+                    },
+                    "required": ["day", "title", "tasks"]
+                }
+            }
+        },
+        "required": ["days"]
+    })
+    .to_string()
+}
+
+const ALLOWED_PLAN_COMMANDS: [&str; 12] = [
+    "/anlat",
+    "/lesson",
+    "/explain",
+    "/quiz",
+    "/kazanim",
+    "/practice",
+    "/kelime",
+    "/cards",
+    "/tekrar",
+    "/review",
+    "/deneme",
+    "/exam",
+];
+
+fn normalize_plan_command(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let cmd = trimmed.split_whitespace().next().unwrap_or("");
+    if ALLOWED_PLAN_COMMANDS.contains(&cmd) {
+        trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        String::new()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedPlan {
+    days: Vec<DayConfig>,
+}
+
+pub fn parse_plan(raw: &str, expected_days: usize) -> Result<Vec<DayConfig>> {
+    let cleaned = strip_code_fence(raw);
+    let parsed: GeneratedPlan = serde_json::from_str(cleaned)?;
+    if parsed.days.len() != expected_days {
+        return Err(invalid(format!(
+            "AI {} günlük plan döndürdü; {expected_days} gün bekleniyordu / AI returned {} day(s); expected {expected_days}.",
+            parsed.days.len(),
+            parsed.days.len()
+        )));
+    }
+    let mut normalized = Vec::with_capacity(expected_days);
+    for (idx, day) in parsed.days.into_iter().enumerate() {
+        let title = day.title.trim().to_string();
+        if title.is_empty() {
+            return Err(invalid(
+                "Plan gün başlığı boş olamaz / Plan day title must not be empty.",
+            ));
+        }
+        let tasks: Vec<TaskConfig> = day
+            .tasks
+            .into_iter()
+            .filter_map(|t| {
+                let label = t.label.trim().to_string();
+                (!label.is_empty()).then(|| TaskConfig {
+                    command: normalize_plan_command(&t.command),
+                    label,
+                })
+            })
+            .take(crate::plan::MAX_TASKS_PER_DAY)
+            .collect();
+        if tasks.is_empty() {
+            return Err(invalid(
+                "Plan gününde en az bir görev olmalı / Each plan day must have at least one task.",
+            ));
+        }
+        normalized.push(DayConfig {
+            day: idx + 1,
+            title,
+            tasks,
+        });
+    }
+    let check = CourseConfig {
+        plan: normalized.clone(),
+        ..CourseConfig::default()
+    };
+    check.validate()?;
+    Ok(normalized)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_request(
+    course: &CourseConfig,
+    subject: &str,
+    days: usize,
+    tasks_per_day: usize,
+    focus: &str,
+    catalog: &[String],
+    weak_topics: &[(String, i64, i64)],
+    due_reviews: i64,
+    lang: Lang,
+) -> (String, Option<String>) {
+    let title = course.display_title(subject);
+    let catalog_block = if catalog.is_empty() {
+        lang.pick("(dosya listesi yok)", "(no file catalog)")
+            .to_string()
+    } else {
+        catalog.join("\n")
+    };
+    let categories_block = course
+        .exam
+        .as_ref()
+        .filter(|e| !e.categories.is_empty())
+        .map(|e| {
+            e.categories
+                .iter()
+                .map(|c| format!("{} ({})", c.name, c.count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let weak_block = if weak_topics.is_empty() {
+        lang.pick("henüz istatistik yok", "no quiz stats yet")
+            .to_string()
+    } else {
+        weak_topics
+            .iter()
+            .map(|(t, c, tot)| format!("{t}: {c}/{tot}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let focus_trimmed = focus.trim();
+    let (focus_block, inner_nonce) = if focus_trimmed.is_empty() {
+        (String::new(), None)
+    } else {
+        let nonce = untrusted_nonce();
+        let fenced = fence_untrusted("focus", &nonce, focus_trimmed);
+        let line = match lang {
+            Lang::Tr => format!("\nÖğrenci hedefi/odağı:\n{fenced}"),
+            Lang::En => format!("\nStudent goal/focus:\n{fenced}"),
+        };
+        (line, Some(nonce))
+    };
+
+    let text = match lang {
+        Lang::Tr => {
+            let cat_line = if categories_block.is_empty() {
+                String::new()
+            } else {
+                format!("\nSınav kategorileri: {categories_block}")
+            };
+            format!(
+                "'{title}' dersi için tam {days} günlük, her günde yaklaşık {tasks_per_day} görev içeren dengeli ve uygulanabilir bir ÇALIŞMA PROGRAMI oluştur.{cat_line}\n\
+                Mevcut ders materyalleri:\n{catalog_block}\n\
+                Öğrencinin zayıf konuları: {weak_block} · Bekleyen tekrar: {due_reviews}{focus_block}\n\n\
+                KURALLAR:\n\
+                1) days dizisi tam {days} gün içermeli (day: 1..={days}).\n\
+                2) Her günün başlığı (title) kısa ve net konu özeti olsun.\n\
+                3) Her görevde label Türkçe açıklayıcı görev adı, command ise yalnızca şu geçerli komutlardan biri (veya elle okuma görevi için boş string \"\") olsun:\n\
+                   - \"/anlat <konu>\" (konu anlatımı + 5 soruluk kazanım testi)\n\
+                   - \"/quiz <konu> [5-10]\" (konu testi)\n\
+                   - \"/kelime <konu> [15-25]\" (kavram/kelime kartı destesi)\n\
+                   - \"/tekrar\" (zamanı gelen yanlışların tekrarı; 2. günden itibaren düzenli ekle)\n\
+                   - \"/deneme\" (deneme sınavı; son gün veya ara değerlendirme günlerine uygun ise ekle)\n\
+                   - \"\" (kaynak okuma/tekrar gibi elle işaretlenen görevler)\n\
+                4) Konuları kolaydan zora, zayıf alanlara ve mevcut kaynaklara uyumlu dağıt.\n\
+                5) JSON dışında metin yazma."
+            )
+        }
+        Lang::En => {
+            let cat_line = if categories_block.is_empty() {
+                String::new()
+            } else {
+                format!("\nExam categories: {categories_block}")
+            };
+            format!(
+                "Create a structured {days}-day STUDY SCHEDULE for '{title}' with approximately {tasks_per_day} tasks per day.{cat_line}\n\
+                Available course files:\n{catalog_block}\n\
+                Weakest topics: {weak_block} · Due reviews: {due_reviews}{focus_block}\n\n\
+                RULES:\n\
+                1) The days array MUST have exactly {days} days (day: 1..={days}).\n\
+                2) Give each day a concise, descriptive title.\n\
+                3) Each task must have a clear English label, and command MUST be either \"\" (for manual reading/practice) or one of:\n\
+                   - \"/lesson <topic>\" (lesson explanation + 5-question check)\n\
+                   - \"/quiz <topic> [5-10]\" (topic quiz)\n\
+                   - \"/cards <topic> [15-25]\" (flashcards deck)\n\
+                   - \"/review\" (due mistakes review; include regularly from Day 2+)\n\
+                   - \"/exam\" (mock exam on milestone/final days when appropriate)\n\
+                4) Progress logically from foundational topics to advanced integration and weak areas.\n\
+                5) Return valid JSON only."
+            )
+        }
+    };
+    (text, inner_nonce)
 }
 
 pub fn quiz_schema_for(count: usize, choices_count: usize) -> String {
@@ -712,15 +940,14 @@ where
         ("agy", AiProvider::Agy),
         ("claude", AiProvider::Claude),
         ("codex", AiProvider::Codex),
-        ("gemini", AiProvider::GeminiCli),
     ] {
         if probe(bin).is_some() {
             return Ok(provider);
         }
     }
     Err(invalid(
-        "Yapay zeka sağlayıcısı bulunamadı (GEMINI_API_KEY, OPENAI_API_KEY veya PATH'te agy/claude/codex/gemini yok). / \
-         No AI provider configured (set GEMINI_API_KEY, OPENAI_API_KEY, STUDIA_AI_PROVIDER=custom, or install agy/claude/codex/gemini CLI).",
+        "Yapay zeka sağlayıcısı bulunamadı (GEMINI_API_KEY, OPENAI_API_KEY veya PATH'te agy/claude/codex yok). / \
+         No AI provider configured (set GEMINI_API_KEY, OPENAI_API_KEY, STUDIA_AI_PROVIDER=custom, or install agy/claude/codex CLI).",
     ))
 }
 
@@ -759,16 +986,74 @@ pub fn gemini_endpoint_and_headers<'a>(
     Ok((url, vec![("x-goog-api-key", key)]))
 }
 
-pub fn gemini_request_body(prompt: &str, schema_val: &Value) -> Value {
+fn gemini_thinking_config(model: Option<&str>, effort: AiEffort) -> Value {
+    let m = model
+        .unwrap_or(config::DEFAULT_GEMINI_MODEL)
+        .trim()
+        .to_ascii_lowercase();
+    if m.starts_with("gemini-2.5") {
+        let budget = if m.contains("pro") {
+            match effort {
+                AiEffort::Minimal => 128,
+                AiEffort::Low => 1024,
+                AiEffort::Medium => 8192,
+                AiEffort::High => 16384,
+                AiEffort::XHigh | AiEffort::Max => 32768,
+            }
+        } else {
+            match effort {
+                AiEffort::Minimal => 0,
+                AiEffort::Low => 1024,
+                AiEffort::Medium => 8192,
+                AiEffort::High => 16384,
+                AiEffort::XHigh | AiEffort::Max => 24576,
+            }
+        };
+        return json!({ "thinkingBudget": budget });
+    }
+    let level = if m.contains("3.5-flash-lite") {
+        match effort {
+            AiEffort::Minimal => "minimal",
+            AiEffort::Low => "low",
+            AiEffort::Medium => "medium",
+            AiEffort::High | AiEffort::XHigh | AiEffort::Max => "high",
+        }
+    } else if m.contains("4-hydrogen") {
+        match effort {
+            AiEffort::Minimal | AiEffort::Low => "low",
+            AiEffort::Medium => "medium",
+            AiEffort::High => "high",
+            AiEffort::XHigh | AiEffort::Max => "xhigh",
+        }
+    } else {
+        match effort {
+            AiEffort::Minimal | AiEffort::Low => "low",
+            AiEffort::Medium => "medium",
+            AiEffort::High | AiEffort::XHigh | AiEffort::Max => "high",
+        }
+    };
+    json!({ "thinkingLevel": level })
+}
+
+pub fn gemini_request_body(
+    model: Option<&str>,
+    prompt: &str,
+    schema_val: &Value,
+    effort: Option<AiEffort>,
+) -> Value {
+    let mut gen_cfg = json!({
+        "responseMimeType": "application/json",
+        "responseJsonSchema": schema_val
+    });
+    if let Some(eff) = effort {
+        gen_cfg["thinkingConfig"] = gemini_thinking_config(model, eff);
+    }
     json!({
         "contents": [{
             "role": "user",
             "parts": [{ "text": prompt }]
         }],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseJsonSchema": schema_val
-        }
+        "generationConfig": gen_cfg
     })
 }
 
@@ -823,14 +1108,52 @@ pub fn openai_endpoint(
     Ok((format!("{base}/chat/completions"), clean_key))
 }
 
+pub fn openai_effort_str(model: &str, effort: AiEffort) -> Option<&'static str> {
+    let m = model.trim().to_ascii_lowercase();
+    if m.starts_with("gpt-4o") {
+        return None;
+    }
+    if m == "o4-mini" || m == "o3-mini" || m == "o3" {
+        return Some(match effort {
+            AiEffort::Minimal | AiEffort::Low => "low",
+            AiEffort::Medium => "medium",
+            AiEffort::High | AiEffort::XHigh | AiEffort::Max => "high",
+        });
+    }
+    if m == "gpt-5" || m == "gpt-5-mini" {
+        return Some(match effort {
+            AiEffort::Minimal => "minimal",
+            AiEffort::Low => "low",
+            AiEffort::Medium => "medium",
+            AiEffort::High | AiEffort::XHigh | AiEffort::Max => "high",
+        });
+    }
+    if m.contains("-codex") {
+        return Some(match effort {
+            AiEffort::Minimal | AiEffort::Low => "low",
+            AiEffort::Medium => "medium",
+            AiEffort::High => "high",
+            AiEffort::XHigh | AiEffort::Max => "xhigh",
+        });
+    }
+    Some(match effort {
+        AiEffort::Minimal | AiEffort::Low => "low",
+        AiEffort::Medium => "medium",
+        AiEffort::High => "high",
+        AiEffort::XHigh => "xhigh",
+        AiEffort::Max => "max",
+    })
+}
+
 pub fn openai_request_body(
     model: &str,
     prompt: &str,
     schema_val: &Value,
     use_json_schema: bool,
     raw_schema: &str,
+    effort: Option<AiEffort>,
 ) -> Value {
-    if use_json_schema {
+    let mut body = if use_json_schema {
         json!({
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
@@ -852,7 +1175,11 @@ pub fn openai_request_body(
             }],
             "response_format": { "type": "json_object" }
         })
+    };
+    if let Some(eff_str) = effort.and_then(|e| openai_effort_str(model, e)) {
+        body["reasoning_effort"] = json!(eff_str);
     }
+    body
 }
 
 pub fn should_fallback_openai_json_object(status: u16, body: &str) -> bool {
@@ -864,6 +1191,14 @@ pub fn should_fallback_openai_json_object(status: u16, body: &str) -> bool {
         || lower.contains("response_format")
         || lower.contains("json_object")
         || lower.contains("schema")
+}
+
+pub fn should_fallback_openai_reasoning_effort(status: u16, body: &str) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("reasoning_effort") || lower.contains("reasoning effort")
 }
 
 pub fn parse_openai_response(body: &str) -> Result<String> {
@@ -988,11 +1323,41 @@ pub fn parse_custom_command(raw: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
+fn agy_effort_str(model: Option<&str>, effort: AiEffort) -> Option<&'static str> {
+    if let Some(raw) = model {
+        let m = raw.trim().to_ascii_lowercase();
+        // `agy` models indexed with an effort suffix conflict with `--effort`; orchestrator has no tiers.
+        if m.ends_with("-low")
+            || m.ends_with("-medium")
+            || m.ends_with("-high")
+            || m.ends_with("-xhigh")
+            || m.ends_with("-max")
+            || m.contains("orchestrator")
+        {
+            return None;
+        }
+        if m.contains("4-hydrogen") {
+            return Some(match effort {
+                AiEffort::Minimal | AiEffort::Low => "low",
+                AiEffort::Medium => "medium",
+                AiEffort::High => "high",
+                AiEffort::XHigh | AiEffort::Max => "xhigh",
+            });
+        }
+    }
+    Some(match effort {
+        AiEffort::Minimal | AiEffort::Low => "low",
+        AiEffort::Medium => "medium",
+        AiEffort::High | AiEffort::XHigh | AiEffort::Max => "high",
+    })
+}
+
 pub fn build_cli_args(
     provider: AiProvider,
     _prompt: &str,
     schema: &str,
     model: Option<&str>,
+    effort: Option<AiEffort>,
     schema_file: &Path,
     out_file: &Path,
 ) -> Result<Vec<String>> {
@@ -1011,6 +1376,10 @@ pub fn build_cli_args(
             if let Some(m) = model {
                 args.push("--model".to_string());
                 args.push(m.to_string());
+            }
+            if let Some(lvl) = effort.and_then(|e| agy_effort_str(model, e)) {
+                args.push("--effort".to_string());
+                args.push(lvl.to_string());
             }
             args.extend([
                 "--sandbox".to_string(),
@@ -1032,6 +1401,14 @@ pub fn build_cli_args(
                 args.push("--model".to_string());
                 args.push(m.to_string());
             }
+            if let Some(eff) = effort {
+                let lvl = match eff {
+                    AiEffort::Minimal => "low",
+                    _ => eff.as_env_str(),
+                };
+                args.push("--effort".to_string());
+                args.push(lvl.to_string());
+            }
         }
         AiProvider::Codex => {
             args.extend([
@@ -1047,20 +1424,13 @@ pub fn build_cli_args(
                 args.push("--model".to_string());
                 args.push(m.to_string());
             }
-            args.push("-".to_string());
-        }
-        AiProvider::GeminiCli => {
-            args.extend([
-                "-p".to_string(),
-                "Follow instructions from stdin strictly. Return ONLY valid JSON matching the requested schema."
-                    .to_string(),
-                "--output-format".to_string(),
-                "json".to_string(),
-            ]);
-            if let Some(m) = model {
-                args.push("--model".to_string());
-                args.push(m.to_string());
+            if let Some(eff_str) =
+                effort.and_then(|e| openai_effort_str(model.unwrap_or("gpt-5.3-codex"), e))
+            {
+                args.push("-c".to_string());
+                args.push(format!("model_reasoning_effort={eff_str}"));
             }
+            args.push("-".to_string());
         }
         _ => {}
     }
@@ -1178,7 +1548,7 @@ fn generate_http_gemini(
     let (url, headers) =
         gemini_endpoint_and_headers(cfg.base_url.as_deref(), cfg.model.as_deref(), key)?;
     let schema_val: Value = serde_json::from_str(schema)?;
-    let body = gemini_request_body(prompt, &schema_val);
+    let body = gemini_request_body(cfg.model.as_deref(), prompt, &schema_val, cfg.effort);
     let (status, resp) = post_json_body(&url, &headers, &body, cfg.timeout_secs, secrets)?;
     if !(200..300).contains(&status) {
         let safe_err = config::redact_secrets(&truncate_chars(&resp, ERROR_SNIPPET_CHARS), secrets);
@@ -1208,22 +1578,24 @@ fn generate_http_openai(
         None => Vec::new(),
     };
 
-    let body_strict = openai_request_body(model, prompt, &schema_val, true, schema);
-    let (status, resp) = post_json_body(&url, &headers, &body_strict, cfg.timeout_secs, secrets)?;
-    let final_resp = if should_fallback_openai_json_object(status, &resp) {
-        let body_fallback = openai_request_body(model, prompt, &schema_val, false, schema);
-        let (st2, r2) = post_json_body(&url, &headers, &body_fallback, cfg.timeout_secs, secrets)?;
-        if !(200..300).contains(&st2) {
-            let safe_err =
-                config::redact_secrets(&truncate_chars(&r2, ERROR_SNIPPET_CHARS), secrets);
-            return Err(invalid(format!("OpenAI HTTP {st2}: {safe_err}")));
+    let mut use_json_schema = true;
+    let mut effort = cfg.effort;
+    let final_resp = loop {
+        let body = openai_request_body(model, prompt, &schema_val, use_json_schema, schema, effort);
+        let (status, resp) = post_json_body(&url, &headers, &body, cfg.timeout_secs, secrets)?;
+        if (200..300).contains(&status) {
+            break resp;
         }
-        r2
-    } else if !(200..300).contains(&status) {
+        if effort.is_some() && should_fallback_openai_reasoning_effort(status, &resp) {
+            effort = None;
+            continue;
+        }
+        if use_json_schema && should_fallback_openai_json_object(status, &resp) {
+            use_json_schema = false;
+            continue;
+        }
         let safe_err = config::redact_secrets(&truncate_chars(&resp, ERROR_SNIPPET_CHARS), secrets);
         return Err(invalid(format!("OpenAI HTTP {status}: {safe_err}")));
-    } else {
-        resp
     };
     parse_openai_response(&final_resp)
         .map_err(|err| invalid(config::redact_secrets(&err.to_string(), secrets)))
@@ -1265,7 +1637,6 @@ fn execute_cli(
         AiProvider::Agy => "agy",
         AiProvider::Claude => "claude",
         AiProvider::Codex => "codex",
-        AiProvider::GeminiCli => "gemini",
         _ => return Err(invalid("Unsupported CLI AI provider.")),
     };
     let executable = resolve_cli_binary(bin_name)?;
@@ -1274,6 +1645,7 @@ fn execute_cli(
         prompt,
         schema,
         cfg.model.as_deref(),
+        cfg.effort,
         &schema_file,
         &out_file,
     )?;
@@ -1285,9 +1657,6 @@ fn execute_cli(
     let stdin_payload = match provider {
         AiProvider::Agy => String::new(),
         AiProvider::Claude | AiProvider::Codex => prompt.to_string(),
-        AiProvider::GeminiCli => {
-            format!("{prompt}\n\nReturn ONLY valid JSON matching this JSON Schema:\n{schema}\n")
-        }
         _ => String::new(),
     };
 
@@ -1393,18 +1762,192 @@ fn execute_custom_cmd(
 
 pub fn generate(root: &Path, prompt: &str, schema: &str) -> Result<String> {
     let cfg = config::load_ai_config(root)?;
-    let owned_secrets = collect_secrets(root, &cfg);
+    generate_with_config(root, &cfg, prompt, schema)
+}
+
+pub fn generate_with_config(
+    root: &Path,
+    cfg: &AiConfig,
+    prompt: &str,
+    schema: &str,
+) -> Result<String> {
+    let owned_secrets = collect_secrets(root, cfg);
     let secrets: Vec<&str> = owned_secrets.iter().map(String::as_str).collect();
-    let provider = resolve_provider(&cfg, &|bin| config::find_cli_in_path(bin))?;
+    let provider = resolve_provider(cfg, &|bin| config::find_cli_in_path(bin))?;
     match provider {
-        AiProvider::GeminiApi => generate_http_gemini(&cfg, prompt, schema, &secrets),
-        AiProvider::OpenAiApi => generate_http_openai(&cfg, prompt, schema, &secrets),
-        AiProvider::Agy | AiProvider::Claude | AiProvider::Codex | AiProvider::GeminiCli => {
-            execute_cli(&cfg, provider, prompt, schema, &secrets)
+        AiProvider::GeminiApi => generate_http_gemini(cfg, prompt, schema, &secrets),
+        AiProvider::OpenAiApi => generate_http_openai(cfg, prompt, schema, &secrets),
+        AiProvider::Agy | AiProvider::Claude | AiProvider::Codex => {
+            execute_cli(cfg, provider, prompt, schema, &secrets)
         }
-        AiProvider::Custom => execute_custom_cmd(&cfg, prompt, schema, &secrets),
+        AiProvider::Custom => execute_custom_cmd(cfg, prompt, schema, &secrets),
         AiProvider::Auto => unreachable!(),
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderStatus {
+    pub provider: AiProvider,
+    pub ready: bool,
+    pub detail: String,
+}
+
+pub fn probe_providers_with<F>(cfg: &AiConfig, lang: Lang, probe: &F) -> Vec<ProviderStatus>
+where
+    F: Fn(&str) -> Option<PathBuf>,
+{
+    AiProvider::ALL
+        .into_iter()
+        .map(|provider| match provider {
+            AiProvider::Auto => match resolve_provider(
+                &AiConfig {
+                    provider: AiProvider::Auto,
+                    ..cfg.clone()
+                },
+                probe,
+            ) {
+                Ok(resolved) => ProviderStatus {
+                    provider,
+                    ready: true,
+                    detail: format!(
+                        "{}: {}",
+                        lang.pick("Seçilen", "Resolves to"),
+                        resolved.as_env_str()
+                    ),
+                },
+                Err(_) => ProviderStatus {
+                    provider,
+                    ready: false,
+                    detail: lang.pick("Sağlayıcı yok", "No provider").into(),
+                },
+            },
+            AiProvider::GeminiApi => {
+                let ready = cfg
+                    .gemini_api_key
+                    .as_deref()
+                    .is_some_and(|k| !k.trim().is_empty());
+                ProviderStatus {
+                    provider,
+                    ready,
+                    detail: if ready {
+                        lang.pick("API anahtarı hazır", "API key set").into()
+                    } else {
+                        lang.pick("API anahtarı eksik", "API key missing").into()
+                    },
+                }
+            }
+            AiProvider::OpenAiApi => {
+                let has_key = cfg
+                    .openai_api_key
+                    .as_deref()
+                    .is_some_and(|k| !k.trim().is_empty());
+                let has_base = cfg
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|u| !u.trim().is_empty());
+                let ready = has_key || has_base;
+                ProviderStatus {
+                    provider,
+                    ready,
+                    detail: if has_key {
+                        lang.pick("API anahtarı hazır", "API key set").into()
+                    } else if has_base {
+                        lang.pick("Özel URL hazır", "Custom URL set").into()
+                    } else {
+                        lang.pick("Anahtar/URL eksik", "Key/URL missing").into()
+                    },
+                }
+            }
+            AiProvider::Agy => {
+                let ready = probe("agy").is_some();
+                ProviderStatus {
+                    provider,
+                    ready,
+                    detail: if ready {
+                        lang.pick("PATH'te hazır", "Found in PATH").into()
+                    } else {
+                        lang.pick("PATH'te yok", "Not in PATH").into()
+                    },
+                }
+            }
+            AiProvider::Claude => {
+                let ready = probe("claude").is_some();
+                ProviderStatus {
+                    provider,
+                    ready,
+                    detail: if ready {
+                        lang.pick("PATH'te hazır", "Found in PATH").into()
+                    } else {
+                        lang.pick("PATH'te yok", "Not in PATH").into()
+                    },
+                }
+            }
+            AiProvider::Codex => {
+                let ready = probe("codex").is_some();
+                ProviderStatus {
+                    provider,
+                    ready,
+                    detail: if ready {
+                        lang.pick("PATH'te hazır", "Found in PATH").into()
+                    } else {
+                        lang.pick("PATH'te yok", "Not in PATH").into()
+                    },
+                }
+            }
+            AiProvider::Custom => {
+                let ready = cfg
+                    .custom_cmd
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty());
+                ProviderStatus {
+                    provider,
+                    ready,
+                    detail: if ready {
+                        lang.pick("Komut tanımlı", "Command set").into()
+                    } else {
+                        lang.pick("Komut eksik", "Command missing").into()
+                    },
+                }
+            }
+        })
+        .collect()
+}
+
+pub fn probe_providers(cfg: &AiConfig, lang: Lang) -> Vec<ProviderStatus> {
+    probe_providers_with(cfg, lang, &|bin| config::find_cli_in_path(bin))
+}
+
+pub fn effective_model_label(cfg: &AiConfig, resolved: AiProvider) -> String {
+    if let Some(model) = cfg
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return model.to_string();
+    }
+    match resolved {
+        AiProvider::GeminiApi => config::DEFAULT_GEMINI_MODEL.to_string(),
+        AiProvider::OpenAiApi => config::DEFAULT_OPENAI_MODEL.to_string(),
+        _ => "default".to_string(),
+    }
+}
+
+pub fn test_connection_with_config(
+    root: &Path,
+    cfg: &AiConfig,
+) -> Result<(AiProvider, String, u128)> {
+    let resolved = resolve_provider(cfg, &|bin| config::find_cli_in_path(bin))?;
+    let model = effective_model_label(cfg, resolved);
+    let started = Instant::now();
+    let raw = generate_with_config(
+        root,
+        cfg,
+        "Respond with valid JSON matching the schema: {\"answer\":\"OK\"}",
+        ANSWER_SCHEMA,
+    )?;
+    let _ = parse_answer(&raw)?;
+    Ok((resolved, model, started.elapsed().as_millis()))
 }
 
 #[cfg(test)]
@@ -1443,6 +1986,7 @@ mod tests {
                 "prompt",
                 "SCHEMA",
                 Some("gemini-3.8-flash-low"),
+                None,
                 Path::new("schema.json"),
                 Path::new("out.json"),
             )
@@ -1723,6 +2267,7 @@ mod tests {
         let mut cfg = config::AiConfig {
             provider: config::AiProvider::Auto,
             model: None,
+            effort: None,
             base_url: None,
             gemini_api_key: Some("gem-key".into()),
             openai_api_key: Some("oai-key".into()),
@@ -1753,9 +2298,9 @@ mod tests {
             resolve_provider(&cfg, &|bin| (bin == "codex").then(|| PathBuf::from(bin))).unwrap(),
             config::AiProvider::Codex
         );
-        assert_eq!(
-            resolve_provider(&cfg, &|bin| (bin == "gemini").then(|| PathBuf::from(bin))).unwrap(),
-            config::AiProvider::GeminiCli
+        // Standalone `gemini` CLI is intentionally no longer probed; use `agy` CLI or Gemini API.
+        assert!(
+            resolve_provider(&cfg, &|bin| (bin == "gemini").then(|| PathBuf::from(bin))).is_err()
         );
         assert!(resolve_provider(&cfg, &|_| None).is_err());
     }
@@ -1777,12 +2322,64 @@ mod tests {
         assert!(gemini_endpoint_and_headers(Some("http://localhost:8080"), None, "secret").is_ok());
 
         let schema: Value = serde_json::from_str(ANSWER_SCHEMA).unwrap();
-        let gbody = gemini_request_body("Hello?", &schema);
+        let gbody = gemini_request_body(None, "Hello?", &schema, None);
         assert_eq!(
             gbody["generationConfig"]["responseMimeType"],
             "application/json"
         );
         assert_eq!(gbody["generationConfig"]["responseJsonSchema"], schema);
+        assert!(gbody["generationConfig"]["thinkingConfig"].is_null());
+
+        // Gemini 2.5 models require thinkingBudget (integer), NOT thinkingLevel (HTTP 400).
+        let gbody_25_flash =
+            gemini_request_body(None, "Hello?", &schema, Some(config::AiEffort::Minimal));
+        assert_eq!(
+            gbody_25_flash["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            0
+        );
+        assert!(gbody_25_flash["generationConfig"]["thinkingConfig"]["thinkingLevel"].is_null());
+        let gbody_25_pro = gemini_request_body(
+            Some("gemini-2.5-pro"),
+            "Hello?",
+            &schema,
+            Some(config::AiEffort::Minimal),
+        );
+        assert_eq!(
+            gbody_25_pro["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            128
+        );
+
+        // Gemini 3.5-flash-lite supports minimal; 4-hydrogen supports xhigh; others clamp to low/medium/high.
+        let gbody_lite = gemini_request_body(
+            Some("gemini-3.5-flash-lite"),
+            "Hello?",
+            &schema,
+            Some(config::AiEffort::Minimal),
+        );
+        assert_eq!(
+            gbody_lite["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "minimal"
+        );
+        let gbody_h2 = gemini_request_body(
+            Some("gemini-4-hydrogen"),
+            "Hello?",
+            &schema,
+            Some(config::AiEffort::Max),
+        );
+        assert_eq!(
+            gbody_h2["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "xhigh"
+        );
+        let gbody_eff = gemini_request_body(
+            Some("gemini-3.8-flash"),
+            "Hello?",
+            &schema,
+            Some(config::AiEffort::XHigh),
+        );
+        assert_eq!(
+            gbody_eff["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
         let gresp = json!({
             "candidates": [{"content": {"parts": [{"text": "{\"answer\":\"42\"}"}]}}]
         })
@@ -1796,21 +2393,71 @@ mod tests {
         assert_eq!(oai_url, "http://localhost:11434/v1/chat/completions");
         assert!(openai_endpoint(Some("http://remote.example.com/v1"), Some("k")).is_err());
 
-        let obody_strict = openai_request_body("gpt-4o-mini", "Q?", &schema, true, ANSWER_SCHEMA);
+        let obody_strict =
+            openai_request_body("gpt-4o-mini", "Q?", &schema, true, ANSWER_SCHEMA, None);
         assert_eq!(obody_strict["response_format"]["type"], "json_schema");
         assert_eq!(
             obody_strict["response_format"]["json_schema"]["strict"],
             true
         );
 
-        let obody_obj = openai_request_body("llama3", "Q?", &schema, false, ANSWER_SCHEMA);
+        let obody_obj = openai_request_body("llama3", "Q?", &schema, false, ANSWER_SCHEMA, None);
         assert_eq!(obody_obj["response_format"]["type"], "json_object");
+        assert!(obody_obj["reasoning_effort"].is_null());
+
+        let obody_eff = openai_request_body(
+            "gpt-6.1-sol",
+            "Q?",
+            &schema,
+            true,
+            ANSWER_SCHEMA,
+            Some(config::AiEffort::Minimal),
+        );
+        // gpt-6* rejects "minimal" (HTTP 400); normalized cleanly to "low".
+        assert_eq!(obody_eff["reasoning_effort"], "low");
+
+        // gpt-4o-mini is non-reasoning and rejects reasoning_effort; must be omitted.
+        let obody_4o = openai_request_body(
+            "gpt-4o-mini",
+            "Q?",
+            &schema,
+            true,
+            ANSWER_SCHEMA,
+            Some(config::AiEffort::High),
+        );
+        assert!(obody_4o["reasoning_effort"].is_null());
+
+        // gpt-5 supports minimal and clamps xhigh/max to high; o4-mini accepts low/medium/high.
+        assert_eq!(
+            openai_effort_str("gpt-5", config::AiEffort::Minimal),
+            Some("minimal")
+        );
+        assert_eq!(
+            openai_effort_str("gpt-5-mini", config::AiEffort::XHigh),
+            Some("high")
+        );
+        assert_eq!(
+            openai_effort_str("o4-mini", config::AiEffort::Max),
+            Some("high")
+        );
+        assert_eq!(
+            openai_effort_str("gpt-5.3-codex", config::AiEffort::Max),
+            Some("xhigh")
+        );
 
         assert!(should_fallback_openai_json_object(
             400,
             r#"{"error":{"message":"response_format type json_schema is not supported"}}"#
         ));
         assert!(!should_fallback_openai_json_object(401, "unauthorized"));
+        assert!(should_fallback_openai_reasoning_effort(
+            400,
+            r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#
+        ));
+        assert!(!should_fallback_openai_reasoning_effort(
+            401,
+            "unauthorized"
+        ));
 
         let oresp = json!({
             "choices": [{"message": {"content": "{\"answer\":\"ok\"}"}}]
@@ -1859,6 +2506,7 @@ mod tests {
             "prompt",
             "{}",
             None,
+            None,
             Path::new("/tmp/s.json"),
             Path::new("/tmp/o.json"),
         )
@@ -1872,6 +2520,7 @@ mod tests {
             "prompt",
             "{}",
             Some("sonnet"),
+            None,
             Path::new("/tmp/s.json"),
             Path::new("/tmp/o.json"),
         )
@@ -1888,6 +2537,7 @@ mod tests {
             "prompt",
             "{}",
             None,
+            None,
             Path::new("/tmp/s.json"),
             Path::new("/tmp/o.json"),
         )
@@ -1895,6 +2545,60 @@ mod tests {
         assert_eq!(codex_args[0], "exec");
         assert!(codex_args.contains(&"--sandbox".to_string()));
         assert_eq!(codex_args.last().map(String::as_str), Some("-"));
+
+        let claude_eff = build_cli_args(
+            config::AiProvider::Claude,
+            "prompt",
+            "{}",
+            Some("claude-sonnet-5-5"),
+            Some(config::AiEffort::High),
+            Path::new("/tmp/s.json"),
+            Path::new("/tmp/o.json"),
+        )
+        .unwrap();
+        assert!(claude_eff.windows(2).any(|w| w == ["--effort", "high"]));
+
+        let codex_eff = build_cli_args(
+            config::AiProvider::Codex,
+            "prompt",
+            "{}",
+            Some("gpt-5.3-codex"),
+            Some(config::AiEffort::Max),
+            Path::new("/tmp/s.json"),
+            Path::new("/tmp/o.json"),
+        )
+        .unwrap();
+        assert!(
+            codex_eff
+                .windows(2)
+                .any(|w| w == ["-c", "model_reasoning_effort=xhigh"])
+        );
+        assert_eq!(codex_eff.last().map(String::as_str), Some("-"));
+
+        let agy_eff = build_cli_args(
+            config::AiProvider::Agy,
+            "prompt",
+            "{}",
+            Some("gemini-4-hydrogen"),
+            Some(config::AiEffort::Max),
+            Path::new("/tmp/s.json"),
+            Path::new("/tmp/o.json"),
+        )
+        .unwrap();
+        assert!(agy_eff.windows(2).any(|w| w == ["--effort", "xhigh"]));
+
+        // Pre-suffixed agy model must NOT also pass `--effort` (conflicts in agy CLI).
+        let agy_suffixed = build_cli_args(
+            config::AiProvider::Agy,
+            "prompt",
+            "{}",
+            Some("gemini-4-hydrogen-high"),
+            Some(config::AiEffort::Low),
+            Path::new("/tmp/s.json"),
+            Path::new("/tmp/o.json"),
+        )
+        .unwrap();
+        assert!(!agy_suffixed.contains(&"--effort".to_string()));
 
         let gem_env = json!({"response": "{\"answer\":\"hi\"}"}).to_string();
         assert_eq!(parse_cli_output(&gem_env).unwrap(), "{\"answer\":\"hi\"}");
@@ -2066,6 +2770,7 @@ mod tests {
         let cfg = AiConfig {
             provider: AiProvider::Custom,
             model: None,
+            effort: None,
             base_url: None,
             gemini_api_key: None,
             openai_api_key: None,
@@ -2118,12 +2823,7 @@ mod tests {
         }
 
         // All other CLI/custom providers scrub every variable including ANTHROPIC_API_KEY.
-        for provider in [
-            AiProvider::Agy,
-            AiProvider::Codex,
-            AiProvider::GeminiCli,
-            AiProvider::Custom,
-        ] {
+        for provider in [AiProvider::Agy, AiProvider::Codex, AiProvider::Custom] {
             let mut cmd = Command::new("tool");
             scrub_sensitive_env(&mut cmd, provider);
             let envs: Vec<(String, Option<String>)> = cmd
@@ -2185,6 +2885,7 @@ mod tests {
                     "p",
                     "{}",
                     Some(bad_model),
+                    None,
                     Path::new("s.json"),
                     Path::new("o.json"),
                 )
@@ -2208,5 +2909,94 @@ mod tests {
         assert_eq!(anki_field("@SUM(1,2)"), "'@SUM(1,2)");
         assert_eq!(anki_field("-able"), "-able");
         assert_eq!(anki_field("ownership"), "ownership");
+    }
+
+    #[test]
+    fn parse_plan_normalizes_days_commands_and_rejects_bad_length() {
+        let raw = r#"```json
+        {
+          "days": [
+            {
+              "day": 10,
+              "title": "  Zamanlar  ",
+              "tasks": [
+                { "command": "/anlat   Tenses", "label": "Konu: Zamanlar" },
+                { "command": "/rm -rf /", "label": "Elle okuma" }
+              ]
+            },
+            {
+              "day": 99,
+              "title": "Tekrar",
+              "tasks": [
+                { "command": "/tekrar", "label": "Günlük tekrar" }
+              ]
+            }
+          ]
+        }
+        ```"#;
+        let parsed = parse_plan(raw, 2).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].day, 1);
+        assert_eq!(parsed[0].title, "Zamanlar");
+        assert_eq!(parsed[0].tasks[0].command, "/anlat Tenses");
+        assert_eq!(parsed[0].tasks[1].command, "");
+        assert_eq!(parsed[1].day, 2);
+        assert!(parse_plan(raw, 3).is_err());
+
+        let schema: Value = serde_json::from_str(&plan_schema(2)).unwrap();
+        assert_eq!(schema["properties"]["days"]["minItems"], 2);
+        assert_eq!(schema["properties"]["days"]["maxItems"], 2);
+    }
+
+    #[test]
+    fn probe_providers_reports_ready_state_without_network() {
+        let cfg = AiConfig {
+            provider: AiProvider::Auto,
+            model: None,
+            effort: None,
+            base_url: None,
+            gemini_api_key: Some("AIzaTest".into()),
+            openai_api_key: None,
+            custom_cmd: None,
+            timeout_secs: 180,
+        };
+        let statuses = probe_providers_with(&cfg, Lang::En, &|bin| {
+            (bin == "codex").then(|| PathBuf::from("/usr/bin/codex"))
+        });
+        assert!(
+            statuses
+                .iter()
+                .find(|s| s.provider == AiProvider::Auto)
+                .unwrap()
+                .ready
+        );
+        assert!(
+            statuses
+                .iter()
+                .find(|s| s.provider == AiProvider::GeminiApi)
+                .unwrap()
+                .ready
+        );
+        assert!(
+            !statuses
+                .iter()
+                .find(|s| s.provider == AiProvider::OpenAiApi)
+                .unwrap()
+                .ready
+        );
+        assert!(
+            statuses
+                .iter()
+                .find(|s| s.provider == AiProvider::Codex)
+                .unwrap()
+                .ready
+        );
+        assert!(
+            !statuses
+                .iter()
+                .find(|s| s.provider == AiProvider::Claude)
+                .unwrap()
+                .ready
+        );
     }
 }

@@ -27,12 +27,12 @@
 | `CFG-1` | Environment lookup precedence is strictly: `1. Process env (std::env::var)` -> `2. <root>/.env` -> `3. <root>/data/.env`. Never read an unrelated CWD `.env` when `--root` points elsewhere. |
 | `CFG-2` | Unrecognized/legacy env prefixes (e.g., `LEGACY_STUDY_TELEGRAM_TOKEN`, `LEGACY_TELEGRAM_CHAT_ID`) are ignored cleanly. |
 | `CFG-3` | `.env` parser handles blank lines, full-line `#` comments, optional leading `export `, trimmed keys, balanced single (`'...'`) or double (`"..."`) quotes, unquoted inline `#` comments, and ignores entries containing NUL (`\0`) bytes. |
-| `CFG-4` | Typed config models: `AiProvider` (`Auto`, `GeminiApi`, `OpenAiApi`, `Agy`, `Claude`, `Codex`, `GeminiCli`, `Custom`), `AiConfig`, `TelegramConfig`, and `STUDIA_AI_TIMEOUT_SECS` (default `180`, `0` = no limit). |
+| `CFG-4` | Typed config models: `AiProvider` (`Auto`, `GeminiApi`, `OpenAiApi`, `Agy`, `Claude`, `Codex`, `Custom`), `AiEffort` (`Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`), `AiConfig`, `TelegramConfig`, and `STUDIA_AI_TIMEOUT_SECS` (default `180`, `0` = no limit). |
 
 ### Key Env Variables
 - `STUDIA_LANG`: `en` | `tr`
-- `STUDIA_AI_PROVIDER`: `auto` | `gemini` | `openai` | `agy` | `claude` | `codex` | `gemini-cli` | `custom`
-- `STUDIA_AI_MODEL`, `STUDIA_AI_BASE_URL`, `GEMINI_API_KEY` / `STUDIA_GEMINI_API_KEY`, `OPENAI_API_KEY` / `STUDIA_OPENAI_API_KEY`, `STUDIA_AI_CMD`, `STUDIA_AI_TIMEOUT_SECS`
+- `STUDIA_AI_PROVIDER`: `auto` | `gemini` | `openai` | `agy` | `claude` | `codex` | `custom`
+- `STUDIA_AI_MODEL`, `STUDIA_AI_EFFORT`, `STUDIA_AI_BASE_URL`, `GEMINI_API_KEY` / `STUDIA_GEMINI_API_KEY`, `OPENAI_API_KEY` / `STUDIA_OPENAI_API_KEY`, `STUDIA_AI_CMD`, `STUDIA_AI_TIMEOUT_SECS`
 - `STUDIA_TELEGRAM_TOKEN`, `STUDIA_TELEGRAM_CHAT_ID`, `STUDIA_MORNING` (`HH:MM`, default `08:30`)
 
 ### Acceptance Criteria (`CFG-*`)

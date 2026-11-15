@@ -1,7 +1,10 @@
+use super::modals::{
+    AiSettingsModal, Modal, PlanEditModal, PlanEditPrompt, PlanGenModal, TASK_CMD_KINDS,
+};
 use crate::{
     Result, ai,
     bot::{self, JobKind, JobResult, Session},
-    coach, exam,
+    coach, config, exam,
     i18n::Lang,
     invalid, plan, sources,
     store::{SessionStats, Store, StoredQuestion},
@@ -98,6 +101,8 @@ enum Work {
     Coach {
         snapshot: coach::Snapshot,
     },
+    /// Ayar modalından başlatılan canlı AI bağlantı testi.
+    TestAi,
 }
 
 /// Koçun durumu. `On`: kendi kendine çalışır. `Paused`: kullanıcı bir oturumu kesti; F3 ile sürer. `Off`: kapalı.
@@ -150,6 +155,35 @@ fn job_label(kind: &JobKind, lang: Lang) -> &'static str {
         ),
         JobKind::Vocab { .. } => lang.pick("Kavram kartları hazırlanıyor", "Preparing flashcards"),
         JobKind::DenemeCoach { .. } => lang.pick("Koç yanıtlıyor", "Coach is answering"),
+        JobKind::GeneratePlan { .. } => {
+            lang.pick("Çalışma planı hazırlanıyor", "Generating study plan")
+        }
+    }
+}
+
+fn compute_ai_badge(root: &Path) -> String {
+    let Ok(cfg) = config::load_ai_config(root) else {
+        return "AI: err".into();
+    };
+    match ai::resolve_provider(&cfg, &|bin| config::find_cli_in_path(bin)) {
+        Ok(resolved) => {
+            let model = ai::effective_model_label(&cfg, resolved);
+            let short_model = if model.chars().count() > 20 {
+                let prefix: String = model.chars().take(19).collect();
+                format!("{prefix}…")
+            } else {
+                model
+            };
+            match cfg.effort {
+                Some(eff) => format!(
+                    "{}: {short_model}·{}",
+                    resolved.as_env_str(),
+                    eff.as_env_str()
+                ),
+                None => format!("{}: {short_model}", resolved.as_env_str()),
+            }
+        }
+        Err(_) => format!("{}: none", cfg.provider.as_env_str()),
     }
 }
 
@@ -241,6 +275,7 @@ pub struct App {
     topic: String,
     pub answer: String,
     pub scroll: u16,
+    pub ask_max_scroll: Cell<u16>,
     pub session: Option<Session>,
     pub session_tab: usize,
     pub session_subject: String,
@@ -298,6 +333,42 @@ pub struct App {
     /// Son tamamlanan koç oturumunun özeti.
     pub coach_note: String,
     pub lang: Lang,
+    /// Açık modal pencere (Plan oluşturucu, Plan düzenleyici, AI/Model ayarları).
+    pub modal: Option<Modal>,
+    /// Başlık çubuğundaki etkin sağlayıcı/model etiketi.
+    pub ai_badge: String,
+}
+
+fn clamp_scroll(current: u16, max: u16, delta: i32) -> u16 {
+    (i32::from(current.min(max)) + delta).clamp(0, i32::from(max)) as u16
+}
+
+impl App {
+    /// Sor sekmesi yanıt / özet panelinde kaydırır.
+    fn scroll_ask(&mut self, delta: i32) {
+        self.scroll = clamp_scroll(self.scroll, self.ask_max_scroll.get(), delta);
+    }
+
+    /// Fare tekerleği olaylarını aktif ekrana göre kaydırır.
+    pub fn mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        if self.help || self.modal.is_some() {
+            return;
+        }
+        let delta = match mouse.kind {
+            crossterm::event::MouseEventKind::ScrollUp => -3,
+            crossterm::event::MouseEventKind::ScrollDown => 3,
+            _ => return,
+        };
+        if self.editing == Some(Input::DenemeChat) || self.deneme_chat.is_some() {
+            self.scroll_chat(delta);
+        } else if self.tab == 4 && self.lesson.is_some() {
+            self.scroll_lesson(delta);
+        } else if self.tab == 0 {
+            self.scroll_ask(delta);
+        } else {
+            self.scroll = clamp_scroll(self.scroll, u16::MAX, delta);
+        }
+    }
 }
 
 impl App {
@@ -320,6 +391,7 @@ impl App {
         let root = fs::canonicalize(root)?;
         let store = Store::open(&root.join("data/studia.db"))?;
         let coach_mode = CoachMode::from_state(store.state("coach_mode")?);
+        let ai_badge = compute_ai_badge(&root);
         let mut app = Self {
             root,
             store,
@@ -331,6 +403,7 @@ impl App {
             topic: String::new(),
             answer: String::new(),
             scroll: 0,
+            ask_max_scroll: Cell::new(u16::MAX),
             session: None,
             session_tab: 1,
             session_subject: String::new(),
@@ -372,6 +445,8 @@ impl App {
             coach_ready: None,
             coach_note: String::new(),
             lang,
+            modal: None,
+            ai_badge,
         };
         app.refresh()?;
         Ok(app)
@@ -463,6 +538,11 @@ impl App {
                     ),
                     true,
                 ),
+                Work::TestAi => (
+                    self.lang
+                        .pick("AI bağlantısı test ediliyor", "Testing AI connection"),
+                    true,
+                ),
                 // Koç ve ders sohbetinde Esc sohbetten çıkarır; iş arka planda biter, sonucu atılır.
                 Work::Ai { kind, .. } => (
                     job_label(kind, self.lang),
@@ -498,7 +578,7 @@ impl App {
     /// Dizinleme yarıda bırakılmaz, çünkü veritabanını yazmaya devam eder.
     fn cancel_pending(&mut self) -> Result<()> {
         match self.pending.as_ref().map(|pending| &pending.work) {
-            Some(Work::Ai { .. }) => {
+            Some(Work::Ai { .. } | Work::TestAi) => {
                 self.pending = None;
                 self.status = self
                     .lang
@@ -586,6 +666,90 @@ impl App {
             started: Instant::now(),
         });
         self.status.clear();
+        Ok(())
+    }
+
+    fn begin_ai_test(&mut self, cfg: config::AiConfig) -> Result<()> {
+        let root = self.root.clone();
+        self.begin_ai_test_with(move || ai::test_connection_with_config(&root, &cfg))
+    }
+
+    fn begin_ai_test_with(
+        &mut self,
+        run: impl FnOnce() -> Result<(config::AiProvider, String, u128)> + Send + 'static,
+    ) -> Result<()> {
+        if self.pending.is_some() {
+            self.status = self
+                .lang
+                .pick(
+                    "Önceki istek sürüyor…",
+                    "Previous request is still running…",
+                )
+                .into();
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let lang = self.lang;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("studia-tui-ai-test".into())
+            .spawn(move || {
+                let result = match run() {
+                    Ok((provider, model, ms)) => Ok(format!(
+                        "{} / {model} ({ms} ms)",
+                        provider.display_name(lang)
+                    )),
+                    Err(err) => Err(invalid(config::redact_error(&root, &err))),
+                };
+                let _ = sender.send(result);
+            })?;
+        self.pending = Some(Pending {
+            work: Work::TestAi,
+            receiver,
+            started: Instant::now(),
+        });
+        if let Some(Modal::AiSettings(m)) = self.modal.as_mut() {
+            m.test_result = Some((
+                true,
+                self.lang
+                    .pick("Bağlantı test ediliyor…", "Testing connection…")
+                    .into(),
+            ));
+            m.error = None;
+        }
+        Ok(())
+    }
+
+    fn open_plan_gen_modal(&mut self) -> Result<()> {
+        self.subject()?;
+        self.tab = 4;
+        self.editing = None;
+        let default_days = if self.course.plan.is_empty() {
+            14
+        } else {
+            self.course.plan.len().min(plan::MAX_PLAN_DAYS)
+        };
+        self.modal = Some(Modal::PlanGen(PlanGenModal::new(default_days)));
+        Ok(())
+    }
+
+    fn open_plan_edit_modal(&mut self) -> Result<()> {
+        self.subject()?;
+        self.tab = 4;
+        self.editing = None;
+        self.modal = Some(Modal::PlanEdit(PlanEditModal::from_plan(
+            &self.course.plan,
+            self.lang,
+        )));
+        Ok(())
+    }
+
+    fn open_ai_settings_modal(&mut self) -> Result<()> {
+        self.editing = None;
+        let cfg = config::load_ai_config(&self.root)?;
+        self.modal = Some(Modal::AiSettings(Box::new(AiSettingsModal::load(
+            cfg, self.lang,
+        ))));
         Ok(())
     }
 
@@ -868,10 +1032,33 @@ impl App {
             self.finish_lesson_chat(subject, topic, reply)?;
             return self.refresh();
         }
+        if matches!(pending.work, Work::TestAi) {
+            match result {
+                Ok(summary) => {
+                    let msg = match self.lang {
+                        Lang::Tr => format!("✓ Bağlantı başarılı: {summary}"),
+                        Lang::En => format!("✓ Connected: {summary}"),
+                    };
+                    if let Some(Modal::AiSettings(m)) = self.modal.as_mut() {
+                        m.test_result = Some((true, msg.clone()));
+                        m.error = None;
+                    }
+                    self.status = msg;
+                }
+                Err(err) => {
+                    let safe = config::redact_error(&self.root, &err);
+                    if let Some(Modal::AiSettings(m)) = self.modal.as_mut() {
+                        m.test_result = Some((false, safe.clone()));
+                    }
+                    self.status = safe;
+                }
+            }
+            return Ok(());
+        }
         let raw = result?;
         match pending.work {
             Work::Index => self.status = format!("✓ {raw}"),
-            Work::Coach { .. } => unreachable!(),
+            Work::Coach { .. } | Work::TestAi => unreachable!(),
             Work::Ai { subject, kind } => {
                 let saved = bot::save_job_in(&mut self.store, &subject, &kind, &raw, self.lang)?;
                 if let Some((start, day, index)) = plan_task {
@@ -1013,6 +1200,32 @@ impl App {
                                 "✓ Ders anlatımı hazır; quiz Bugün sekmesinde başlıyor.",
                                 "✓ Lesson ready; quiz opens in Today tab.",
                             )
+                            .into();
+                    }
+                    JobResult::Plan(days) => {
+                        let auto_start = matches!(
+                            &kind,
+                            JobKind::GeneratePlan {
+                                auto_start: true,
+                                ..
+                            }
+                        );
+                        let msg = bot::apply_generated_plan(
+                            &self.root,
+                            &self.store,
+                            &subject,
+                            days,
+                            auto_start,
+                            Local::now().date_naive(),
+                            self.lang,
+                        )?;
+                        self.plan_view_day = None;
+                        self.task_selected = 0;
+                        self.show(&msg);
+                        self.tab = 4;
+                        self.status = self
+                            .lang
+                            .pick("✓ Çalışma planı oluşturuldu.", "✓ Study plan generated.")
                             .into();
                     }
                 }
@@ -1727,11 +1940,33 @@ impl App {
             "plan" => {
                 let subject = self.subject()?;
                 let course = crate::course::CourseConfig::load_or_default(&self.root, &subject)?;
-                let len = course.plan.len();
                 let (sub, rest) = args
                     .trim()
                     .split_once(char::is_whitespace)
                     .unwrap_or((args.trim(), ""));
+                if matches!(sub, "olustur" | "create" | "generate" | "uret") {
+                    if rest.trim().is_empty() {
+                        self.open_plan_gen_modal()?;
+                    } else {
+                        let (days, tasks_per_day, focus) = bot::parse_plan_create_args(
+                            rest,
+                            Local::now().date_naive(),
+                            self.lang,
+                        )?;
+                        self.begin_ai(JobKind::GeneratePlan {
+                            days,
+                            tasks_per_day,
+                            focus,
+                            auto_start: true,
+                        })?;
+                    }
+                    return Ok(());
+                }
+                if matches!(sub, "duzenle" | "edit") {
+                    self.open_plan_edit_modal()?;
+                    return Ok(());
+                }
+                let len = course.plan.len();
                 if matches!(sub, "gun" | "gec" | "day" | "jump" | "goto")
                     && let Ok(number) = rest.trim().parse::<usize>()
                     && (1..=len).contains(&number)
@@ -1749,6 +1984,46 @@ impl App {
                 )?;
                 self.show(&text);
                 self.refresh()?;
+            }
+            "ai" | "ayarlar" | "settings" => {
+                self.open_ai_settings_modal()?;
+            }
+            "model" => {
+                let trimmed = args.trim();
+                if trimmed.is_empty() {
+                    self.open_ai_settings_modal()?;
+                } else {
+                    let model = config::validate_model_identifier(trimmed)?;
+                    config::save_dotenv_updates(&self.root, &[("STUDIA_AI_MODEL", Some(model))])?;
+                    self.ai_badge = compute_ai_badge(&self.root);
+                    self.status = match self.lang {
+                        Lang::Tr => format!("✓ Varsayılan model güncellendi: {model}"),
+                        Lang::En => format!("✓ Default model updated: {model}"),
+                    };
+                }
+            }
+            "effort" => {
+                let trimmed = args.trim();
+                if trimmed.is_empty() {
+                    self.open_ai_settings_modal()?;
+                } else {
+                    let parsed = config::parse_effort(trimmed)?;
+                    config::save_dotenv_updates(
+                        &self.root,
+                        &[("STUDIA_AI_EFFORT", parsed.map(config::AiEffort::as_env_str))],
+                    )?;
+                    self.ai_badge = compute_ai_badge(&self.root);
+                    self.status = match (self.lang, parsed) {
+                        (Lang::Tr, Some(e)) => {
+                            format!("✓ Düşünme eforu güncellendi: {}", e.as_env_str())
+                        }
+                        (Lang::En, Some(e)) => {
+                            format!("✓ Reasoning effort updated: {}", e.as_env_str())
+                        }
+                        (Lang::Tr, None) => "✓ Düşünme eforu sıfırlandı (varsayılan)".into(),
+                        (Lang::En, None) => "✓ Reasoning effort reset (default)".into(),
+                    };
+                }
             }
             "anlat" | "explain" | "lesson" if args.is_empty() => self.ask_topic("anlat"),
             "anlat" | "explain" | "lesson" => self.open_or_begin_lesson(args, None)?,
@@ -2357,7 +2632,7 @@ impl App {
         } else {
             self.scroll.min(max)
         };
-        let next = (i32::from(current) + delta).clamp(0, i32::from(max)) as u16;
+        let next = clamp_scroll(current, max, delta);
         self.scroll = next;
         self.lesson_follow = max < u16::MAX && next >= max;
     }
@@ -2521,6 +2796,9 @@ impl App {
             }
             return Ok(());
         }
+        if self.modal.is_some() {
+            return self.handle_modal_key(key, control);
+        }
         if let Some(input) = self.editing {
             match key.code {
                 // Koç sohbetinde Esc önce yazılanı siler, boşsa sohbetten çıkar; ↑/↓ ve PgUp/PgDn kaydırır.
@@ -2555,12 +2833,10 @@ impl App {
                     self.scroll = 0;
                     self.lesson_follow = false;
                 }
-                KeyCode::Up if input == Input::Answer => {
-                    self.scroll = self.scroll.saturating_sub(1);
-                }
-                KeyCode::Down if input == Input::Answer => {
-                    self.scroll = self.scroll.saturating_add(1);
-                }
+                KeyCode::Up if input == Input::Answer => self.scroll_ask(-1),
+                KeyCode::Down if input == Input::Answer => self.scroll_ask(1),
+                KeyCode::PageUp if input == Input::Answer => self.scroll_ask(-10),
+                KeyCode::PageDown if input == Input::Answer => self.scroll_ask(10),
                 KeyCode::Esc => {
                     self.input.clear();
                     self.editing = None;
@@ -2601,6 +2877,7 @@ impl App {
             KeyCode::F(2) => return self.toggle_listener(),
             KeyCode::F(3) => return self.toggle_coach(),
             KeyCode::F(4) => return self.toggle_lang(),
+            KeyCode::F(5) => return self.open_ai_settings_modal(),
             _ => {}
         }
         // Ctrl+Q is checked before the quit key: Ctrl+Q must not quit.
@@ -2693,6 +2970,16 @@ impl App {
                     (self.task_selected + len - 1) % len
                 };
             }
+            KeyCode::Up
+                if self.tab == 0 && (!self.answer.is_empty() || self.subjects.len() <= 1) =>
+            {
+                self.scroll_ask(-1);
+            }
+            KeyCode::Down
+                if self.tab == 0 && (!self.answer.is_empty() || self.subjects.len() <= 1) =>
+            {
+                self.scroll_ask(1);
+            }
             KeyCode::Up | KeyCode::Down if !self.subjects.is_empty() => {
                 let len = self.subjects.len();
                 self.selected = if key.code == KeyCode::Down {
@@ -2736,6 +3023,16 @@ impl App {
             {
                 self.plan_start()?
             }
+            KeyCode::Char('g')
+                if self.tab == 4 && self.session.is_none() && self.lesson.is_none() =>
+            {
+                self.open_plan_gen_modal()?
+            }
+            KeyCode::Char('e')
+                if self.tab == 4 && self.session.is_none() && self.lesson.is_none() =>
+            {
+                self.open_plan_edit_modal()?
+            }
             KeyCode::Enter if matches!(self.tab, 1 | 2) => self.quiz_enter()?,
             KeyCode::Enter if self.tab == 4 => self.plan_enter()?,
             KeyCode::Enter if self.tab == DENEME_TAB => {
@@ -2743,6 +3040,8 @@ impl App {
             }
             KeyCode::Char('d') if self.tab == DENEME_TAB => self.ask_deneme_delete(),
             KeyCode::Esc => self.end_session_early()?,
+            KeyCode::PageUp if self.tab == 0 => self.scroll_ask(-10),
+            KeyCode::PageDown if self.tab == 0 => self.scroll_ask(10),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
             KeyCode::Home if self.tab == 4 && self.lesson.is_none() && self.session.is_none() => {
@@ -2765,6 +3064,578 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_modal_key(&mut self, key: KeyEvent, control: bool) -> Result<()> {
+        match self.modal.take() {
+            Some(Modal::PlanGen(mut modal)) => {
+                let keep = self.handle_plan_gen_key(&mut modal, key, control)?;
+                if keep {
+                    self.modal = Some(Modal::PlanGen(modal));
+                }
+            }
+            Some(Modal::PlanEdit(mut modal)) => {
+                let keep = self.handle_plan_edit_key(&mut modal, key, control)?;
+                if keep {
+                    self.modal = Some(Modal::PlanEdit(modal));
+                }
+            }
+            Some(Modal::AiSettings(mut modal)) => {
+                let keep = self.handle_ai_settings_key(&mut modal, key, control)?;
+                if keep {
+                    self.modal = Some(Modal::AiSettings(modal));
+                }
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn handle_plan_gen_key(
+        &mut self,
+        m: &mut PlanGenModal,
+        key: KeyEvent,
+        control: bool,
+    ) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => return Ok(false),
+            KeyCode::Tab | KeyCode::Down => m.field = (m.field + 1) % 5,
+            KeyCode::BackTab | KeyCode::Up => m.field = (m.field + 4) % 5,
+            KeyCode::Left | KeyCode::Right if m.field == 1 => {
+                let delta = if key.code == KeyCode::Right { 1 } else { 2 };
+                m.intensity = (m.intensity + delta) % 3;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if m.field == 3 => {
+                m.auto_start = !m.auto_start;
+            }
+            KeyCode::Backspace => match m.field {
+                0 => {
+                    m.days_or_date.pop();
+                    m.error = None;
+                }
+                2 => {
+                    m.focus.pop();
+                    m.error = None;
+                }
+                _ => {}
+            },
+            KeyCode::Char('u') if control => match m.field {
+                0 => {
+                    m.days_or_date.clear();
+                    m.error = None;
+                }
+                2 => {
+                    m.focus.clear();
+                    m.error = None;
+                }
+                _ => {}
+            },
+            KeyCode::Char('s') if control => {
+                return self.submit_plan_gen_with(m, ai_generate(&self.root));
+            }
+            KeyCode::Enter => {
+                return self.submit_plan_gen_with(m, ai_generate(&self.root));
+            }
+            KeyCode::Char(ch) if !control => match m.field {
+                0 => {
+                    m.days_or_date.push(ch);
+                    m.error = None;
+                }
+                2 => {
+                    m.focus.push(ch);
+                    m.error = None;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn submit_plan_gen_with(
+        &mut self,
+        m: &mut PlanGenModal,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<bool> {
+        match m.validate(self.lang) {
+            Ok(days) => {
+                let tasks_per_day = m.tasks_per_day();
+                let focus = m.focus.trim().to_string();
+                let auto_start = m.auto_start;
+                self.begin_ai_with(
+                    JobKind::GeneratePlan {
+                        days,
+                        tasks_per_day,
+                        focus,
+                        auto_start,
+                    },
+                    generate,
+                )?;
+                Ok(false)
+            }
+            Err(err) => {
+                m.error = Some(err);
+                Ok(true)
+            }
+        }
+    }
+
+    fn handle_plan_edit_key(
+        &mut self,
+        m: &mut PlanEditModal,
+        key: KeyEvent,
+        control: bool,
+    ) -> Result<bool> {
+        if let Some(mut prompt) = m.prompt.take() {
+            let mut keep_prompt = true;
+            match &mut prompt {
+                PlanEditPrompt::DayTitle { is_new, text } => match key.code {
+                    KeyCode::Esc => {
+                        keep_prompt = false;
+                        m.error = None;
+                    }
+                    KeyCode::Backspace => {
+                        text.pop();
+                        m.error = None;
+                    }
+                    KeyCode::Char('u') if control => {
+                        text.clear();
+                        m.error = None;
+                    }
+                    KeyCode::Enter => {
+                        let title = text.trim().to_string();
+                        if title.is_empty() {
+                            m.error = Some(
+                                self.lang
+                                    .pick("Gün başlığı boş olamaz.", "Day title cannot be empty.")
+                                    .into(),
+                            );
+                        } else if *is_new {
+                            if m.days.len() >= plan::MAX_PLAN_DAYS {
+                                m.error = Some(
+                                    self.lang
+                                        .pick(
+                                            "En fazla 90 gün eklenebilir.",
+                                            "Maximum 90 days allowed.",
+                                        )
+                                        .into(),
+                                );
+                            } else {
+                                let next_num = m.days.len() + 1;
+                                m.days.push(crate::course::DayConfig {
+                                    day: next_num,
+                                    title,
+                                    tasks: Vec::new(),
+                                });
+                                m.day_idx = m.days.len() - 1;
+                                m.task_idx = 0;
+                                keep_prompt = false;
+                                m.error = None;
+                            }
+                        } else if let Some(day) = m.days.get_mut(m.day_idx) {
+                            day.title = title;
+                            keep_prompt = false;
+                            m.error = None;
+                        }
+                    }
+                    KeyCode::Char(ch) if !control => {
+                        text.push(ch);
+                        m.error = None;
+                    }
+                    _ => {}
+                },
+                PlanEditPrompt::TaskForm {
+                    is_new,
+                    field,
+                    cmd_kind,
+                    arg,
+                    label,
+                } => match key.code {
+                    KeyCode::Esc => {
+                        keep_prompt = false;
+                        m.error = None;
+                    }
+                    KeyCode::Tab | KeyCode::Down => *field = (*field + 1) % 3,
+                    KeyCode::BackTab | KeyCode::Up => *field = (*field + 2) % 3,
+                    KeyCode::Left | KeyCode::Right if *field == 0 => {
+                        let len = TASK_CMD_KINDS.len();
+                        *cmd_kind = if key.code == KeyCode::Right {
+                            (*cmd_kind + 1) % len
+                        } else {
+                            (*cmd_kind + len - 1) % len
+                        };
+                        m.error = None;
+                    }
+                    KeyCode::Backspace => {
+                        if *field == 1 {
+                            arg.pop();
+                        } else if *field == 2 {
+                            label.pop();
+                        }
+                        m.error = None;
+                    }
+                    KeyCode::Char('u') if control => {
+                        if *field == 1 {
+                            arg.clear();
+                        } else if *field == 2 {
+                            label.clear();
+                        }
+                        m.error = None;
+                    }
+                    KeyCode::Enter => {
+                        if matches!(*cmd_kind, 1..=3) && arg.trim().is_empty() {
+                            m.error = Some(
+                                self.lang
+                                    .pick("Konu/argüman girin.", "Enter a topic or argument.")
+                                    .into(),
+                            );
+                        } else if *cmd_kind == 0 && label.trim().is_empty() {
+                            m.error = Some(
+                                self.lang
+                                    .pick("Görev etiketi girin.", "Enter a task label.")
+                                    .into(),
+                            );
+                        } else {
+                            let task = PlanEditPrompt::build_task(*cmd_kind, arg, label, self.lang);
+                            if *is_new {
+                                if let Some(day) = m.days.get_mut(m.day_idx) {
+                                    if day.tasks.len() >= plan::MAX_TASKS_PER_DAY {
+                                        m.error = Some(
+                                            self.lang
+                                                .pick(
+                                                    "Günde en fazla 6 görev olabilir.",
+                                                    "Maximum 6 tasks per day.",
+                                                )
+                                                .into(),
+                                        );
+                                    } else {
+                                        day.tasks.push(task);
+                                        m.task_idx = day.tasks.len() - 1;
+                                        keep_prompt = false;
+                                        m.error = None;
+                                    }
+                                }
+                            } else if let Some(slot) = m
+                                .days
+                                .get_mut(m.day_idx)
+                                .and_then(|d| d.tasks.get_mut(m.task_idx))
+                            {
+                                *slot = task;
+                                keep_prompt = false;
+                                m.error = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char(ch) if !control => {
+                        if *field == 1 {
+                            arg.push(ch);
+                        } else if *field == 2 {
+                            label.push(ch);
+                        }
+                        m.error = None;
+                    }
+                    _ => {}
+                },
+            }
+            if keep_prompt {
+                m.prompt = Some(prompt);
+            }
+            return Ok(true);
+        }
+
+        if m.days.is_empty() {
+            return Ok(false);
+        }
+        let day_count = m.days.len();
+        match key.code {
+            KeyCode::Esc => return Ok(false),
+            KeyCode::Left | KeyCode::Char('h') => {
+                m.day_idx = (m.day_idx + day_count - 1) % day_count;
+                m.clamp_task();
+                m.error = None;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                m.day_idx = (m.day_idx + 1) % day_count;
+                m.clamp_task();
+                m.error = None;
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let len = m.days.get(m.day_idx).map_or(0, |d| d.tasks.len());
+                if len > 0 {
+                    m.task_idx = if key.code == KeyCode::Down {
+                        (m.task_idx + 1) % len
+                    } else {
+                        (m.task_idx + len - 1) % len
+                    };
+                }
+            }
+            KeyCode::Char('+') | KeyCode::Char('n') => {
+                if m.days.len() >= plan::MAX_PLAN_DAYS {
+                    m.error = Some(
+                        self.lang
+                            .pick("En fazla 90 gün eklenebilir.", "Maximum 90 days allowed.")
+                            .into(),
+                    );
+                } else {
+                    m.prompt = Some(PlanEditPrompt::DayTitle {
+                        is_new: true,
+                        text: format!("{} {}", self.lang.pick("Gün", "Day"), m.days.len() + 1),
+                    });
+                    m.error = None;
+                }
+            }
+            KeyCode::Char('t') | KeyCode::Char('r') => {
+                if let Some(day) = m.days.get(m.day_idx) {
+                    m.prompt = Some(PlanEditPrompt::DayTitle {
+                        is_new: false,
+                        text: day.title.clone(),
+                    });
+                    m.error = None;
+                }
+            }
+            KeyCode::Char('d') => {
+                if m.days.len() <= 1 {
+                    m.error = Some(
+                        self.lang
+                            .pick("En az 1 gün kalmalı.", "At least 1 day is required.")
+                            .into(),
+                    );
+                } else if m.day_idx < m.days.len() {
+                    m.days.remove(m.day_idx);
+                    m.renumber_days();
+                    m.error = None;
+                }
+            }
+            KeyCode::Char('a') => {
+                let len = m.days.get(m.day_idx).map_or(0, |d| d.tasks.len());
+                if len >= plan::MAX_TASKS_PER_DAY {
+                    m.error = Some(
+                        self.lang
+                            .pick(
+                                "Günde en fazla 6 görev olabilir.",
+                                "Maximum 6 tasks per day.",
+                            )
+                            .into(),
+                    );
+                } else {
+                    m.prompt = Some(PlanEditPrompt::TaskForm {
+                        is_new: true,
+                        field: 0,
+                        cmd_kind: 1,
+                        arg: String::new(),
+                        label: String::new(),
+                    });
+                    m.error = None;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                if let Some(task) = m.days.get(m.day_idx).and_then(|d| d.tasks.get(m.task_idx)) {
+                    m.prompt = Some(PlanEditPrompt::from_task(task, false));
+                    m.error = None;
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+                if let Some(day) = m.days.get_mut(m.day_idx)
+                    && m.task_idx < day.tasks.len()
+                {
+                    day.tasks.remove(m.task_idx);
+                    m.clamp_task();
+                    m.error = None;
+                }
+            }
+            KeyCode::Char('s') => {
+                return self.save_plan_edit(m);
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn save_plan_edit(&mut self, m: &mut PlanEditModal) -> Result<bool> {
+        let subject = self.subject()?;
+        let mut course = crate::course::CourseConfig::load_or_default(&self.root, &subject)?;
+        course.plan = m.days.clone();
+        if let Err(err) = course
+            .validate()
+            .and_then(|()| course.save(&self.root, &subject))
+        {
+            m.error = Some(config::redact_error(&self.root, &err));
+            return Ok(true);
+        }
+        self.plan_view_day = None;
+        self.task_selected = 0;
+        self.refresh()?;
+        self.status = self
+            .lang
+            .pick("✓ Çalışma planı kaydedildi.", "✓ Study plan saved.")
+            .into();
+        Ok(false)
+    }
+
+    fn handle_ai_settings_key(
+        &mut self,
+        m: &mut AiSettingsModal,
+        key: KeyEvent,
+        control: bool,
+    ) -> Result<bool> {
+        const FIELDS: usize = 10;
+        match key.code {
+            KeyCode::Esc => {
+                if matches!(self.pending.as_ref().map(|p| &p.work), Some(Work::TestAi)) {
+                    self.pending = None;
+                }
+                return Ok(false);
+            }
+            KeyCode::Tab | KeyCode::Down => m.field = (m.field + 1) % FIELDS,
+            KeyCode::BackTab | KeyCode::Up => m.field = (m.field + FIELDS - 1) % FIELDS,
+            KeyCode::Left | KeyCode::Right if m.field == 0 => {
+                let delta = if key.code == KeyCode::Right { 1 } else { -1 };
+                m.cycle_provider(delta, self.lang);
+            }
+            KeyCode::Char(' ') if m.field == 0 => m.cycle_provider(1, self.lang),
+            KeyCode::Left | KeyCode::Right if m.field == 1 => {
+                let delta = if key.code == KeyCode::Right { 1 } else { -1 };
+                m.cycle_suggested_model(delta);
+            }
+            KeyCode::Left | KeyCode::Right if m.field == 2 => {
+                let delta = if key.code == KeyCode::Right { 1 } else { -1 };
+                m.cycle_effort(delta);
+            }
+            KeyCode::Char(' ') if m.field == 2 => m.cycle_effort(1),
+            KeyCode::Char('t') if control => {
+                return self.trigger_ai_settings_test(m);
+            }
+            KeyCode::Char('s') if control => {
+                return self.save_ai_settings(m);
+            }
+            KeyCode::Enter => match m.field {
+                8 => return self.trigger_ai_settings_test(m),
+                9 => return self.save_ai_settings(m),
+                _ => m.field = (m.field + 1) % FIELDS,
+            },
+            KeyCode::Char(' ') if m.field == 8 => return self.trigger_ai_settings_test(m),
+            KeyCode::Char(' ') if m.field == 9 => return self.save_ai_settings(m),
+            KeyCode::Backspace => match m.field {
+                1 => {
+                    m.model.pop();
+                    m.error = None;
+                }
+                3 => {
+                    m.base_url.pop();
+                    m.error = None;
+                }
+                4 => {
+                    if m.gemini_key_dirty {
+                        m.gemini_key_input.pop();
+                    } else {
+                        m.gemini_key_dirty = true;
+                        m.gemini_key_input.clear();
+                        m.gemini_key_masked = None;
+                    }
+                    m.error = None;
+                }
+                5 => {
+                    if m.openai_key_dirty {
+                        m.openai_key_input.pop();
+                    } else {
+                        m.openai_key_dirty = true;
+                        m.openai_key_input.clear();
+                        m.openai_key_masked = None;
+                    }
+                    m.error = None;
+                }
+                6 => {
+                    m.custom_cmd.pop();
+                    m.error = None;
+                }
+                7 => {
+                    m.timeout_secs.pop();
+                    m.error = None;
+                }
+                _ => {}
+            },
+            KeyCode::Char('u') if control => match m.field {
+                1 => m.model.clear(),
+                3 => m.base_url.clear(),
+                4 => {
+                    m.gemini_key_dirty = true;
+                    m.gemini_key_input.clear();
+                    m.gemini_key_masked = None;
+                }
+                5 => {
+                    m.openai_key_dirty = true;
+                    m.openai_key_input.clear();
+                    m.openai_key_masked = None;
+                }
+                6 => m.custom_cmd.clear(),
+                7 => m.timeout_secs.clear(),
+                _ => {}
+            },
+            KeyCode::Char(ch) if !control => match m.field {
+                1 => {
+                    m.model.push(ch);
+                    m.error = None;
+                }
+                3 => {
+                    m.base_url.push(ch);
+                    m.error = None;
+                }
+                4 => {
+                    m.gemini_key_dirty = true;
+                    m.gemini_key_input.push(ch);
+                    m.error = None;
+                }
+                5 => {
+                    m.openai_key_dirty = true;
+                    m.openai_key_input.push(ch);
+                    m.error = None;
+                }
+                6 => {
+                    m.custom_cmd.push(ch);
+                    m.error = None;
+                }
+                7 if ch.is_ascii_digit() => {
+                    m.timeout_secs.push(ch);
+                    m.error = None;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn trigger_ai_settings_test(&mut self, m: &mut AiSettingsModal) -> Result<bool> {
+        match m.build_config() {
+            Ok(cfg) => {
+                // Keep modal open; result is populated into m.test_result by poll().
+                self.modal = Some(Modal::AiSettings(Box::new(m.clone())));
+                self.begin_ai_test(cfg)?;
+                if let Some(Modal::AiSettings(updated)) = self.modal.take() {
+                    *m = *updated;
+                }
+            }
+            Err(err) => {
+                m.error = Some(config::redact_error(&self.root, &err));
+            }
+        }
+        Ok(true)
+    }
+
+    fn save_ai_settings(&mut self, m: &mut AiSettingsModal) -> Result<bool> {
+        if let Err(err) = m.save_to_dotenv(&self.root) {
+            m.error = Some(config::redact_error(&self.root, &err));
+            return Ok(true);
+        }
+        self.ai_badge = compute_ai_badge(&self.root);
+        self.status = self
+            .lang
+            .pick(
+                "✓ AI ayarları .env dosyasına kaydedildi.",
+                "✓ AI settings saved to .env.",
+            )
+            .into();
+        Ok(false)
     }
 }
 
@@ -4236,5 +5107,192 @@ mod tests {
             plan::start_date(&app.store, "Ders").unwrap(),
             Some(today - chrono::Days::new(1))
         );
+    }
+
+    #[test]
+    fn tui_plan_generator_and_manual_editor_modals_persist_course_json() {
+        let (root, mut app) = setup();
+        let meta = crate::course::CourseConfig {
+            title: Some("Özel Başlık".into()),
+            persona: None,
+            exam: None,
+            plan: vec![],
+        };
+        meta.save(root.path(), "Ders").unwrap();
+        app.refresh().unwrap();
+
+        // Today tab -> 'g' opens AI Plan Generator modal.
+        key(&mut app, KeyCode::Char('5'));
+        assert_eq!(app.tab, 4);
+        key(&mut app, KeyCode::Char('g'));
+        assert!(matches!(app.modal, Some(Modal::PlanGen(_))));
+
+        // Fill in 2 days and a focus note, then submit via test generator.
+        let mut gen_modal = match app.modal.take() {
+            Some(Modal::PlanGen(mut m)) => {
+                m.days_or_date = "2".into();
+                m.focus = "Bağlaçlar".into();
+                m
+            }
+            _ => unreachable!(),
+        };
+        app.submit_plan_gen_with(&mut gen_modal, |prompt, _| {
+            assert!(prompt.contains("Bağlaçlar"));
+            Ok(serde_json::json!({
+                "days": [
+                    {"day": 1, "title": "Gün 1", "tasks": [{"command": "/anlat Bağlaçlar", "label": "Konu: Bağlaçlar"}]},
+                    {"day": 2, "title": "Gün 2", "tasks": [{"command": "/quiz Bağlaçlar 5", "label": "Quiz: Bağlaçlar"}]}
+                ]
+            })
+            .to_string())
+        })
+        .unwrap();
+        complete(&mut app);
+        assert_eq!(app.course.title.as_deref(), Some("Özel Başlık"));
+        assert_eq!(app.course.plan.len(), 2);
+
+        // Open manual Plan Editor with 'e', add a 3rd day + manual task, and save with 's'.
+        key(&mut app, KeyCode::Char('e'));
+        assert!(matches!(app.modal, Some(Modal::PlanEdit(_))));
+        key(&mut app, KeyCode::Char('+'));
+        key(&mut app, KeyCode::Char('!')); // appends to prefilled "Gün 3"
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('a')); // new task on Day 3
+        // Cmd kind 0 = manual reading (default is 1 = /anlat; press Left once -> 0)
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Down); // arg
+        key(&mut app, KeyCode::Down); // label
+        for ch in "Okuma 10 sayfa".chars() {
+            key(&mut app, KeyCode::Char(ch));
+        }
+        key(&mut app, KeyCode::Enter); // add task
+        key(&mut app, KeyCode::Char('s')); // save plan
+        assert!(app.modal.is_none());
+
+        let saved = crate::course::CourseConfig::load_or_default(root.path(), "Ders").unwrap();
+        assert_eq!(saved.plan.len(), 3);
+        assert_eq!(saved.plan[2].title, "Gün 3!");
+        assert_eq!(saved.plan[2].tasks[0].label, "Okuma 10 sayfa");
+    }
+
+    #[test]
+    fn tui_ai_settings_modal_saves_dotenv_and_runs_test_ai() {
+        let (root, mut app) = setup();
+        fs::write(
+            root.path().join(".env"),
+            "# Telegram ayarları\nSTUDIA_TELEGRAM_TOKEN=tg-keep-token\n",
+        )
+        .unwrap();
+
+        key(&mut app, KeyCode::F(5));
+        assert!(matches!(app.modal, Some(Modal::AiSettings(_))));
+
+        // Cycle provider to GeminiApi (Auto -> GeminiApi = Right x1).
+        key(&mut app, KeyCode::Right);
+        // Move to Model (field 1) and enter custom model.
+        key(&mut app, KeyCode::Tab);
+        for ch in "gemini-3.8-flash".chars() {
+            key(&mut app, KeyCode::Char(ch));
+        }
+        // Move to Effort (field 2) and pick "high" (default -> minimal -> low -> medium -> high).
+        key(&mut app, KeyCode::Tab);
+        for _ in 0..4 {
+            key(&mut app, KeyCode::Right);
+        }
+        // Move to Base URL (field 3) -> GEMINI_API_KEY (field 4).
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Tab);
+        for ch in "gem-secret-key-9999".chars() {
+            key(&mut app, KeyCode::Char(ch));
+        }
+
+        // Ctrl+S saves to .env and closes modal.
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.modal.is_none());
+
+        let dotenv = fs::read_to_string(root.path().join(".env")).unwrap();
+        assert!(dotenv.contains("STUDIA_TELEGRAM_TOKEN=tg-keep-token"));
+        assert!(dotenv.contains("STUDIA_AI_PROVIDER=gemini"));
+        assert!(dotenv.contains("STUDIA_AI_MODEL=gemini-3.8-flash"));
+        assert!(dotenv.contains("STUDIA_AI_EFFORT=high"));
+        assert!(dotenv.contains("GEMINI_API_KEY=gem-secret-key-9999"));
+
+        // `/model gpt-5-mini` and `/effort xhigh` update .env directly and refresh badge.
+        app.command("/model", "gpt-5-mini").unwrap();
+        app.command("/effort", "xhigh").unwrap();
+        let dotenv2 = fs::read_to_string(root.path().join(".env")).unwrap();
+        assert!(dotenv2.contains("STUDIA_AI_MODEL=gpt-5-mini"));
+        assert!(dotenv2.contains("STUDIA_AI_EFFORT=xhigh"));
+
+        // Reopen AI settings modal and verify TestAi worker populates modal.test_result & redacts errors.
+        key(&mut app, KeyCode::F(5));
+        app.begin_ai_test_with(|| {
+            Ok((config::AiProvider::GeminiApi, "gemini-2.5-flash".into(), 42))
+        })
+        .unwrap();
+        while app.pending.is_some() {
+            app.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        match app.modal.as_ref() {
+            Some(Modal::AiSettings(m)) => {
+                let (ok, msg) = m.test_result.as_ref().unwrap();
+                assert!(*ok, "{msg}");
+                assert!(msg.contains("42 ms"), "{msg}");
+            }
+            other => panic!("expected AiSettings modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_tab_scrolls_with_arrows_page_keys_and_mouse() {
+        let (_root, mut app) = setup();
+        app.answer = (1..=40)
+            .map(|i| format!("Satır {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.ask_max_scroll.set(18);
+        assert_eq!(app.tab, 0);
+        assert_eq!(app.scroll, 0);
+
+        // Normal mode on Ask tab: Down/Up scroll the answer instead of resetting via subject switch.
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.scroll, 2);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.scroll, 1);
+
+        // PageDown clamps to ask_max_scroll (18).
+        key(&mut app, KeyCode::PageDown);
+        key(&mut app, KeyCode::PageDown);
+        assert_eq!(app.scroll, 18);
+        key(&mut app, KeyCode::PageUp);
+        assert_eq!(app.scroll, 8);
+
+        // While typing a question (Input::Answer), Up/Down/PgUp/PgDn scroll cleanly as well.
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.editing, Some(Input::Answer));
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.scroll, 9);
+        key(&mut app, KeyCode::Esc);
+
+        // Mouse wheel scrolls in 3-line steps and respects bounds.
+        let scroll_down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let scroll_up = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(scroll_down);
+        assert_eq!(app.scroll, 12);
+        app.mouse(scroll_up);
+        assert_eq!(app.scroll, 9);
     }
 }

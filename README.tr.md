@@ -23,7 +23,7 @@
 - **Terminal Arayüzü (TUI) ve Telegram Botu**: 6 sekmeli klavye odaklı terminal arayüzünden (`Sor`, `Quiz`, `Tekrar`, `İstatistik`, `Bugün`, `Denemeler`) veya Telegram üzerinden (`studia listen`) aynı ilerleme ve veritabanıyla (`data/studia.db`) çalışın.
 - **Canlı Çift Dil Desteği (`tr` / `en`)**: Başlangıçta sistem dilini otomatik algılar (`--lang > veritabanı > STUDIA_LANG > sistem dili > en`); çalışma sırasında TUI'da `F4` tuşuyla veya bot/TUI komut satırında `/lang tr|en` ile anında değiştirilebilir.
 - **Dersten Bağımsız Yapı**: `resources/<ders>/` altına notlarınızı ekleyin; isterseniz `course.json` ile eğitmen kimliği, deneme sınavı soru/şık sayısı, kategori dağılımı ve günlük çalışma planı tanımlayın.
-- **Esnek Yapay Zeka Sağlayıcıları**: Gemini HTTP API, OpenAI (veya `STUDIA_AI_BASE_URL` üzerinden Ollama gibi OpenAI uyumlu sunucular), CLI araçları (`agy`, `claude`, `codex`, `gemini`) ve özel komut şablonları (`STUDIA_AI_PROVIDER=custom`) desteklenir.
+- **Esnek Yapay Zeka Sağlayıcıları**: Gemini HTTP API, OpenAI (veya `STUDIA_AI_BASE_URL` üzerinden Ollama gibi OpenAI uyumlu sunucular), CLI araçları (`agy`, `claude`, `codex`) ve özel komut şablonları (`STUDIA_AI_PROVIDER=custom`) desteklenir.
 - **Aralıklı Tekrar ve Anki Kartları**: Yanlış yanıtlanan sorular 5 kutulu Leitner tekrar kuyruğuna alınır ve tekrarda aynı kuralı farklı bağlamda test eden taze varyasyonlar üretilir; kavram kartları `anki/` altına `.txt` olarak kaydedilir.
 - **Çevrimdışı Sistem Kontrolü**: `studia doctor` komutu `resources/`, `curl`, `pdftotext`, AI ayarları, `.env` dosya izinleri ve SQLite bütünlüğünü (`PRAGMA quick_check`) denetler.
 
@@ -86,8 +86,9 @@ cargo build --release --locked
 
 | Değişken | Açıklama | Varsayılan |
 | :--- | :--- | :--- |
-| `STUDIA_AI_PROVIDER` | `auto`, `gemini`, `openai`, `agy`, `claude`, `codex`, `gemini-cli`, `custom` | `auto` |
-| `STUDIA_AI_MODEL` | İsteğe bağlı model adı | `gemini-2.5-flash` / `gpt-4o-mini` |
+| `STUDIA_AI_PROVIDER` | `auto`, `gemini`, `openai`, `agy`, `claude`, `codex`, `custom` | `auto` |
+| `STUDIA_AI_MODEL` | İsteğe bağlı model adı | Sağlayıcı varsayılanı |
+| `STUDIA_AI_EFFORT` | İsteğe bağlı düşünme eforu (`minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`) | Sağlayıcı varsayılanı |
 | `STUDIA_AI_BASE_URL` | Özel API adresi (örn. yerel Ollama için `http://localhost:11434/v1`) | Sağlayıcı varsayılanı |
 | `GEMINI_API_KEY` | Gemini API anahtarı (`STUDIA_GEMINI_API_KEY` de desteklenir) | — |
 | `OPENAI_API_KEY` | OpenAI / uyumlu API anahtarı (`STUDIA_OPENAI_API_KEY`, `STUDIA_AI_API_KEY`) | — |
@@ -95,7 +96,7 @@ cargo build --release --locked
 | `STUDIA_AI_TIMEOUT_SECS` | Alt süreç AI zaman aşımı saniyesi (`0` devre dışı bırakır) | `180` |
 | `STUDIA_LANG` | Başlangıç dili (`tr` \| `en`) | Otomatik |
 
-`STUDIA_AI_PROVIDER=auto` iken kontrol sırası: `GEMINI_API_KEY` → `OPENAI_API_KEY` → `PATH` üzerinde `agy` → `claude` → `codex` → `gemini`.
+`STUDIA_AI_PROVIDER=auto` iken kontrol sırası: `GEMINI_API_KEY` → `OPENAI_API_KEY` → `PATH` üzerinde `agy` → `claude` → `codex`.
 
 ## Telegram Bot Kurulumu
 
@@ -149,6 +150,8 @@ studia --version | -V
 | `F2` | Telegram dinleyicisini başlat/durdur |
 | `F3` | AI Koçu aç/kapat (bir sonraki çalışma adımını seçip başlatır) |
 | `F4` | Arayüz ve AI dilini canlı değiştir (`TR` ↔ `EN`) |
+| `F5` | AI Sağlayıcı ve Model ayarları penceresini aç (`.env` + canlı test) |
+| `g` / `e` *(Bugün)* | AI ile çalışma planı oluştur (`g`) veya gün/görevleri elle düzenle (`e`) |
 | `Enter` | Komut çalıştır, görevi başlat veya girdi aç |
 | `Esc` | Girdiyi iptal et / aktif quiz veya arka plan AI işini sonlandır |
 
@@ -170,7 +173,10 @@ Tüm komutların hem Türkçe hem İngilizce biçimi geçerlidir:
 | `/denemeler [sıra]` | `/exams [index]` | Geçmiş denemeler ve AI koç analizi |
 | `/yanlislar` | `/mistakes` | Derslere göre tekrar sayıları |
 | `/bugun` | `/today` | Bugünün çalışma planı görevleri |
-| `/plan [baslat\|gun\|gec]` | `/plan [start\|day\|goto]` | Çalışma planını başlat veya incele |
+| `/plan [baslat\|gun\|gec\|olustur\|duzenle]` | `/plan [start\|day\|goto\|create\|edit]` | Çalışma planını incele, AI ile oluştur veya düzenle |
+| `/ai` *(veya `/ayarlar`)* | `/ai` *(or `/settings`)* | TUI içinde AI sağlayıcı ve model ayarlarını aç |
+| `/model [ad]` | `/model [name]` | `.env` üzerinde varsayılan modeli değiştir (veya ayarları aç) |
+| `/effort [seviye]` | `/effort [level]` | `.env` üzerinde düşünme eforunu ayarla (`minimal`..`max`, `default`) |
 | `/lang <tr\|en>` | `/lang <tr\|en>` | Dili kalıcı olarak değiştir |
 | `/test` | `/test` | Çevrimdışı örnek soru dene |
 | `/iptal` | `/cancel` | Çalışan AI işini veya quizi iptal et |

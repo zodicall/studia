@@ -145,6 +145,13 @@ impl Store {
         Ok(())
     }
 
+    /// Prefix deletion via `instr` avoids `LIKE` wildcard ambiguity on subject names.
+    pub fn clear_state_prefix(&self, prefix: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM state WHERE instr(key, ?1) = 1", [prefix])?;
+        Ok(())
+    }
+
     pub fn offset(&self) -> Result<i64> {
         match self.state("offset")? {
             Some(value) => Ok(value.parse()?),

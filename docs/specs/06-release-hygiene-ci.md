@@ -18,7 +18,7 @@
 
 | ID | Requirement |
 | :--- | :--- |
-| `REL-3` | - `README.md` (English primary with Turkish switcher link at top) and `README.tr.md` (full Turkish mirror) covering: overview, quickstart, AI backend setup (`GEMINI_API_KEY`, OpenAI/Ollama, `agy`/`claude`/`codex`/`gemini`/`custom`), Telegram setup, custom `course.json`, CLI/TUI/Bot commands, `doctor` troubleshooting, and MIT license.<br>- `CONTRIBUTING.md` (dev setup, Spec-Driven check workflow `fmt` / `clippy` / `test --locked`, localization checklist), `CHANGELOG.md` (`v0.1.0`), `SECURITY.md` (threat boundary, local-first storage, responsible disclosure).<br>- `examples/general-course/course.json` and `examples/academic-english/course.json` clean, original, copyright-free templates validated directly by unit tests against `CourseConfig`. |
+| `REL-3` | - `README.md` (English primary with Turkish switcher link at top) and `README.tr.md` (full Turkish mirror) covering: overview, quickstart, AI backend setup (`GEMINI_API_KEY`, OpenAI/Ollama, `agy`/`claude`/`codex`/`custom`), Telegram setup, custom `course.json`, CLI/TUI/Bot commands, `doctor` troubleshooting, and MIT license.<br>- `CONTRIBUTING.md` (dev setup, Spec-Driven check workflow `fmt` / `clippy` / `test --locked`, localization checklist), `CHANGELOG.md` (`v0.1.0`), `SECURITY.md` (threat boundary, local-first storage, responsible disclosure).<br>- `examples/general-course/course.json` and `examples/academic-english/course.json` clean, original, copyright-free templates validated directly by unit tests against `CourseConfig`. |
 
 ---
 

@@ -23,7 +23,7 @@
 - **Terminal TUI & Telegram Bot**: Study locally in a 6-tab keyboard-driven terminal UI (`Ask`, `Quiz`, `Review`, `Stats`, `Today`, `Exams`) or remotely via Telegram using the same SQLite database (`data/studia.db`).
 - **Live Bilingual Experience (`en` / `tr`)**: Auto-detects OS language (`--lang > stored > STUDIA_LANG > OS locale > en`), switchable live with `F4` in the TUI or `/lang tr|en` in Telegram/TUI.
 - **Course-Agnostic Design**: Drop notes under `resources/<course>/` and optionally customize persona, mock exam question counts/categories/rules, and multi-day study plans in `course.json`.
-- **Flexible AI Backends**: Works with Gemini HTTP API, OpenAI (or Ollama / any OpenAI-compatible endpoint via `STUDIA_AI_BASE_URL`), AI CLIs (`agy`, `claude`, `codex`, `gemini`), or custom command templates (`STUDIA_AI_PROVIDER=custom`).
+- **Flexible AI Backends**: Works with Gemini HTTP API, OpenAI (or Ollama / any OpenAI-compatible endpoint via `STUDIA_AI_BASE_URL`), AI CLIs (`agy`, `claude`, `codex`), or custom command templates (`STUDIA_AI_PROVIDER=custom`).
 - **Spaced Repetition & Anki**: Incorrect answers enter a 5-box Leitner schedule and generate fresh AI variation questions on review; flashcards export directly to tab-separated `.txt` decks under `anki/`.
 - **Offline Diagnostics**: `studia doctor` verifies `resources/`, `curl`, `pdftotext`, AI configuration, `.env` file permissions, and SQLite integrity (`PRAGMA quick_check`).
 
@@ -86,8 +86,9 @@ cargo build --release --locked
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `STUDIA_AI_PROVIDER` | `auto`, `gemini`, `openai`, `agy`, `claude`, `codex`, `gemini-cli`, `custom` | `auto` |
-| `STUDIA_AI_MODEL` | Optional model override | `gemini-2.5-flash` / `gpt-4o-mini` |
+| `STUDIA_AI_PROVIDER` | `auto`, `gemini`, `openai`, `agy`, `claude`, `codex`, `custom` | `auto` |
+| `STUDIA_AI_MODEL` | Optional model override | Provider default |
+| `STUDIA_AI_EFFORT` | Optional reasoning effort (`minimal` \| `low` \| `medium` \| `high` \| `xhigh` \| `max`) | Provider default |
 | `STUDIA_AI_BASE_URL` | Custom API endpoint (e.g., `http://localhost:11434/v1` for Ollama) | Provider default |
 | `GEMINI_API_KEY` | Google Gemini API key (also supports `STUDIA_GEMINI_API_KEY`) | — |
 | `OPENAI_API_KEY` | OpenAI / compatible API key (also supports `STUDIA_OPENAI_API_KEY`, `STUDIA_AI_API_KEY`) | — |
@@ -95,7 +96,7 @@ cargo build --release --locked
 | `STUDIA_AI_TIMEOUT_SECS` | Timeout in seconds (`0` disables timeout) | `180` |
 | `STUDIA_LANG` | Startup UI/prompt language (`en` \| `tr`) | Auto-detected |
 
-When `STUDIA_AI_PROVIDER=auto`, the order checked is: `GEMINI_API_KEY` → `OPENAI_API_KEY` → `agy` → `claude` → `codex` → `gemini` in `PATH`.
+When `STUDIA_AI_PROVIDER=auto`, the order checked is: `GEMINI_API_KEY` → `OPENAI_API_KEY` → `agy` → `claude` → `codex` in `PATH`.
 
 ## Telegram Bot Setup
 
@@ -149,6 +150,8 @@ studia --version | -V
 | `F2` | Start / stop background Telegram listener |
 | `F3` | Toggle AI Coach (auto-picks and launches next study step) |
 | `F4` | Switch UI & AI prompt language live (`EN` ↔ `TR`) |
+| `F5` | Open AI Provider & Model settings modal (`.env` + live connection test) |
+| `g` / `e` *(Today)* | Generate an AI study plan (`g`) or edit days/tasks manually (`e`) |
 | `Enter` | Submit command, start study task, or open prompt |
 | `Esc` | Cancel input / end active quiz or background AI job |
 
@@ -170,7 +173,10 @@ All commands accept both English and Turkish aliases:
 | `/exams [index]` | `/denemeler [sıra]` | View mock exam history & AI coaching breakdown |
 | `/mistakes` | `/yanlislar` | Due review counts across courses |
 | `/today` | `/bugun` | Today's study plan checklist |
-| `/plan [start\|day\|goto]` | `/plan [baslat\|gun\|gec]` | Inspect or schedule study plan |
+| `/plan [start\|day\|goto\|create\|edit]` | `/plan [baslat\|gun\|gec\|olustur\|duzenle]` | Inspect, AI-generate, or edit study plan |
+| `/ai` *(or `/settings`)* | `/ai` *(veya `/ayarlar`)* | Open TUI AI provider & model configuration |
+| `/model [name]` | `/model [ad]` | Set default AI model in `.env` (or open AI settings) |
+| `/effort [level]` | `/effort [seviye]` | Set reasoning effort (`minimal`..`max`, `default`) in `.env` |
 | `/lang <tr\|en>` | `/lang <tr\|en>` | Switch language persistently |
 | `/test` | `/test` | Run a local offline sample question |
 | `/cancel` | `/iptal` | Cancel running AI job or active quiz |

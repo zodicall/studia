@@ -20,8 +20,8 @@ use std::{
 const MENU: &str = r#"{"keyboard":[[{"text":"📅 Bugün"},{"text":"📖 Konu anlat"}],[{"text":"📝 Quiz"},{"text":"🔁 Tekrar"}],[{"text":"🃏 Kelime"},{"text":"🧪 Deneme"}],[{"text":"📚 Ders Seç"},{"text":"❓ Yardım"}]],"resize_keyboard":true,"is_persistent":true}"#;
 const MENU_EN: &str = r#"{"keyboard":[[{"text":"📅 Today"},{"text":"📖 Explain"}],[{"text":"📝 Quiz"},{"text":"🔁 Review"}],[{"text":"🃏 Cards"},{"text":"🧪 Exam"}],[{"text":"📚 Courses"},{"text":"❓ Help"}]],"resize_keyboard":true,"is_persistent":true}"#;
 
-const COMMANDS: &str = r#"[{"command":"bugun","description":"Bugünün plan görevleri"},{"command":"plan","description":"Plan durumu; /plan baslat [tarih] ile başlat"},{"command":"anlat","description":"Konu anlatımı + kazanım testi"},{"command":"quiz","description":"Konudan soru üret: /quiz <konu> [n]"},{"command":"tekrar","description":"Zamanı gelen yanlışları tekrar et"},{"command":"kelime","description":"Kavram / kelime destesi: /kelime <konu> [n]"},{"command":"deneme","description":"Deneme sınavı: /deneme [n]"},{"command":"denemeler","description":"Geçmiş deneme puanları"},{"command":"yanlislar","description":"Tekrar sayıları"},{"command":"dersler","description":"Dersler ve ders seçimi"},{"command":"ders","description":"Aktif dersi seç"},{"command":"lang","description":"Dil değiştir: /lang tr|en"},{"command":"iptal","description":"Aktif oturumu bitir"},{"command":"yardim","description":"Menü ve yardım"}]"#;
-const COMMANDS_EN: &str = r#"[{"command":"today","description":"Today's study plan tasks"},{"command":"plan","description":"Plan status; /plan start [date] to begin"},{"command":"explain","description":"Lesson explanation + quick check"},{"command":"quiz","description":"Generate quiz: /quiz <topic> [n]"},{"command":"review","description":"Review due mistakes"},{"command":"cards","description":"Flashcards deck: /cards <topic> [n]"},{"command":"exam","description":"Mock exam: /exam [n]"},{"command":"exams","description":"Past exam scores and breakdown"},{"command":"mistakes","description":"Review counts per course"},{"command":"courses","description":"List and switch courses"},{"command":"course","description":"Select active course"},{"command":"lang","description":"Switch language: /lang tr|en"},{"command":"cancel","description":"Finish active session"},{"command":"help","description":"Menu and help"}]"#;
+const COMMANDS: &str = r#"[{"command":"bugun","description":"Bugünün plan görevleri"},{"command":"plan","description":"Plan durumu, /plan baslat veya /plan olustur"},{"command":"anlat","description":"Konu anlatımı + kazanım testi"},{"command":"quiz","description":"Konudan soru üret: /quiz <konu> [n]"},{"command":"tekrar","description":"Zamanı gelen yanlışları tekrar et"},{"command":"kelime","description":"Kavram / kelime destesi: /kelime <konu> [n]"},{"command":"deneme","description":"Deneme sınavı: /deneme [n]"},{"command":"denemeler","description":"Geçmiş deneme puanları"},{"command":"yanlislar","description":"Tekrar sayıları"},{"command":"dersler","description":"Dersler ve ders seçimi"},{"command":"ders","description":"Aktif dersi seç"},{"command":"lang","description":"Dil değiştir: /lang tr|en"},{"command":"iptal","description":"Aktif oturumu bitir"},{"command":"yardim","description":"Menü ve yardım"}]"#;
+const COMMANDS_EN: &str = r#"[{"command":"today","description":"Today's study plan tasks"},{"command":"plan","description":"Plan status, /plan start, or /plan create"},{"command":"explain","description":"Lesson explanation + quick check"},{"command":"quiz","description":"Generate quiz: /quiz <topic> [n]"},{"command":"review","description":"Review due mistakes"},{"command":"cards","description":"Flashcards deck: /cards <topic> [n]"},{"command":"exam","description":"Mock exam: /exam [n]"},{"command":"exams","description":"Past exam scores and breakdown"},{"command":"mistakes","description":"Review counts per course"},{"command":"courses","description":"List and switch courses"},{"command":"course","description":"Select active course"},{"command":"lang","description":"Switch language: /lang tr|en"},{"command":"cancel","description":"Finish active session"},{"command":"help","description":"Menu and help"}]"#;
 
 pub fn menu_json(lang: Lang) -> &'static str {
     match lang {
@@ -75,10 +75,8 @@ const PLAN_FINISHED: &str =
     "Plan tamamlandı: sınav günü geçti. Yeni plan için /plan baslat [tarih].";
 const PLAN_FINISHED_EN: &str =
     "Study plan finished: exam day has passed. Run /plan start [date] to start a new plan.";
-const PLAN_NONE: &str =
-    "Bu ders için çalışma planı tanımlı değil (resources/<ders>/course.json ile ekleyebilirsiniz).";
-const PLAN_NONE_EN: &str =
-    "No study plan defined for this course (you can add one via resources/<course>/course.json).";
+const PLAN_NONE: &str = "Bu ders için çalışma planı tanımlı değil (/plan olustur [gün] veya resources/<ders>/course.json ile ekleyebilirsiniz).";
+const PLAN_NONE_EN: &str = "No study plan defined for this course (run /plan create [days] or add one via resources/<course>/course.json).";
 const STALE_BUTTON: &str = "Bu düğme artık geçerli değil.";
 const STALE_BUTTON_EN: &str = "This button is no longer active.";
 
@@ -216,11 +214,100 @@ pub fn plan_text_in(
         }
         _ => lang
             .pick(
-                "Kullanım: /plan, /plan baslat [2026-11-05], /plan gun N (önizleme), /plan gec N (bugünü Gün N yap)",
-                "Usage: /plan, /plan start [2026-11-05], /plan day N (preview), /plan jump N (set today to Day N)",
+                "Kullanım: /plan, /plan olustur [gün|tarih] [odak], /plan baslat [2026-11-05], /plan gun N (önizleme), /plan gec N (bugünü Gün N yap)",
+                "Usage: /plan, /plan create [days|date] [focus], /plan start [2026-11-05], /plan day N (preview), /plan jump N (set today to Day N)",
             )
             .into(),
     })
+}
+
+pub fn parse_plan_create_args(
+    args: &str,
+    today: NaiveDate,
+    lang: Lang,
+) -> Result<(usize, usize, String)> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Ok((7, 3, String::new()));
+    }
+    let (first, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+    let (days, focus_raw) = match plan::parse_days_or_target_date(first, today) {
+        Ok(days) => (days, rest.trim()),
+        Err("past") => {
+            return Err(invalid(lang.pick(
+                "Hedef tarih bugünden önce olamaz.",
+                "Target date cannot be in the past.",
+            )));
+        }
+        Err("range") => {
+            return Err(invalid(lang.pick(
+                "Gün sayısı 1–90 arasında olmalı.",
+                "Plan length must be between 1 and 90 days.",
+            )));
+        }
+        Err(_) => (7, trimmed),
+    };
+    let (head, tail) = focus_raw
+        .split_once(char::is_whitespace)
+        .unwrap_or((focus_raw, ""));
+    let (tasks_per_day, focus) = match head.to_ascii_lowercase().as_str() {
+        "hafif" | "light" => (2, tail.trim()),
+        "dengeli" | "balanced" => (3, tail.trim()),
+        "yogun" | "yoğun" | "intensive" => (4, tail.trim()),
+        _ => (3, focus_raw),
+    };
+    Ok((days, tasks_per_day, focus.to_string()))
+}
+
+pub fn apply_generated_plan(
+    root: &Path,
+    store: &Store,
+    subject: &str,
+    days: Vec<course::DayConfig>,
+    auto_start: bool,
+    today: NaiveDate,
+    lang: Lang,
+) -> Result<String> {
+    let total = days.len();
+    let mut course_cfg = course::CourseConfig::load_or_default(root, subject)?;
+    course_cfg.plan = days;
+    course_cfg.save(root, subject)?;
+    if auto_start {
+        plan::clear_done(store, subject, today)?;
+        plan::set_start(store, subject, today)?;
+    }
+    let preview = course_cfg
+        .plan
+        .iter()
+        .take(5)
+        .map(|d| format!("• {} {}: {}", lang.pick("Gün", "Day"), d.day, d.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = if total > 5 {
+        match lang {
+            Lang::Tr => format!("\n… (+{} gün daha)", total - 5),
+            Lang::En => format!("\n… (+{} more day(s))", total - 5),
+        }
+    } else {
+        String::new()
+    };
+    let header = match (lang, auto_start) {
+        (Lang::Tr, true) => format!(
+            "📅 **{total} günlük ders programı oluşturuldu ve bugünden başlatıldı!**\nBugünün görevleri için /bugun."
+        ),
+        (Lang::Tr, false) => format!(
+            "📅 **{total} günlük ders programı oluşturuldu.**\nBaşlatmak için /plan baslat."
+        ),
+        (Lang::En, true) => format!(
+            "📅 **{total}-day study schedule created and started today!**\nRun /today for today's tasks."
+        ),
+        (Lang::En, false) => {
+            format!("📅 **{total}-day study schedule created.**\nRun /plan start to begin.")
+        }
+    };
+    Ok(format!("{header}\n\n{preview}{more}"))
 }
 
 #[cfg(test)]
@@ -806,6 +893,12 @@ pub enum JobKind {
         question: String,
         history: Vec<(String, String)>,
     },
+    GeneratePlan {
+        days: usize,
+        tasks_per_day: usize,
+        focus: String,
+        auto_start: bool,
+    },
 }
 
 pub enum JobResult {
@@ -813,6 +906,7 @@ pub enum JobResult {
     Quiz(Vec<StoredQuestion>),
     Lesson(ai::Lesson),
     Vocab(Vec<ai::Card>),
+    Plan(Vec<course::DayConfig>),
 }
 
 impl Session {
@@ -1532,6 +1626,13 @@ pub fn prepare_job_in(
             .map(|q| q.value.source.as_str())
             .collect::<Vec<_>>()
             .join(" "),
+        JobKind::GeneratePlan { focus, .. } => {
+            if focus.trim().is_empty() {
+                title.to_string()
+            } else {
+                focus.clone()
+            }
+        }
     };
     prepare_job_with_query(root, store, subject, &course, kind, &query, lang)
 }
@@ -1561,7 +1662,10 @@ fn prepare_job_with_query(
         .map(|r| format!("\n{r}"))
         .unwrap_or_default();
 
-    let sources = sources::text(root, subject, query)?;
+    let sources = match kind {
+        JobKind::GeneratePlan { .. } => sources::text(root, subject, query).unwrap_or_default(),
+        _ => sources::text(root, subject, query)?,
+    };
     let history = match kind {
         JobKind::DenemeCoach { history, .. } | JobKind::LessonChat { history, .. } => {
             history.clone()
@@ -1794,6 +1898,29 @@ fn prepare_job_with_query(
                 ai::lesson_schema_for(choices),
             )
         }
+        JobKind::GeneratePlan {
+            days,
+            tasks_per_day,
+            focus,
+            ..
+        } => {
+            let catalog = sources::catalog(root, subject, 60).unwrap_or_default();
+            let weak_topics = store.weakest_topics(subject, 5).unwrap_or_default();
+            let due_reviews = store.review_counts(subject, Utc::now()).map_or(0, |r| r.0);
+            let (plan_prompt, nonce) = ai::plan_request(
+                course,
+                subject,
+                *days,
+                *tasks_per_day,
+                focus,
+                &catalog,
+                &weak_topics,
+                due_reviews,
+                lang,
+            );
+            inner_nonce = nonce;
+            (plan_prompt, ai::plan_schema(*days))
+        }
     };
     let request = if matches!(
         kind,
@@ -1802,6 +1929,7 @@ fn prepare_job_with_query(
             | JobKind::Vocab { .. }
             | JobKind::DenemeCoach { .. }
             | JobKind::LessonChat { .. }
+            | JobKind::GeneratePlan { .. }
     ) {
         request
     } else {
@@ -1867,6 +1995,12 @@ pub fn failure_text_in(kind: &JobKind, lang: Lang) -> &'static str {
         (JobKind::DenemeCoach { .. }, Lang::En) => {
             "Coach could not reply right now. Please try again shortly."
         }
+        (JobKind::GeneratePlan { .. }, Lang::Tr) => {
+            "Ders programı oluşturulamadı. Biraz sonra /plan olustur ile tekrar deneyin."
+        }
+        (JobKind::GeneratePlan { .. }, Lang::En) => {
+            "Could not generate study schedule. Please retry later with /plan create."
+        }
     }
 }
 
@@ -1912,6 +2046,7 @@ pub fn save_job_in(
         JobKind::DenemeCoach { .. } | JobKind::LessonChat { .. } => {
             Ok(JobResult::Answer(ai::parse_answer(raw)?))
         }
+        JobKind::GeneratePlan { days, .. } => Ok(JobResult::Plan(ai::parse_plan(raw, *days)?)),
     }
 }
 
@@ -2890,7 +3025,13 @@ impl Bot {
         (!rows.is_empty()).then(|| json!({ "inline_keyboard": rows }).to_string())
     }
 
-    fn plan_command(&self, args: &str, today: NaiveDate, caller: &mut Caller<'_>) -> Result<()> {
+    fn plan_command(
+        &mut self,
+        args: &str,
+        today: NaiveDate,
+        caller: &mut Caller<'_>,
+        ai: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
         let lang = self.lang();
         let subject = match self.active_subject() {
             Ok(subject) => subject,
@@ -2899,12 +3040,52 @@ impl Bot {
                 return Ok(());
             }
         };
-        let course = self.load_course(&subject);
-        let length = course.plan.len();
         let (sub, rest) = args
             .trim()
             .split_once(char::is_whitespace)
             .unwrap_or((args.trim(), ""));
+        if matches!(sub, "olustur" | "create" | "generate" | "uret") {
+            if self.pending.is_some() {
+                self.send(
+                    lang.pick("Önceki istek sürüyor…", "Previous request still running…"),
+                    None,
+                    caller,
+                )?;
+                return Ok(());
+            }
+            if self.session.is_some() {
+                self.send(
+                    lang.pick(
+                        "Aktif quiz var. Önce /iptal ile bitirin.",
+                        "A quiz session is active. Finish it first with /cancel.",
+                    ),
+                    None,
+                    caller,
+                )?;
+                return Ok(());
+            }
+            match parse_plan_create_args(rest, today, lang) {
+                Ok((days, tasks_per_day, focus)) => {
+                    return self.begin_job(
+                        subject,
+                        JobKind::GeneratePlan {
+                            days,
+                            tasks_per_day,
+                            focus,
+                            auto_start: true,
+                        },
+                        caller,
+                        ai,
+                    );
+                }
+                Err(err) => {
+                    self.send(&err.to_string(), None, caller)?;
+                    return Ok(());
+                }
+            }
+        }
+        let course = self.load_course(&subject);
+        let length = course.plan.len();
         if matches!(sub, "gun" | "day")
             && length > 0
             && let Ok(number) = rest.trim().parse::<usize>()
@@ -3624,6 +3805,25 @@ impl Bot {
                     self.session = Some(session);
                     self.next_question(caller)
                 }
+                JobResult::Plan(days) => {
+                    let auto_start = matches!(
+                        pending.kind,
+                        JobKind::GeneratePlan {
+                            auto_start: true,
+                            ..
+                        }
+                    );
+                    let msg = apply_generated_plan(
+                        &self.root,
+                        &self.store,
+                        &pending.subject,
+                        days,
+                        auto_start,
+                        Local::now().date_naive(),
+                        lang,
+                    )?;
+                    self.edit(pending.message_id, &msg, caller)
+                }
             }
         })();
         match &result {
@@ -3793,7 +3993,7 @@ impl Bot {
                         • 🃏 Kelime — /kelime <konu> [n]: Anki destesi / kavram kartları\n\
                         {plan_info}\n\
                         • 📚 Ders Seç — /dersler ile dersi değiştir\n\
-                        Plan: /bugun, /plan (durum), /plan baslat [tarih] (başlat), /plan gun N (önizleme), /plan gec N (bugünü Gün N yap)\n\
+                        Plan: /bugun, /plan (durum), /plan olustur [gün|tarih] [odak], /plan baslat [tarih], /plan gun N, /plan gec N\n\
                         Diğer: /ders <ad>, /dersler, /yanlislar, /denemeler [sıra], /lang <tr|en>, /test, /iptal\n\
                         Ders hakkında soru da yazabilirsin; kaynaklara göre yanıtlarım."
                     ),
@@ -3807,7 +4007,7 @@ impl Bot {
                         • 🃏 Cards — /cards <topic> [n]: Anki flashcards deck\n\
                         {plan_info}\n\
                         • 📚 Courses — switch course with /courses\n\
-                        Plan: /today, /plan (status), /plan start [date] (start), /plan day N (preview), /plan goto N (jump to Day N)\n\
+                        Plan: /today, /plan (status), /plan create [days|date] [focus], /plan start [date], /plan day N, /plan goto N\n\
                         More: /course <name>, /courses, /mistakes, /exams [index], /lang <tr|en>, /test, /cancel\n\
                         You can also ask any question about your course sources."
                     ),
@@ -3915,7 +4115,7 @@ impl Bot {
                     )?;
                 }
             }
-            "/plan" => self.plan_command(args, Local::now().date_naive(), caller)?,
+            "/plan" => self.plan_command(args, Local::now().date_naive(), caller, ai)?,
             "/anlat" | "/explain" | "/lesson" => {
                 if self.pending.is_some() {
                     self.send(
@@ -7165,5 +7365,70 @@ mod tests {
         assert!(sanitized.contains("[REDACTED]"));
         assert!(!sanitized.contains(&root.path().to_string_lossy().into_owned()));
         assert!(sanitized.contains("<workspace>"));
+    }
+
+    #[test]
+    fn plan_create_command_generates_and_preserves_course_metadata() {
+        let (root, mut bot) = setup();
+        let initial = course::CourseConfig {
+            title: Some("YDS Master".into()),
+            persona: Some("Sınav koçu".into()),
+            exam: Some(course::ExamConfig {
+                question_count: 80,
+                choices_count: 5,
+                categories: vec![],
+                rules: None,
+            }),
+            plan: vec![],
+        };
+        initial.save(root.path(), "Ders").unwrap();
+
+        let today = Local::now().date_naive();
+        let (days, tasks, focus) =
+            parse_plan_create_args("2 yogun Paragraf", today, Lang::Tr).unwrap();
+        assert_eq!(days, 2);
+        assert_eq!(tasks, 4);
+        assert_eq!(focus, "Paragraf");
+
+        let mut calls = Vec::new();
+        let fake_plan = serde_json::json!({
+            "days": [
+                {
+                    "day": 1,
+                    "title": "Giriş",
+                    "tasks": [
+                        {"command": "/anlat Zamanlar", "label": "Konu: Zamanlar"}
+                    ]
+                },
+                {
+                    "day": 2,
+                    "title": "Tekrar",
+                    "tasks": [
+                        {"command": "/tekrar", "label": "Tekrar: Vadesi gelenler"},
+                        {"command": "", "label": "Okuma: 2 pasaj"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+        bot.handle_update(
+            &message("/plan olustur 2 Paragraf"),
+            &mut caller(&mut calls),
+            move |prompt, _schema| {
+                assert!(prompt.contains("Paragraf"));
+                Ok(fake_plan)
+            },
+        )
+        .unwrap();
+        // Poll pending job completion.
+        complete(&mut bot, &mut calls);
+
+        let reloaded = course::CourseConfig::load_or_default(root.path(), "Ders").unwrap();
+        assert_eq!(reloaded.title.as_deref(), Some("YDS Master"));
+        assert_eq!(reloaded.persona.as_deref(), Some("Sınav koçu"));
+        assert!(reloaded.exam.is_some());
+        assert_eq!(reloaded.plan.len(), 2);
+        assert_eq!(reloaded.plan[0].tasks[0].command, "/anlat Zamanlar");
+        assert_eq!(plan::start_date(&bot.store, "Ders").unwrap(), Some(today));
     }
 }

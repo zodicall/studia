@@ -1,5 +1,8 @@
 use super::app::{App, CoachMode, CoachReply, DenemeChat, Input, tabs};
-use crate::{bot, i18n::Lang, plan};
+use super::modals::{
+    AiSettingsModal, Modal, PlanEditModal, PlanEditPrompt, PlanGenModal, TASK_CMD_KINDS,
+};
+use crate::{bot, config::AiProvider, i18n::Lang, plan};
 use chrono::{Days, Utc};
 use ratatui::{
     Frame,
@@ -36,38 +39,40 @@ const ONBOARDING_EN: &str = "Getting started:\n\
 
 const HELP: &str = "\
 Genel    Tab / Shift+Tab, 1–6 sekme · ↑/↓ ders · r dizinle
-         F2 Telegram dinleyici · F3 Koç · F4 Dil (TR/EN) · q çık
-Sor      Enter soru yaz · Ctrl+Q bu konudan 5 soruluk quiz
+         F2 Telegram · F3 Koç · F4 Dil · F5 AI/Model · q çık
+Sor      Enter soru yaz · ↑/↓ PgUp/PgDn kaydır · Ctrl+Q bu konudan 5 soruluk quiz
 Komut    / her sekmeden komut yazar (Telegram ile aynı):
          /quiz [konu n] · /tekrar [n] [orijinal] · /kazanim <konu> [n]
          /kelime <konu> [n] · /anlat <konu> · /deneme [n] · /denemeler
-         /plan [baslat tarih | gun N | gec N] · /bugun · /dersler
-         /yanlislar · /ders <ad> · /lang <tr|en> · /iptal · /test · /yardim
+         /plan [baslat tarih | gun N | gec N | olustur | duzenle] · /bugun · /dersler
+         /ai · /model <ad> · /effort <seviye> · /yanlislar · /ders <ad> · /lang <tr|en> · /iptal · /test · /yardim
 Quiz     n yeni quiz · Enter kayıtlı sorular · w yanlışları tekrar
          a–e veya 1–5 cevap · Enter sonraki · Esc bitir
 Tekrar   t veya Enter bugünkü tekrarları başlat
 Deneme   ↑/↓ seç · Enter koçla tartış · d sil (y onay)
          sohbette Tab/Shift+Tab yanlışları gez · Enter gönder
 Bugün    ←/→ gün değiştir · ↑/↓ görev · Enter çalıştır · b başlat
-         F3 koçu aç/kapat: AI bir sonraki adımı seçip kendisi başlatır
+         g AI plan oluştur · e planı elle düzenle
+         F3 koçu aç/kapat · F5 AI ve model ayarları
 Her yerde PgUp / PgDn kaydır · Esc AI işini iptal eder · F1 / ? yardım";
 
 const HELP_EN: &str = "\
 General  Tab / Shift+Tab, 1–6 tabs · ↑/↓ course · r index
-         F2 Telegram listener · F3 Coach · F4 Lang (TR/EN) · q quit
-Ask      Enter ask a question · Ctrl+Q 5-question quiz on topic
+         F2 Telegram listener · F3 Coach · F4 Lang (TR/EN) · F5 AI/Model · q quit
+Ask      Enter ask a question · ↑/↓ PgUp/PgDn scroll · Ctrl+Q 5-question quiz on topic
 Command  / runs slash commands from any tab (shared with Telegram):
          /quiz [topic n] · /review [n] [exact] · /cards <topic> [n]
          /explain <topic> · /exam [n] · /exams · /today · /courses
-         /plan [start date | day N | goto N] · /mistakes · /course <name>
-         /practice <t> [n] · /lang <tr|en> · /cancel · /test · /help
+         /plan [start date | day N | goto N | create | edit] · /ai · /model <name> · /effort <lvl>
+         /mistakes · /course <name> · /practice <t> [n] · /lang <tr|en> · /cancel · /test · /help
 Quiz     n new quiz · Enter saved questions · w retry mistakes
          a–e or 1–5 answer · Enter next · Esc finish
 Review   t or Enter start due reviews
 Exams    ↑/↓ select · Enter discuss with coach · d delete (y confirm)
          in chat Tab/Shift+Tab step mistakes · Enter send
 Today    ←/→ change day · ↑/↓ task · Enter run · b start plan
-         F3 toggle coach: AI chooses and launches next step
+         g generate AI plan · e edit plan manually
+         F3 toggle coach · F5 AI & model settings
 Everywhere PgUp / PgDn scroll · Esc cancel AI · F1 / ? help";
 
 /// Terminal kontrol karakterlerini ve ANSI CSI/OSC kaçış dizilerini temizler.
@@ -415,6 +420,8 @@ fn header(app: &App) -> Line<'static> {
         CoachMode::Off => chip(app.lang.pick("Koç kapalı", "Coach off"), MUTED, SURFACE),
     };
     let lang_chip = chip(app.lang.code().to_ascii_uppercase().as_str(), BASE, TEXT);
+    let ai_label = sanitize_tui_text(&app.ai_badge);
+    let ai_chip = chip(&format!("AI {ai_label}"), TEXT, SURFACE);
     Line::from(vec![
         chip("studia", BASE, ACCENT),
         Span::raw(" "),
@@ -425,6 +432,8 @@ fn header(app: &App) -> Line<'static> {
         coach,
         Span::raw(" "),
         lang_chip,
+        Span::raw(" "),
+        ai_chip,
         Span::raw("  "),
         Span::styled(
             telegram,
@@ -498,6 +507,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ]),
         footer,
     );
+    if let Some(modal) = &app.modal {
+        draw_modal(frame, area, modal, app.lang);
+    }
     if app.help {
         draw_help(frame, area, app.lang);
     }
@@ -638,37 +650,36 @@ fn plan_text(app: &App) -> String {
 
 fn draw_ask(frame: &mut Frame, area: Rect, app: &App) {
     let [answer, input] = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(area);
-    if app.answer.is_empty() {
+    let (title_base, rendered) = if app.answer.is_empty() {
         if app.subjects.is_empty() {
             let body = match app.lang {
                 Lang::Tr => ONBOARDING,
                 Lang::En => ONBOARDING_EN,
             };
-            paragraph(
-                frame,
-                answer,
+            (
                 app.lang.pick("Başlarken", "Getting Started"),
-                body,
-                0,
-            );
+                markdown(body),
+            )
         } else {
-            panel_text(
-                frame,
-                answer,
-                app.lang.pick("Özet", "Summary"),
-                dashboard(app),
-                0,
-            );
+            (app.lang.pick("Özet", "Summary"), dashboard(app))
         }
     } else {
-        paragraph(
-            frame,
-            answer,
-            app.lang.pick("Yanıt · PgUp/PgDn", "Answer · PgUp/PgDn"),
-            &app.answer,
-            app.scroll,
-        );
-    }
+        (app.lang.pick("Yanıt", "Answer"), markdown(&app.answer))
+    };
+    let inner_width = answer.width.saturating_sub(2);
+    let inner_height = usize::from(answer.height.saturating_sub(2));
+    let total = Paragraph::new(rendered.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width);
+    let max = u16::try_from(total.saturating_sub(inner_height)).unwrap_or(u16::MAX);
+    app.ask_max_scroll.set(max);
+    let offset = app.scroll.min(max);
+    let panel_title = if !app.answer.is_empty() || max > 0 {
+        format!("{title_base} · ↑/↓ PgUp/PgDn")
+    } else {
+        title_base.to_string()
+    };
+    panel_text(frame, answer, &panel_title, rendered, offset);
     let title = if app.editing.is_some() {
         app.lang.pick(
             "Soru · Enter gönder · Esc temizle",
@@ -944,12 +955,12 @@ fn draw_plan(frame: &mut Frame, content: Rect, app: &App) {
             frame,
             tasks,
             app.lang.pick(
-                "Çalışma Planı · Esnek Ders",
-                "Study Plan · Flexible Course",
+                "Çalışma Planı · Henüz Plan Yok",
+                "Study Plan · No Plan Yet",
             ),
             app.lang.pick(
-                "Bu ders için çalışma planı tanımlı değil (isteğe bağlı: resources/<ders>/course.json).\n\nDoğrudan Soru/Özet (1), Quiz (2), Tekrar (3) veya Deneme (5) sekmelerini kullanabilirsiniz.",
-                "No study plan defined for this course (optional: resources/<course>/course.json).\n\nYou can use Ask (1), Quiz (2), Review (3), or Exams (5) directly.",
+                "Bu ders için henüz çalışma planı tanımlı değil.\n\n• g  AI ile kaynaklara göre otomatik ders programı oluştur (/plan olustur)\n• e  Elle gün ve görev ekleyerek plan oluştur (/plan duzenle)\n\nİsterseniz doğrudan Soru/Özet (1), Quiz (2), Tekrar (3) veya Deneme (5) sekmelerini de kullanabilirsiniz.",
+                "No study plan is defined for this course yet.\n\n• g  Generate an AI study schedule from your course materials (/plan create)\n• e  Create or edit days & tasks manually (/plan edit)\n\nYou can also use Ask (1), Quiz (2), Review (3), or Exams (5) directly.",
             ),
             0,
         );
@@ -1038,12 +1049,12 @@ fn draw_plan(frame: &mut Frame, content: Rect, app: &App) {
 
     let title_name = info.map_or("", |i| i.title.as_str());
     let title = match app.lang {
-        Lang::Tr => format!(
-            "Gün {view_day}/{total_days} · {tag} · {title_name} · ←/→ gün · ↑/↓ görev · Enter çalıştır"
-        ),
-        Lang::En => format!(
-            "Day {view_day}/{total_days} · {tag} · {title_name} · ←/→ day · ↑/↓ task · Enter run"
-        ),
+        Lang::Tr => {
+            format!("Gün {view_day}/{total_days} · {tag} · {title_name} · g AI plan · e düzenle")
+        }
+        Lang::En => {
+            format!("Day {view_day}/{total_days} · {tag} · {title_name} · g AI plan · e edit")
+        }
     };
 
     let items: Vec<ListItem> = info
@@ -1386,13 +1397,54 @@ fn weakest_lines(app: &App) -> String {
 /// Aktif bağlama göre alt satırdaki tuş ipuçları.
 fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let lang = app.lang;
+    if let Some(modal) = &app.modal {
+        return match modal {
+            Modal::PlanGen(_) => vec![
+                ("Tab/↑↓", lang.pick("alan", "field")),
+                ("←/→ Space", lang.pick("seç", "toggle")),
+                ("Enter", lang.pick("oluştur", "generate")),
+                ("Esc", lang.pick("kapat", "close")),
+            ],
+            Modal::PlanEdit(m) => {
+                if m.prompt.is_some() {
+                    vec![
+                        ("Tab/↑↓", lang.pick("alan", "field")),
+                        ("←/→", lang.pick("tür", "kind")),
+                        ("Enter", lang.pick("uygula", "apply")),
+                        ("Esc", lang.pick("geri", "back")),
+                    ]
+                } else {
+                    vec![
+                        ("←/→", lang.pick("gün", "day")),
+                        ("+/t/d", lang.pick("gün ekle/ad/sil", "add/ren/del day")),
+                        (
+                            "a/Enter/x",
+                            lang.pick("görev ekle/düz/sil", "task add/ed/del"),
+                        ),
+                        ("s", lang.pick("kaydet", "save")),
+                        ("Esc", lang.pick("kapat", "close")),
+                    ]
+                }
+            }
+            Modal::AiSettings(_) => vec![
+                ("Tab/↑↓", lang.pick("alan", "field")),
+                (
+                    "←/→",
+                    lang.pick("sağlayıcı/model/efor", "provider/model/effort"),
+                ),
+                ("Ctrl+T", lang.pick("test", "test")),
+                ("Ctrl+S", lang.pick("kaydet", "save")),
+                ("Esc", lang.pick("kapat", "close")),
+            ],
+        };
+    }
     if let Some(input) = app.editing {
         return match input {
             Input::Answer => vec![
                 ("Enter", lang.pick("gönder", "send")),
+                ("↑/↓ PgUp/PgDn", lang.pick("kaydır", "scroll")),
                 ("Esc", lang.pick("vazgeç", "cancel")),
                 ("Ctrl+U", lang.pick("temizle", "clear")),
-                ("Backspace", lang.pick("sil", "del")),
             ],
             Input::Topic | Input::Count => vec![
                 ("Enter", lang.pick("devam", "next")),
@@ -1446,7 +1498,7 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         0 => vec![
             ("Enter", lang.pick("yaz", "ask")),
             ("Ctrl+Q", lang.pick("bu konudan quiz", "quiz topic")),
-            ("PgUp/PgDn", lang.pick("kaydır", "scroll")),
+            ("↑/↓ PgUp/PgDn", lang.pick("kaydır", "scroll")),
         ],
         1 if app.wrong_count() > 0 => vec![
             ("n", lang.pick("yeni quiz", "new quiz")),
@@ -1482,7 +1534,9 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("←/→", lang.pick("gün", "day")),
             ("↑/↓", lang.pick("görev", "task")),
             ("Enter", lang.pick("çalıştır", "run")),
-            ("b", lang.pick("bugün / başlat", "today / start")),
+            ("b", lang.pick("başlat", "start")),
+            ("g", lang.pick("AI plan", "AI plan")),
+            ("e", lang.pick("düzenle", "edit")),
         ],
     }
 }
@@ -1509,13 +1563,14 @@ fn global_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             },
         ),
         ("F4", lang.pick("EN", "TR")),
+        ("F5", lang.pick("AI/Model", "AI/Model")),
         ("F1 / ?", lang.pick("yardım", "help")),
         ("q", lang.pick("çık", "quit")),
     ]
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, lang: Lang) {
-    let popup = centered(area, 72, 19);
+    let popup = centered(area, 76, 21);
     frame.render_widget(Clear, popup);
     let body = match lang {
         Lang::Tr => HELP,
@@ -1531,6 +1586,525 @@ fn draw_help(frame: &mut Frame, area: Rect, lang: Lang) {
         body,
         0,
     );
+}
+
+fn draw_modal(frame: &mut Frame, area: Rect, modal: &Modal, lang: Lang) {
+    match modal {
+        Modal::PlanGen(m) => draw_plan_gen(frame, area, m, lang),
+        Modal::PlanEdit(m) => draw_plan_editor(frame, area, m, lang),
+        Modal::AiSettings(m) => draw_ai_settings(frame, area, m, lang),
+    }
+}
+
+fn field_row(label: &str, value: &str, focused: bool, hint: Option<&str>) -> Line<'static> {
+    let marker = if focused { "▸ " } else { "  " };
+    let label_style = if focused {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED)
+    };
+    let val_style = if focused {
+        Style::default()
+            .fg(TEXT)
+            .bg(SURFACE)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT)
+    };
+    let mut spans = vec![
+        Span::styled(format!("{marker}{label:<18} "), label_style),
+        Span::styled(format!(" {} ", sanitize_tui_text(value)), val_style),
+    ];
+    if let Some(hint) = hint {
+        spans.push(Span::styled(
+            format!("  {}", sanitize_tui_text(hint)),
+            Style::default().fg(MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn draw_plan_gen(frame: &mut Frame, area: Rect, m: &PlanGenModal, lang: Lang) {
+    let popup = centered(area, 74, 15);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(lang.pick(
+            " AI Çalışma Planı Oluştur · Esc kapat ",
+            " Generate AI Study Plan · Esc close ",
+        ))
+        .style(Style::default().fg(TEXT).bg(BASE))
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let intensity_label = match (m.intensity, lang) {
+        (0, Lang::Tr) => "◀ Hafif (2 görev/gün) ▶",
+        (1, Lang::Tr) => "◀ Dengeli (3 görev/gün) ▶",
+        (_, Lang::Tr) => "◀ Yoğun (4 görev/gün) ▶",
+        (0, Lang::En) => "◀ Light (2 tasks/day) ▶",
+        (1, Lang::En) => "◀ Balanced (3 tasks/day) ▶",
+        (_, Lang::En) => "◀ Intensive (4 tasks/day) ▶",
+    };
+    let auto_val = if m.auto_start {
+        lang.pick("[x] Evet, bugünden başlat", "[x] Yes, start today")
+    } else {
+        lang.pick("[ ] Hayır, sadece kaydet", "[ ] No, save only")
+    };
+    let btn_style = if m.field == 4 {
+        Style::default()
+            .fg(BASE)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(ACCENT)
+            .bg(SURFACE)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            lang.pick(
+                "Ders kaynakları analiz edilerek gün gün çalışma programı üretilir.",
+                "Analyzes course materials to generate a day-by-day schedule.",
+            ),
+            Style::default().fg(MUTED),
+        )),
+        Line::raw(""),
+        field_row(
+            lang.pick("Gün / Hedef tarih", "Days / Target date"),
+            &m.days_or_date,
+            m.field == 0,
+            Some(lang.pick("ör: 14 veya 2026-06-15", "e.g. 14 or 2026-06-15")),
+        ),
+        field_row(
+            lang.pick("Günlük yoğunluk", "Daily intensity"),
+            intensity_label,
+            m.field == 1,
+            Some("←/→"),
+        ),
+        field_row(
+            lang.pick("Odak notu", "Focus note"),
+            if m.focus.is_empty() {
+                lang.pick("(isteğe bağlı)", "(optional)")
+            } else {
+                &m.focus
+            },
+            m.field == 2,
+            None,
+        ),
+        field_row(
+            lang.pick("Bugünden başlat", "Start today"),
+            auto_val,
+            m.field == 3,
+            Some("Space"),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                lang.pick("  AI ile Oluştur (Enter)  ", "  Generate with AI (Enter)  "),
+                btn_style,
+            ),
+        ]),
+    ];
+    if let Some(err) = &m.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("! {}", sanitize_tui_text(err)),
+            Style::default().fg(WARN),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_plan_editor(frame: &mut Frame, area: Rect, m: &PlanEditModal, lang: Lang) {
+    let popup = centered(area, 82, 23);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(lang.pick(
+            " Çalışma Planı Düzenleyici · s kaydet · Esc kapat ",
+            " Study Plan Editor · s save · Esc close ",
+        ))
+        .style(Style::default().fg(TEXT).bg(BASE))
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [head_area, body_area, foot_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(4),
+        Constraint::Length(if m.prompt.is_some() { 7 } else { 2 }),
+    ])
+    .areas(inner);
+
+    let total_days = m.days.len();
+    let cur_day = m.days.get(m.day_idx);
+    let day_num = cur_day.map_or(1, |d| d.day);
+    let day_title = cur_day.map_or("", |d| d.title.as_str());
+    let head_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" ◀ Gün/Day {day_num}/{total_days}: "),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                sanitize_tui_text(day_title),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ▶", Style::default().fg(ACCENT)),
+        ]),
+        Line::styled(
+            lang.pick(
+                " ←/→ gün · + yeni gün · t başlık · d gün sil · a görev ekle · Enter düzenle · x sil · s kaydet",
+                " ←/→ day · + add day · t rename · d del day · a add task · Enter edit · x del · s save",
+            ),
+            Style::default().fg(MUTED),
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(head_lines).wrap(Wrap { trim: false }),
+        head_area,
+    );
+
+    let tasks = cur_day.map(|d| d.tasks.as_slice()).unwrap_or(&[]);
+    let task_items: Vec<ListItem> = if tasks.is_empty() {
+        vec![ListItem::new(lang.pick(
+            "  (Bu günde görev yok — eklemek için 'a' tuşuna basın)",
+            "  (No tasks on this day — press 'a' to add one)",
+        ))]
+    } else {
+        tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let cmd = if t.command.is_empty() {
+                    lang.pick("[okuma]", "[manual]")
+                } else {
+                    t.command.as_str()
+                };
+                let line = format!(
+                    "  {}. {}  ({})",
+                    i + 1,
+                    sanitize_tui_text(&t.label),
+                    sanitize_tui_text(cmd)
+                );
+                ListItem::new(line)
+            })
+            .collect()
+    };
+    let mut state = ListState::default();
+    if !tasks.is_empty() {
+        state.select(Some(m.task_idx.min(tasks.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(task_items)
+            .highlight_symbol("▸ ")
+            .highlight_style(
+                Style::default()
+                    .fg(BASE)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        body_area,
+        &mut state,
+    );
+
+    if let Some(prompt) = &m.prompt {
+        let mut p_lines = Vec::new();
+        match prompt {
+            PlanEditPrompt::DayTitle { is_new, text } => {
+                p_lines.push(Line::styled(
+                    if *is_new {
+                        lang.pick(
+                            "Yeni Gün Başlığı (Enter ekle, Esc iptal):",
+                            "New Day Title (Enter add, Esc cancel):",
+                        )
+                    } else {
+                        lang.pick(
+                            "Gün Başlığını Düzenle (Enter uygula, Esc iptal):",
+                            "Rename Day (Enter apply, Esc cancel):",
+                        )
+                    },
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+                p_lines.push(field_row(lang.pick("Başlık", "Title"), text, true, None));
+            }
+            PlanEditPrompt::TaskForm {
+                is_new,
+                field,
+                cmd_kind,
+                arg,
+                label,
+            } => {
+                let kind_label = match (*cmd_kind, lang) {
+                    (0, Lang::Tr) => "◀ Elle okuma / çalışma ▶",
+                    (0, Lang::En) => "◀ Manual reading / study ▶",
+                    (i, _) => TASK_CMD_KINDS.get(i).copied().unwrap_or(""),
+                };
+                p_lines.push(Line::styled(
+                    if *is_new {
+                        lang.pick(
+                            "Yeni Görev (Enter ekle, Esc iptal):",
+                            "New Task (Enter add, Esc cancel):",
+                        )
+                    } else {
+                        lang.pick(
+                            "Görevi Düzenle (Enter uygula, Esc iptal):",
+                            "Edit Task (Enter apply, Esc cancel):",
+                        )
+                    },
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+                p_lines.push(field_row(
+                    lang.pick("Komut türü", "Command kind"),
+                    kind_label,
+                    *field == 0,
+                    Some("←/→"),
+                ));
+                p_lines.push(field_row(
+                    lang.pick("Konu / argüman", "Topic / argument"),
+                    arg,
+                    *field == 1,
+                    None,
+                ));
+                p_lines.push(field_row(
+                    lang.pick("Etiket (isteğe b.)", "Label (optional)"),
+                    label,
+                    *field == 2,
+                    None,
+                ));
+            }
+        }
+        if let Some(err) = &m.error {
+            p_lines.push(Line::styled(
+                format!("! {}", sanitize_tui_text(err)),
+                Style::default().fg(WARN),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(p_lines)
+                .block(Block::bordered().border_style(Style::default().fg(MUTED)))
+                .wrap(Wrap { trim: false }),
+            foot_area,
+        );
+    } else if let Some(err) = &m.error {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!("! {}", sanitize_tui_text(err)),
+                Style::default().fg(WARN),
+            )),
+            foot_area,
+        );
+    }
+}
+
+fn mask_secret_display(
+    dirty: bool,
+    input: &str,
+    existing_masked: Option<&str>,
+    lang: Lang,
+) -> String {
+    if dirty {
+        if input.is_empty() {
+            lang.pick("(silinecek)", "(will clear)").into()
+        } else {
+            let bullets = "•".repeat(input.chars().count().min(12));
+            format!("{bullets} ({})", lang.pick("yeni", "new"))
+        }
+    } else if let Some(mask) = existing_masked {
+        mask.to_string()
+    } else {
+        lang.pick("(ayarlı değil)", "(not set)").into()
+    }
+}
+
+fn draw_ai_settings(frame: &mut Frame, area: Rect, m: &AiSettingsModal, lang: Lang) {
+    let popup = centered(area, 84, 25);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(lang.pick(
+            " AI Sağlayıcı ve Model Ayarları (.env) · Esc kapat ",
+            " AI Provider & Model Settings (.env) · Esc close ",
+        ))
+        .style(Style::default().fg(TEXT).bg(BASE))
+        .border_style(Style::default().fg(ACCENT));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let selected_provider = m.provider();
+    let provider_val = format!("◀ {} ▶", selected_provider.display_name(lang));
+    let model_val = if m.model.is_empty() {
+        lang.pick("(varsayılan)", "(default)")
+    } else {
+        m.model.as_str()
+    };
+    let effort_val = match m.effort() {
+        Some(eff) => format!("◀ {} ▶", eff.display_name(lang)),
+        None => format!("◀ {} ▶", lang.pick("(varsayılan)", "(default)")),
+    };
+    let base_val = if m.base_url.is_empty() {
+        lang.pick("(varsayılan)", "(default)")
+    } else {
+        m.base_url.as_str()
+    };
+    let custom_val = if m.custom_cmd.is_empty() {
+        lang.pick("(yok)", "(none)")
+    } else {
+        m.custom_cmd.as_str()
+    };
+    let gemini_disp = mask_secret_display(
+        m.gemini_key_dirty,
+        &m.gemini_key_input,
+        m.gemini_key_masked.as_deref(),
+        lang,
+    );
+    let openai_disp = mask_secret_display(
+        m.openai_key_dirty,
+        &m.openai_key_input,
+        m.openai_key_masked.as_deref(),
+        lang,
+    );
+
+    let mut status_spans = Vec::new();
+    for st in &m.statuses {
+        let mark = if st.ready { "✓" } else { "·" };
+        let color = if st.provider == selected_provider {
+            ACCENT
+        } else if st.ready {
+            GOOD
+        } else {
+            MUTED
+        };
+        status_spans.push(Span::styled(
+            format!("{mark}{} ", st.provider.as_env_str()),
+            Style::default().fg(color),
+        ));
+    }
+
+    let test_style = if m.field == 8 {
+        Style::default()
+            .fg(BASE)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(ACCENT).bg(SURFACE)
+    };
+    let save_style = if m.field == 9 {
+        Style::default()
+            .fg(BASE)
+            .bg(GOOD)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(GOOD).bg(SURFACE)
+    };
+
+    let mut lines = vec![
+        Line::from(status_spans),
+        Line::raw(""),
+        field_row(
+            lang.pick("Sağlayıcı", "Provider"),
+            &provider_val,
+            m.field == 0,
+            Some("←/→"),
+        ),
+        field_row(
+            lang.pick("Model", "Model"),
+            model_val,
+            m.field == 1,
+            Some(lang.pick("←/→ hazır · yaz: özel", "←/→ preset · type custom")),
+        ),
+        field_row(
+            lang.pick("Düşünme Eforu", "Effort"),
+            &effort_val,
+            m.field == 2,
+            Some("←/→"),
+        ),
+        field_row(
+            lang.pick("Base URL", "Base URL"),
+            base_val,
+            m.field == 3,
+            Some("OpenAI / Gemini URL"),
+        ),
+        field_row(
+            "GEMINI_API_KEY",
+            &gemini_disp,
+            m.field == 4,
+            Some(lang.pick("yaz: değiştir · Del/Bksp: sil", "type: set · Bksp: clear")),
+        ),
+        field_row(
+            "OPENAI_API_KEY",
+            &openai_disp,
+            m.field == 5,
+            Some(lang.pick("yaz: değiştir · Del/Bksp: sil", "type: set · Bksp: clear")),
+        ),
+        field_row(
+            "STUDIA_AI_CMD",
+            custom_val,
+            m.field == 6,
+            Some("{prompt} {schema}"),
+        ),
+        field_row(
+            lang.pick("Zaman aşımı (sn)", "Timeout (sec)"),
+            &m.timeout_secs,
+            m.field == 7,
+            Some("0 = limitsiz"),
+        ),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                lang.pick(
+                    " Bağlantıyı Test Et (Ctrl+T) ",
+                    " Test Connection (Ctrl+T) ",
+                ),
+                test_style,
+            ),
+            Span::raw("   "),
+            Span::styled(
+                lang.pick(" .env'ye Kaydet (Ctrl+S) ", " Save to .env (Ctrl+S) "),
+                save_style,
+            ),
+        ]),
+    ];
+
+    if let Some((ok, msg)) = &m.test_result {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            sanitize_tui_text(msg),
+            Style::default().fg(if *ok { GOOD } else { WARN }),
+        ));
+    }
+    if let Some(err) = &m.error {
+        lines.push(Line::styled(
+            format!("! {}", sanitize_tui_text(err)),
+            Style::default().fg(WARN),
+        ));
+    }
+    if !m.env_overrides.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                "{} {}",
+                lang.pick(
+                    "Not — ortam değişkeni aktif:",
+                    "Note — env overrides active:"
+                ),
+                m.env_overrides.join(", ")
+            ),
+            Style::default().fg(WARN),
+        ));
+    }
+    if selected_provider == AiProvider::Auto {
+        lines.push(Line::styled(
+            lang.pick(
+                "Auto: önce agy CLI, yoksa GEMINI_API_KEY / OPENAI_API_KEY / diğer CLI'lar denenir.",
+                "Auto: tries agy CLI first, then GEMINI_API_KEY / OPENAI_API_KEY / other CLIs.",
+            ),
+            Style::default().fg(MUTED),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 #[cfg(test)]
@@ -1779,5 +2353,55 @@ mod tests {
         assert!(!screen.contains('\x1b'));
         assert!(!screen.contains('\x07'));
         assert!(!screen.contains('\u{009b}'));
+    }
+
+    #[test]
+    fn all_new_modals_render_cleanly_and_mask_api_secrets() {
+        let (_root, mut app) = app_with_subject();
+
+        // 1. PlanGenModal in TR and EN across normal & small sizes.
+        app.key(press(KeyCode::Char('5'))).unwrap();
+        app.key(press(KeyCode::Char('g'))).unwrap();
+        for (w, h) in [(100, 30), (60, 16)] {
+            let s = render(&app, w, h);
+            assert!(s.contains("AI Çalışma Planı Oluştur"), "{s}");
+        }
+        app.key(press(KeyCode::Esc)).unwrap();
+
+        // 2. PlanEditModal (list + inline TaskForm).
+        app.key(press(KeyCode::Char('e'))).unwrap();
+        let editor_screen = render(&app, 100, 30);
+        assert!(
+            editor_screen.contains("Çalışma Planı Düzenleyici"),
+            "{editor_screen}"
+        );
+        app.key(press(KeyCode::Char('a'))).unwrap();
+        let prompt_screen = render(&app, 100, 30);
+        assert!(prompt_screen.contains("Yeni Görev"), "{prompt_screen}");
+        app.key(press(KeyCode::Esc)).unwrap();
+        app.key(press(KeyCode::Esc)).unwrap();
+
+        // 3. AiSettingsModal: verify raw typed secret never appears in buffer.
+        app.key(press(KeyCode::F(5))).unwrap();
+        app.key(press(KeyCode::Tab)).unwrap(); // 1: model
+        app.key(press(KeyCode::Tab)).unwrap(); // 2: effort
+        app.key(press(KeyCode::Tab)).unwrap(); // 3: base_url
+        app.key(press(KeyCode::Tab)).unwrap(); // 4: gemini_key
+        for ch in "sk-super-secret-xyz999".chars() {
+            app.key(press(KeyCode::Char(ch))).unwrap();
+        }
+        for (w, h) in [(100, 30), (60, 16)] {
+            let ai_screen = render(&app, w, h);
+            assert!(!ai_screen.contains("sk-super-secret-xyz999"));
+            assert!(ai_screen.contains("AI Sağlayıcı") || ai_screen.contains("AI"));
+        }
+        app.key(press(KeyCode::Esc)).unwrap();
+        app.key(press(KeyCode::F(4))).unwrap();
+        app.key(press(KeyCode::F(5))).unwrap();
+        let en_screen = render(&app, 100, 30);
+        assert!(
+            en_screen.contains("AI Provider & Model Settings"),
+            "{en_screen}"
+        );
     }
 }

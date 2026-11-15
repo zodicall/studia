@@ -193,6 +193,37 @@ impl CourseConfig {
         parsed.validate()?;
         Ok(parsed)
     }
+
+    pub fn save(&self, root: &Path, subject: &str) -> Result<()> {
+        validate_identifier(subject)?;
+        self.validate()?;
+        let sources_root = crate::sources::sources_dir(root);
+        fs::create_dir_all(&sources_root)?;
+        let canon_root = fs::canonicalize(&sources_root)?;
+        let subject_dir = sources_root.join(subject);
+        if fs::symlink_metadata(&subject_dir).is_err() {
+            fs::create_dir_all(&subject_dir)?;
+        }
+        let canon_subject = fs::canonicalize(&subject_dir)?;
+        if canon_subject == canon_root || !canon_subject.starts_with(&canon_root) {
+            return Err(invalid(format!(
+                "course.json resources kökünün dışına taşıyor / escapes resources root: {}",
+                subject_dir.display()
+            )));
+        }
+        let path = subject_dir.join("course.json");
+        if let Ok(canon_path) = fs::canonicalize(&path)
+            && (canon_path == canon_root || !canon_path.starts_with(&canon_root))
+        {
+            return Err(invalid(format!(
+                "course.json resources kökünün dışına taşıyor / escapes resources root: {}",
+                path.display()
+            )));
+        }
+        let mut json = serde_json::to_string_pretty(self)?;
+        json.push('\n');
+        crate::config::atomic_write_private(&path, json.as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -287,5 +318,46 @@ mod tests {
             .unwrap();
             assert!(CourseConfig::load_or_default(dir.path(), "LinkedFile").is_err());
         }
+    }
+
+    #[test]
+    fn save_roundtrip_preserves_metadata_and_rejects_invalid_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CourseConfig {
+            title: Some("YDS".into()),
+            persona: Some("Helpful coach".into()),
+            exam: Some(ExamConfig {
+                question_count: 80,
+                choices_count: 5,
+                categories: vec![CategoryWeight {
+                    name: "Grammar".into(),
+                    count: 10,
+                }],
+                rules: Some("YDS rules".into()),
+            }),
+            plan: vec![DayConfig {
+                day: 1,
+                title: "Tenses".into(),
+                tasks: vec![TaskConfig {
+                    command: "/anlat Tenses".into(),
+                    label: "Ders: Zamanlar".into(),
+                }],
+            }],
+        };
+        cfg.save(dir.path(), "yds").unwrap();
+        let loaded = CourseConfig::load_or_default(dir.path(), "yds").unwrap();
+        assert_eq!(loaded, cfg);
+
+        cfg.plan.push(DayConfig {
+            day: 99,
+            title: "Bad".into(),
+            tasks: vec![],
+        });
+        assert!(cfg.save(dir.path(), "yds").is_err());
+        assert!(
+            CourseConfig::default()
+                .save(dir.path(), "../escape")
+                .is_err()
+        );
     }
 }

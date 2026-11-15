@@ -1,9 +1,14 @@
 mod app;
+mod modals;
 mod ui;
 
 use crate::{Result, config, i18n::Lang};
-use crossterm::event::{self, Event};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    execute,
+};
 use std::{
+    io,
     path::Path,
     time::{Duration, Instant},
 };
@@ -16,6 +21,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
     }
 }
@@ -25,6 +31,7 @@ pub fn run_with(root: &Path, lang: Lang) -> Result<()> {
     // try_init installs ratatui's panic hook, which restores before reporting a panic.
     let _guard = TerminalGuard;
     let mut terminal = ratatui::try_init()?;
+    let _ = execute!(io::stdout(), EnableMouseCapture);
     let mut refreshed = Instant::now();
     let result = (|| -> Result<()> {
         while !app.quit {
@@ -51,15 +58,20 @@ pub fn run_with(root: &Path, lang: Lang) -> Result<()> {
                 app.status = status_error(root, app.lang.pick("Koç", "Coach"), &error);
             }
             terminal.draw(|frame| ui::draw(frame, &app))?;
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(key) = event::read()?
-                && let Err(error) = app.key(key)
-            {
-                app.status = status_error(
-                    root,
-                    app.lang.pick("İşlem yapılamadı", "Action failed"),
-                    &error,
-                );
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if let Err(error) = app.key(key) {
+                            app.status = status_error(
+                                root,
+                                app.lang.pick("İşlem yapılamadı", "Action failed"),
+                                &error,
+                            );
+                        }
+                    }
+                    Event::Mouse(mouse) => app.mouse(mouse),
+                    _ => {}
+                }
             }
         }
         Ok(())

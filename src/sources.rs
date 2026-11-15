@@ -528,6 +528,34 @@ pub fn text(root: &Path, subject: &str, query: &str) -> Result<String> {
     Ok(output)
 }
 
+/// Lists up to `max_items` relative study file paths inside `resources/<subject>/`
+/// so AI plan generation can align days with actual source materials.
+pub fn catalog(root: &Path, subject: &str, max_items: usize) -> Result<Vec<String>> {
+    crate::course::validate_identifier(subject)?;
+    if !subjects(root)?.iter().any(|name| name == subject) {
+        return Err(invalid("Ders bulunamadı / Course not found."));
+    }
+    let sources_root = sources_dir(root);
+    let canon_root = fs::canonicalize(&sources_root)?;
+    let subject_dir = sources_root.join(subject);
+    let mut paths = Vec::new();
+    let mut visited = BTreeSet::new();
+    files(&subject_dir, &canon_root, 0, &mut visited, &mut paths)?;
+    let mut items = Vec::new();
+    for path in paths {
+        if let Ok(rel) = path.strip_prefix(&subject_dir) {
+            let clean = rel.to_string_lossy().replace('\\', "/");
+            if !clean.contains(" (2).") {
+                items.push(clean);
+                if items.len() >= max_items {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,5 +868,26 @@ mod tests {
             symlink(&outside, &cache_dir).unwrap();
             assert!(text(root.path(), "Safe", "").is_err());
         }
+    }
+
+    #[test]
+    fn catalog_lists_subject_files_respecting_skips_and_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("resources/Math");
+        fs::create_dir_all(sub.join("Algebra")).unwrap();
+        fs::create_dir_all(sub.join("exams")).unwrap();
+        fs::write(sub.join("Algebra/01_linear.md"), "x").unwrap();
+        fs::write(sub.join("Algebra/02_quad.txt"), "y").unwrap();
+        fs::write(sub.join("exams/mock.json"), "{}").unwrap();
+        fs::write(sub.join("course.json"), "{}").unwrap();
+        let list = catalog(root.path(), "Math", 10).unwrap();
+        assert_eq!(
+            list,
+            vec![
+                "Algebra/01_linear.md".to_string(),
+                "Algebra/02_quad.txt".to_string()
+            ]
+        );
+        assert_eq!(catalog(root.path(), "Math", 1).unwrap().len(), 1);
     }
 }

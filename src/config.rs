@@ -1,4 +1,4 @@
-use crate::{Result, invalid};
+use crate::{Result, i18n::Lang, invalid};
 use std::{
     collections::BTreeMap,
     fs,
@@ -31,14 +31,158 @@ pub enum AiProvider {
     Agy,
     Claude,
     Codex,
-    GeminiCli,
     Custom,
+}
+
+impl AiProvider {
+    pub const ALL: [Self; 7] = [
+        Self::Auto,
+        Self::GeminiApi,
+        Self::OpenAiApi,
+        Self::Agy,
+        Self::Claude,
+        Self::Codex,
+        Self::Custom,
+    ];
+
+    pub fn as_env_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::GeminiApi => "gemini",
+            Self::OpenAiApi => "openai",
+            Self::Agy => "agy",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn display_name(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Self::Auto, Lang::Tr) => "Otomatik (auto)",
+            (Self::Auto, Lang::En) => "Automatic (auto)",
+            (Self::GeminiApi, _) => "Gemini API",
+            (Self::OpenAiApi, Lang::Tr) => "OpenAI / Uyumlu API",
+            (Self::OpenAiApi, Lang::En) => "OpenAI / Compatible API",
+            (Self::Agy, _) => "Antigravity (agy CLI)",
+            (Self::Claude, _) => "Claude CLI",
+            (Self::Codex, _) => "Codex CLI",
+            (Self::Custom, Lang::Tr) => "Özel Komut (custom)",
+            (Self::Custom, Lang::En) => "Custom Command (custom)",
+        }
+    }
+
+    pub fn suggested_models(self) -> &'static [&'static str] {
+        match self {
+            Self::GeminiApi => &[
+                "gemini-3.8-flash",
+                "gemini-4-hydrogen",
+                "gemini-4-argon",
+                "gemini-4-carbon",
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-pro-preview",
+                "gemini-2.5-pro",
+            ],
+            Self::OpenAiApi => &[
+                "gpt-6.1-terra",
+                "gpt-6.1-sol",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-5-mini",
+                "gpt-5",
+                "o4-mini",
+                "qwen3.5:9b",
+                "gemma3:12b",
+                "llama4",
+            ],
+            Self::Claude => &[
+                "claude-sonnet-5-5",
+                "claude-opus-5-5",
+                "claude-haiku-5-5",
+                "claude-sonnet-4-6",
+                "claude-opus-4-6",
+            ],
+            Self::Codex => &["gpt-6.1-sol", "gpt-6-astra", "gpt-5.3-codex", "o4-mini"],
+            Self::Agy => &[
+                "gemini-4-hydrogen",
+                "gemini-4-argon",
+                "gemini-3.8-flash",
+                "claude-sonnet-5-5",
+                "claude-opus-5-5",
+                "gpt-oss-120b-medium",
+            ],
+            Self::Auto | Self::Custom => &[],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AiEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl AiEffort {
+    pub const ALL: [Self; 6] = [
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
+
+    pub fn as_env_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn display_name(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Self::Minimal, Lang::Tr) => "minimal (en az)",
+            (Self::Minimal, Lang::En) => "minimal",
+            (Self::Low, Lang::Tr) => "low (hızlı)",
+            (Self::Low, Lang::En) => "low",
+            (Self::Medium, Lang::Tr) => "medium (dengeli)",
+            (Self::Medium, Lang::En) => "medium",
+            (Self::High, Lang::Tr) => "high (derin)",
+            (Self::High, Lang::En) => "high",
+            (Self::XHigh, Lang::Tr) => "xhigh (çok derin)",
+            (Self::XHigh, Lang::En) => "xhigh",
+            (Self::Max, Lang::Tr) => "max (azami)",
+            (Self::Max, Lang::En) => "max",
+        }
+    }
+}
+
+pub fn parse_effort(raw: &str) -> Result<Option<AiEffort>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "auto" | "none" => Ok(None),
+        "minimal" | "min" => Ok(Some(AiEffort::Minimal)),
+        "low" => Ok(Some(AiEffort::Low)),
+        "medium" | "med" => Ok(Some(AiEffort::Medium)),
+        "high" => Ok(Some(AiEffort::High)),
+        "xhigh" | "extra_high" | "extra-high" => Ok(Some(AiEffort::XHigh)),
+        "max" => Ok(Some(AiEffort::Max)),
+        other => Err(invalid(format!("Unknown AI effort level: {other}"))),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiConfig {
     pub provider: AiProvider,
     pub model: Option<String>,
+    pub effort: Option<AiEffort>,
     pub base_url: Option<String>,
     pub gemini_api_key: Option<String>,
     pub openai_api_key: Option<String>,
@@ -181,7 +325,6 @@ pub fn parse_provider(raw: &str) -> Result<AiProvider> {
         "agy" => Ok(AiProvider::Agy),
         "claude" => Ok(AiProvider::Claude),
         "codex" => Ok(AiProvider::Codex),
-        "gemini-cli" => Ok(AiProvider::GeminiCli),
         "custom" => Ok(AiProvider::Custom),
         other => Err(invalid(format!("Unknown AI provider: {other}"))),
     }
@@ -221,6 +364,10 @@ pub fn load_ai_config(root: &Path) -> Result<AiConfig> {
                 .flatten()
         });
     let custom_cmd = env.get("STUDIA_AI_CMD");
+    let effort = match env.get("STUDIA_AI_EFFORT") {
+        Some(raw) => parse_effort(&raw)?,
+        None => None,
+    };
     let timeout_secs = match env.get("STUDIA_AI_TIMEOUT_SECS") {
         Some(raw) => raw
             .trim()
@@ -231,6 +378,7 @@ pub fn load_ai_config(root: &Path) -> Result<AiConfig> {
     Ok(AiConfig {
         provider,
         model,
+        effort,
         base_url,
         gemini_api_key,
         openai_api_key,
@@ -494,6 +642,139 @@ pub fn insecure_env_files(root: &Path) -> Vec<PathBuf> {
     flagged
 }
 
+pub const AI_ENV_VARS: [&str; 10] = [
+    "STUDIA_AI_PROVIDER",
+    "STUDIA_AI_MODEL",
+    "STUDIA_AI_EFFORT",
+    "STUDIA_AI_BASE_URL",
+    "GEMINI_API_KEY",
+    "STUDIA_GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "STUDIA_OPENAI_API_KEY",
+    "STUDIA_AI_CMD",
+    "STUDIA_AI_TIMEOUT_SECS",
+];
+
+pub fn env_overrides() -> Vec<&'static str> {
+    AI_ENV_VARS
+        .into_iter()
+        .filter(|key| {
+            std::env::var(key)
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty() && !v.contains('\0'))
+        })
+        .collect()
+}
+
+pub fn mask_secret_tail(secret: &str) -> String {
+    let trimmed = secret.trim();
+    let count = trimmed.chars().count();
+    if count <= 4 {
+        return "••••".to_string();
+    }
+    let tail: String = trimmed.chars().skip(count.saturating_sub(4)).collect();
+    format!("••••{tail}")
+}
+
+fn dotenv_key_of_line(line: &str) -> Option<&str> {
+    let mut trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    if let Some(after) = trimmed.strip_prefix("export")
+        && after.starts_with(char::is_whitespace)
+    {
+        trimmed = after.trim_start();
+    }
+    let (raw_key, _) = trimmed.split_once('=')?;
+    let key = raw_key.trim();
+    if key.is_empty() || key.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(key)
+}
+
+fn format_dotenv_value(value: &str) -> Result<String> {
+    if value.contains(['\0', '\r', '\n']) {
+        return Err(invalid(
+            "Environment value cannot contain NUL or newline characters.",
+        ));
+    }
+    let needs_quotes = value.is_empty()
+        || value != value.trim()
+        || value.chars().any(char::is_whitespace)
+        || value.contains(['#', '"', '\'', '\\']);
+    if !needs_quotes {
+        return Ok(value.to_string());
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!("\"{escaped}\""))
+}
+
+/// Atomically updates `<root>/.env` keys while preserving comments, blank lines, and unrelated entries.
+pub fn save_dotenv_updates(root: &Path, updates: &[(&str, Option<&str>)]) -> Result<PathBuf> {
+    let path = root.join(".env");
+    let existing = match fs::metadata(&path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return Err(invalid(".env path is not a regular file."));
+            }
+            if meta.len() > MAX_ENV_FILE_BYTES {
+                return Err(invalid(".env exceeds 1 MiB limit."));
+            }
+            fs::read_to_string(&path)?
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut formatted: BTreeMap<&str, Option<String>> = BTreeMap::new();
+    for &(key, val) in updates {
+        if key.trim().is_empty() || key.bytes().any(|b| b.is_ascii_whitespace() || b == b'=') {
+            return Err(invalid(format!("Invalid env key: {key:?}")));
+        }
+        let next = match val {
+            Some(v) => Some(format_dotenv_value(v)?),
+            None => None,
+        };
+        formatted.insert(key, next);
+    }
+
+    let mut seen: BTreeMap<&str, bool> = BTreeMap::new();
+    let mut lines: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        if let Some(key) = dotenv_key_of_line(line)
+            && let Some(desired) = formatted.get(key)
+        {
+            match desired {
+                Some(val) if !seen.contains_key(key) => {
+                    lines.push(format!("{key}={val}"));
+                    seen.insert(key, true);
+                }
+                Some(_) | None => {}
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    for &(key, _) in updates {
+        if !seen.contains_key(key)
+            && let Some(Some(val)) = formatted.get(key)
+        {
+            lines.push(format!("{key}={val}"));
+            seen.insert(key, true);
+        }
+    }
+
+    let mut content = lines.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    atomic_write_private(&path, content.as_bytes())?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,7 +856,8 @@ mod tests {
         assert_eq!(parse_provider("auto").unwrap(), AiProvider::Auto);
         assert_eq!(parse_provider("gemini").unwrap(), AiProvider::GeminiApi);
         assert_eq!(parse_provider("openai").unwrap(), AiProvider::OpenAiApi);
-        assert_eq!(parse_provider("gemini-cli").unwrap(), AiProvider::GeminiCli);
+        assert_eq!(parse_provider("agy").unwrap(), AiProvider::Agy);
+        assert!(parse_provider("gemini-cli").is_err());
         assert!(parse_provider("unknown-provider").is_err());
 
         assert!(validate_http_url("https://api.openai.com/v1").is_ok());
@@ -719,5 +1001,58 @@ mod tests {
         assert!(redacted.contains("<workspace>/data"));
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redact_error(Path::new("."), &"network error.").contains("<workspace>."));
+    }
+
+    #[test]
+    fn save_dotenv_updates_preserves_comments_and_telegram_while_updating_ai() {
+        let root = tempfile::tempdir().unwrap();
+        let env_path = root.path().join(".env");
+        fs::write(
+            &env_path,
+            "# keep comment\nSTUDIA_TELEGRAM_TOKEN=12345:bot-tok\nexport STUDIA_AI_PROVIDER=auto\nSTUDIA_AI_MODEL=old-model\n",
+        )
+        .unwrap();
+
+        save_dotenv_updates(
+            root.path(),
+            &[
+                ("STUDIA_AI_PROVIDER", Some("openai")),
+                ("STUDIA_AI_MODEL", None),
+                ("STUDIA_AI_BASE_URL", Some("http://localhost:11434/v1")),
+                ("STUDIA_AI_CMD", Some("my-cli --prompt {prompt_file}")),
+            ],
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(&env_path).unwrap();
+        assert!(raw.contains("# keep comment"));
+        assert!(raw.contains("STUDIA_TELEGRAM_TOKEN=12345:bot-tok"));
+        let lookup = EnvLookup::from_root(root.path());
+        assert_eq!(lookup.get("STUDIA_AI_PROVIDER").as_deref(), Some("openai"));
+        assert_eq!(lookup.get("STUDIA_AI_MODEL"), None);
+        assert_eq!(
+            lookup.get("STUDIA_AI_BASE_URL").as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(
+            lookup.get("STUDIA_AI_CMD").as_deref(),
+            Some("my-cli --prompt {prompt_file}")
+        );
+
+        assert!(
+            save_dotenv_updates(root.path(), &[("STUDIA_AI_MODEL", Some("bad\nmodel"))]).is_err()
+        );
+        assert_eq!(mask_secret_tail("sk-test-1234"), "••••1234");
+        assert_eq!(mask_secret_tail("abc"), "••••");
+        for provider in AiProvider::ALL {
+            for model in provider.suggested_models() {
+                assert_eq!(validate_model_identifier(model).unwrap(), *model);
+            }
+        }
+        for effort in AiEffort::ALL {
+            assert_eq!(parse_effort(effort.as_env_str()).unwrap(), Some(effort));
+        }
+        assert_eq!(parse_effort("default").unwrap(), None);
+        assert!(parse_effort("ultra").is_err());
     }
 }

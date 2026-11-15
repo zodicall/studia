@@ -219,14 +219,6 @@ fn doctor_report(root: &Path, lang: Lang) -> String {
                         "missing"
                     }
                 ),
-                AiProvider::GeminiCli => format!(
-                    "gemini CLI ({})",
-                    if config::find_cli_in_path("gemini").is_some() {
-                        "PATH OK"
-                    } else {
-                        "missing"
-                    }
-                ),
                 AiProvider::Custom => format!(
                     "custom ({})",
                     if ai_cfg.custom_cmd.is_some() {
@@ -240,7 +232,7 @@ fn doctor_report(root: &Path, lang: Lang) -> String {
                         "auto -> GeminiApi (key set)".into()
                     } else if ai_cfg.openai_api_key.is_some() {
                         "auto -> OpenAiApi (key set)".into()
-                    } else if let Some(cli) = ["agy", "claude", "codex", "gemini"]
+                    } else if let Some(cli) = ["agy", "claude", "codex"]
                         .into_iter()
                         .find(|bin| config::find_cli_in_path(bin).is_some())
                     {

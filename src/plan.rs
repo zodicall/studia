@@ -11,6 +11,8 @@ use chrono::{Days, NaiveDate, NaiveDateTime, NaiveTime};
 
 const START_KEY_PREFIX: &str = "plan_start";
 const DATE_FORMAT: &str = "%Y-%m-%d";
+pub const MAX_PLAN_DAYS: usize = 90;
+pub const MAX_TASKS_PER_DAY: usize = 6;
 
 /// Plandaki durum; `today` her çağrıda yerel tarihten verilir.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +131,43 @@ pub fn mark_done(
 ) -> Result<()> {
     let key = done_key(subject, start, day_num, task_idx)?;
     store.set_state(&key, "1")
+}
+
+/// Clears all completion marks for `subject` starting on `start` (used when regenerating a plan).
+pub fn clear_done(store: &Store, subject: &str, start: NaiveDate) -> Result<()> {
+    validate_identifier(subject)?;
+    let prefix = format!("plan_done:{subject}:{}:", start.format(DATE_FORMAT));
+    store.clear_state_prefix(&prefix)
+}
+
+/// Parses either a day count (`1..=MAX_PLAN_DAYS`) or a target exam date (`YYYY-MM-DD` / `DD.MM.YYYY`).
+pub fn parse_days_or_target_date(
+    raw: &str,
+    today: NaiveDate,
+) -> std::result::Result<usize, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty");
+    }
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let days = trimmed.parse::<usize>().map_err(|_| "range")?;
+        if (1..=MAX_PLAN_DAYS).contains(&days) {
+            return Ok(days);
+        }
+        return Err("range");
+    }
+    let parsed = NaiveDate::parse_from_str(trimmed, DATE_FORMAT)
+        .or_else(|_| NaiveDate::parse_from_str(trimmed, "%d.%m.%Y"))
+        .map_err(|_| "format")?;
+    let diff = (parsed - today).num_days();
+    if diff < 0 {
+        return Err("past");
+    }
+    let days = usize::try_from(diff + 1).map_err(|_| "range")?;
+    if days > MAX_PLAN_DAYS {
+        return Err("range");
+    }
+    Ok(days)
 }
 
 pub fn callback_data(day_num: usize, task_idx: usize) -> String {
@@ -351,5 +390,35 @@ mod tests {
         for invalid in ["", "8:30", "24:00", "08:60", "08:30:00", "aa:bb"] {
             assert_eq!(morning_time(invalid), time);
         }
+    }
+
+    #[test]
+    fn parse_days_or_target_date_and_clear_done_work_cleanly() {
+        let today = date("2026-11-15");
+        assert_eq!(parse_days_or_target_date("14", today), Ok(14));
+        assert_eq!(parse_days_or_target_date("2026-11-15", today), Ok(1));
+        assert_eq!(parse_days_or_target_date("21.11.2026", today), Ok(7));
+        assert_eq!(parse_days_or_target_date("0", today), Err("range"));
+        assert_eq!(parse_days_or_target_date("91", today), Err("range"));
+        assert_eq!(parse_days_or_target_date("2026-11-14", today), Err("past"));
+        assert_eq!(
+            parse_days_or_target_date("not-a-date", today),
+            Err("format")
+        );
+
+        let (_dir, store) = store();
+        let days = sample_days();
+        set_start(&store, "math", today).unwrap();
+        mark_done(&store, "math", today, 1, 0).unwrap();
+        mark_done(&store, "history", today, 1, 0).unwrap();
+        clear_done(&store, "math", today).unwrap();
+        assert_eq!(
+            day_done(&store, "math", &days, today, 1).unwrap(),
+            vec![false, false]
+        );
+        assert_eq!(
+            day_done(&store, "history", &days, today, 1).unwrap(),
+            vec![true, false]
+        );
     }
 }
