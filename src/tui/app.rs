@@ -1,6 +1,4 @@
-use super::modals::{
-    AiSettingsModal, Modal, PlanEditModal, PlanEditPrompt, PlanGenModal, TASK_CMD_KINDS,
-};
+use super::modals::{AiSettingsModal, Modal, PlanEditModal, PlanEditPrompt, TASK_CMD_KINDS};
 use crate::{
     Result, ai,
     bot::{self, JobKind, JobResult, Session},
@@ -22,10 +20,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const TABS: [&str; 6] = ["Sor", "Quiz", "Tekrar", "İstatistik", "Bugün", "Denemeler"];
-pub const TABS_EN: [&str; 6] = ["Ask", "Quiz", "Review", "Stats", "Today", "Exams"];
+pub const TABS: [&str; 7] = [
+    "Sor",
+    "Quiz",
+    "Tekrar",
+    "İstatistik",
+    "Bugün",
+    "Denemeler",
+    "Planla",
+];
+pub const TABS_EN: [&str; 7] = ["Ask", "Quiz", "Review", "Stats", "Today", "Exams", "Plan"];
 
-pub fn tabs(lang: Lang) -> [&'static str; 6] {
+pub fn tabs(lang: Lang) -> [&'static str; 7] {
     match lang {
         Lang::Tr => TABS,
         Lang::En => TABS_EN,
@@ -33,6 +39,8 @@ pub fn tabs(lang: Lang) -> [&'static str; 6] {
 }
 /// Denemeler sekmesi: geçmiş denemeler ve seçilen denemenin analizi.
 pub const DENEME_TAB: usize = 5;
+/// Planla sekmesi: AI ile tartışmalı çalışma planı oluşturma ve taslak önizleme.
+pub const PLAN_TAB: usize = 6;
 /// `✓` ile başlayan başarı bildirimleri bu kadar sonra kaybolur; hatalar bir sonraki tuşa kadar kalır.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 /// Bu süreyi aşan AI işlerinde kullanıcıya uyarı gösterilir.
@@ -54,6 +62,8 @@ pub enum Input {
     DenemeChat,
     /// Ders anlatımı ekranındaki takip sohbeti: boş Enter quize geçer, dolu Enter soru sorar.
     LessonChat,
+    /// Planla sekmesi sohbeti: AI ile çalışma planı tartışma ve revizyon.
+    PlanChat,
 }
 
 /// Koçun bir turdaki yanıtı. `Waiting`: AI henüz dönmedi.
@@ -88,6 +98,18 @@ pub struct DenemeChat {
     /// Takip kapalıyken baştan satır ofseti.
     pub scroll: u16,
     /// Son çizimde hesaplanan en büyük ofset (toplam satır − panel yüksekliği). Çizim yazar.
+    pub max_scroll: Cell<u16>,
+}
+
+/// Planla sekmesindeki çok turlu plan oluşturma oturumu. Yalnızca bellekte tutulur.
+pub struct PlanChat {
+    pub subject: String,
+    pub turns: Vec<DenemeTurn>,
+    pub draft: Option<Vec<crate::course::DayConfig>>,
+    pub draft_day: usize,
+    pub auto_start: bool,
+    pub follow: bool,
+    pub scroll: u16,
     pub max_scroll: Cell<u16>,
 }
 
@@ -158,6 +180,7 @@ fn job_label(kind: &JobKind, lang: Lang) -> &'static str {
         JobKind::GeneratePlan { .. } => {
             lang.pick("Çalışma planı hazırlanıyor", "Generating study plan")
         }
+        JobKind::PlanChat { .. } => lang.pick("Plan danışmanı yanıtlıyor", "Planner is responding"),
     }
 }
 
@@ -212,34 +235,8 @@ fn ai_generate(root: &Path) -> impl FnOnce(String, String) -> Result<String> + S
     move |prompt, schema| ai::generate(&root, &prompt, &schema)
 }
 
-/// Koça giden geçmiş: yanıtı tamamlanmış son 6 tur, sırasıyla (öğrenci, koç). Hatalı turlar girmez.
-fn coach_history(chat: &DenemeChat, lang: Lang) -> Vec<(String, String)> {
-    let done: Vec<(&str, &str)> = chat
-        .turns
-        .iter()
-        .filter_map(|turn| match &turn.reply {
-            CoachReply::Answer(answer) => Some((turn.question.as_str(), answer.as_str())),
-            _ => None,
-        })
-        .collect();
-    done[done.len().saturating_sub(6)..]
-        .iter()
-        .flat_map(|(question, answer)| {
-            let asked = if question.is_empty() {
-                lang.pick("Denemeyi değerlendir.", "Evaluate this mock exam.")
-            } else {
-                question
-            };
-            [
-                ("user".to_string(), asked.to_string()),
-                ("assistant".to_string(), answer.to_string()),
-            ]
-        })
-        .collect()
-}
-
-/// Ders sohbetine giden geçmiş: yanıtı tamamlanmış son 6 tur.
-fn lesson_history(turns: &[DenemeTurn]) -> Vec<(String, String)> {
+/// Tamamlanmış son 6 sohbet turunu `(user, assistant)` çiftleri olarak döndürür.
+fn recent_turn_history(turns: &[DenemeTurn], empty_user: &str) -> Vec<(String, String)> {
     let done: Vec<(&str, &str)> = turns
         .iter()
         .filter_map(|turn| match &turn.reply {
@@ -250,12 +247,41 @@ fn lesson_history(turns: &[DenemeTurn]) -> Vec<(String, String)> {
     done[done.len().saturating_sub(6)..]
         .iter()
         .flat_map(|(question, answer)| {
+            let asked = if question.is_empty() {
+                empty_user
+            } else {
+                *question
+            };
             [
-                ("user".to_string(), (*question).to_string()),
+                ("user".to_string(), asked.to_string()),
                 ("assistant".to_string(), (*answer).to_string()),
             ]
         })
         .collect()
+}
+
+/// Koça giden geçmiş: yanıtı tamamlanmış son 6 tur, sırasıyla (öğrenci, koç). Hatalı turlar girmez.
+fn coach_history(chat: &DenemeChat, lang: Lang) -> Vec<(String, String)> {
+    recent_turn_history(
+        &chat.turns,
+        lang.pick("Denemeyi değerlendir.", "Evaluate this mock exam."),
+    )
+}
+
+/// Ders sohbetine giden geçmiş: yanıtı tamamlanmış son 6 tur.
+fn lesson_history(turns: &[DenemeTurn]) -> Vec<(String, String)> {
+    recent_turn_history(turns, "")
+}
+
+/// Plan sohbetine giden geçmiş: yanıtı tamamlanmış son 6 tur.
+fn plan_chat_history(turns: &[DenemeTurn], lang: Lang) -> Vec<(String, String)> {
+    recent_turn_history(
+        turns,
+        lang.pick(
+            "Planlama tartışmasını başlat.",
+            "Start planning discussion.",
+        ),
+    )
 }
 
 /// Süreyi `dd:ss` biçiminde yazar.
@@ -302,6 +328,7 @@ pub struct App {
     pub deneme_selected: usize,
     pub deneme_chat: Option<DenemeChat>,
     pub deneme_delete: Option<i64>,
+    pub plan_chat: Option<PlanChat>,
     pub lesson: Option<String>,
     pub lesson_topic: String,
     pub lesson_turns: Vec<DenemeTurn>,
@@ -343,6 +370,13 @@ fn clamp_scroll(current: u16, max: u16, delta: i32) -> u16 {
     (i32::from(current.min(max)) + delta).clamp(0, i32::from(max)) as u16
 }
 
+fn scroll_turns(scroll: &mut u16, follow: &mut bool, max: u16, delta: i32) {
+    let current = if *follow { max } else { (*scroll).min(max) };
+    let next = clamp_scroll(current, max, delta);
+    *scroll = next;
+    *follow = next >= max;
+}
+
 impl App {
     /// Sor sekmesi yanıt / özet panelinde kaydırır.
     fn scroll_ask(&mut self, delta: i32) {
@@ -361,6 +395,10 @@ impl App {
         };
         if self.editing == Some(Input::DenemeChat) || self.deneme_chat.is_some() {
             self.scroll_chat(delta);
+        } else if self.editing == Some(Input::PlanChat)
+            || (self.tab == PLAN_TAB && self.plan_chat.is_some())
+        {
+            self.scroll_plan_chat(delta);
         } else if self.tab == 4 && self.lesson.is_some() {
             self.scroll_lesson(delta);
         } else if self.tab == 0 {
@@ -425,6 +463,7 @@ impl App {
             deneme_selected: 0,
             deneme_chat: None,
             deneme_delete: None,
+            plan_chat: None,
             lesson: None,
             lesson_topic: String::new(),
             lesson_turns: vec![],
@@ -548,7 +587,9 @@ impl App {
                     job_label(kind, self.lang),
                     !matches!(
                         kind,
-                        JobKind::DenemeCoach { .. } | JobKind::LessonChat { .. }
+                        JobKind::DenemeCoach { .. }
+                            | JobKind::LessonChat { .. }
+                            | JobKind::PlanChat { .. }
                     ),
                 ),
             };
@@ -578,7 +619,26 @@ impl App {
     /// Dizinleme yarıda bırakılmaz, çünkü veritabanını yazmaya devam eder.
     fn cancel_pending(&mut self) -> Result<()> {
         match self.pending.as_ref().map(|pending| &pending.work) {
-            Some(Work::Ai { .. } | Work::TestAi) => {
+            Some(Work::Ai { kind, .. }) => {
+                if matches!(kind, JobKind::PlanChat { .. })
+                    && let Some(chat) = self.plan_chat.as_mut()
+                    && chat
+                        .turns
+                        .last()
+                        .is_some_and(|turn| turn.reply == CoachReply::Waiting)
+                {
+                    chat.turns.pop();
+                }
+                self.pending = None;
+                self.status = self
+                    .lang
+                    .pick(
+                        "İptal edildi. Sonuç kaydedilmeyecek.",
+                        "Cancelled. Result will be discarded.",
+                    )
+                    .into();
+            }
+            Some(Work::TestAi) => {
                 self.pending = None;
                 self.status = self
                     .lang
@@ -720,22 +780,8 @@ impl App {
         Ok(())
     }
 
-    fn open_plan_gen_modal(&mut self) -> Result<()> {
-        self.subject()?;
-        self.tab = 4;
-        self.editing = None;
-        let default_days = if self.course.plan.is_empty() {
-            14
-        } else {
-            self.course.plan.len().min(plan::MAX_PLAN_DAYS)
-        };
-        self.modal = Some(Modal::PlanGen(PlanGenModal::new(default_days)));
-        Ok(())
-    }
-
     fn open_plan_edit_modal(&mut self) -> Result<()> {
         self.subject()?;
-        self.tab = 4;
         self.editing = None;
         self.modal = Some(Modal::PlanEdit(PlanEditModal::from_plan(
             &self.course.plan,
@@ -807,6 +853,8 @@ impl App {
             || self.pending.is_some()
             || self.session.is_some()
             || self.lesson.is_some()
+            || self.plan_chat.is_some()
+            || self.tab == PLAN_TAB
             || self.subjects.is_empty()
         {
             return Ok(());
@@ -1032,6 +1080,34 @@ impl App {
             self.finish_lesson_chat(subject, topic, reply)?;
             return self.refresh();
         }
+        if let Work::Ai { subject, kind } = &pending.work
+            && matches!(kind, JobKind::PlanChat { .. })
+        {
+            match result {
+                Ok(raw) => {
+                    match bot::save_job_in(&mut self.store, subject, kind, &raw, self.lang) {
+                        Ok(JobResult::PlanChat(plan_reply)) => {
+                            self.finish_plan_chat(
+                                subject,
+                                CoachReply::Answer(plan_reply.reply),
+                                (!plan_reply.days.is_empty()).then_some(plan_reply.days),
+                            );
+                        }
+                        _ => self.finish_plan_chat(
+                            subject,
+                            CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
+                            None,
+                        ),
+                    }
+                }
+                Err(_) => self.finish_plan_chat(
+                    subject,
+                    CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
+                    None,
+                ),
+            }
+            return self.refresh();
+        }
         if matches!(pending.work, Work::TestAi) {
             match result {
                 Ok(summary) => {
@@ -1228,6 +1304,7 @@ impl App {
                             .pick("✓ Çalışma planı oluşturuldu.", "✓ Study plan generated.")
                             .into();
                     }
+                    JobResult::PlanChat(_) => {}
                 }
             }
         }
@@ -1946,7 +2023,7 @@ impl App {
                     .unwrap_or((args.trim(), ""));
                 if matches!(sub, "olustur" | "create" | "generate" | "uret") {
                     if rest.trim().is_empty() {
-                        self.open_plan_gen_modal()?;
+                        self.open_plan_studio(ai_generate(&self.root))?;
                     } else {
                         let (days, tasks_per_day, focus) = bot::parse_plan_create_args(
                             rest,
@@ -2303,6 +2380,7 @@ impl App {
         self.coach_step = None;
         self.coach_ready = None;
         self.deneme_chat = None;
+        self.plan_chat = None;
         self.lesson = None;
         self.refresh()?;
         self.status = format!(
@@ -2373,6 +2451,7 @@ impl App {
             }
             Input::DenemeChat => self.send_deneme_chat(ai_generate(&self.root))?,
             Input::LessonChat => self.send_lesson_chat(ai_generate(&self.root))?,
+            Input::PlanChat => self.send_plan_chat(ai_generate(&self.root))?,
         }
         Ok(())
     }
@@ -2388,6 +2467,8 @@ impl App {
             self.load_denemeler()?;
         } else if tab == 4 && self.lesson.is_some() {
             self.editing = Some(Input::LessonChat);
+        } else if tab == PLAN_TAB && self.plan_chat.is_some() {
+            self.editing = Some(Input::PlanChat);
         }
         Ok(())
     }
@@ -2510,15 +2591,12 @@ impl App {
         let Some(chat) = self.deneme_chat.as_mut() else {
             return;
         };
-        let max = chat.max_scroll.get();
-        let current = if chat.follow {
-            max
-        } else {
-            chat.scroll.min(max)
-        };
-        let next = (i32::from(current) + delta).clamp(0, i32::from(max)) as u16;
-        chat.scroll = next;
-        chat.follow = next >= max;
+        scroll_turns(
+            &mut chat.scroll,
+            &mut chat.follow,
+            chat.max_scroll.get(),
+            delta,
+        );
     }
 
     /// Koç sohbetinde Enter. Yalnızca rakamlardan oluşan ve yanlışlardan biri olan bir numara o soruya
@@ -2733,6 +2811,210 @@ impl App {
         Ok(())
     }
 
+    /// Planla sekmesini açar; seçili ders için aktif tartışma yoksa yeni oturum başlatıp ilk AI sorularını ister.
+    fn open_plan_studio(
+        &mut self,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        let subject = self.subject()?;
+        self.tab = PLAN_TAB;
+        self.scroll = 0;
+        self.editing = Some(Input::PlanChat);
+        self.input.clear();
+        let has_active = self
+            .plan_chat
+            .as_ref()
+            .is_some_and(|chat| chat.subject == subject && !chat.turns.is_empty());
+        if has_active {
+            return Ok(());
+        }
+        self.plan_chat = Some(PlanChat {
+            subject,
+            turns: Vec::new(),
+            draft: None,
+            draft_day: 0,
+            auto_start: true,
+            follow: true,
+            scroll: 0,
+            max_scroll: Cell::new(0),
+        });
+        self.plan_chat_turn(String::new(), generate)
+    }
+
+    fn reset_plan_studio(
+        &mut self,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        if self.pending.is_some() {
+            self.status = self
+                .lang
+                .pick(
+                    "Önceki istek bitene kadar bekleyin.",
+                    "Wait for the active request to finish.",
+                )
+                .into();
+            return Ok(());
+        }
+        self.plan_chat = None;
+        self.open_plan_studio(generate)
+    }
+
+    fn plan_chat_turn(
+        &mut self,
+        question: String,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        if self.pending.is_some() {
+            self.status = self
+                .lang
+                .pick(
+                    "Önceki istek sürüyor…",
+                    "Previous request is still running…",
+                )
+                .into();
+            return Ok(());
+        }
+        let Some(chat) = self.plan_chat.as_mut() else {
+            return Ok(());
+        };
+        let kind = JobKind::PlanChat {
+            question: question.clone(),
+            history: plan_chat_history(&chat.turns, self.lang),
+            draft: chat.draft.clone(),
+        };
+        chat.turns.push(DenemeTurn {
+            question,
+            reply: CoachReply::Waiting,
+        });
+        let result = self.begin_ai_with(kind, generate);
+        if result.is_err() || self.pending.is_none() {
+            if let Some(chat) = self.plan_chat.as_mut() {
+                chat.turns.pop();
+            }
+            return result;
+        }
+        if let Some(chat) = self.plan_chat.as_mut() {
+            chat.follow = true;
+        }
+        result
+    }
+
+    fn send_plan_chat(
+        &mut self,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        let text = self.input.trim().to_string();
+        if text.is_empty() || self.plan_chat.is_none() {
+            return Ok(());
+        }
+        let idle = self.pending.is_none();
+        self.plan_chat_turn(text, generate)?;
+        if idle && self.pending.is_some() {
+            self.input.clear();
+        }
+        Ok(())
+    }
+
+    fn finish_plan_chat(
+        &mut self,
+        subject: &str,
+        reply: CoachReply,
+        new_draft: Option<Vec<crate::course::DayConfig>>,
+    ) {
+        let Some(chat) = self
+            .plan_chat
+            .as_mut()
+            .filter(|chat| chat.subject == subject)
+        else {
+            return;
+        };
+        if let Some(turn) = chat
+            .turns
+            .last_mut()
+            .filter(|turn| turn.reply == CoachReply::Waiting)
+        {
+            turn.reply = reply;
+        }
+        if let Some(days) = new_draft
+            && !days.is_empty()
+        {
+            chat.draft_day = chat.draft_day.min(days.len().saturating_sub(1));
+            chat.draft = Some(days);
+        }
+    }
+
+    fn scroll_plan_chat(&mut self, delta: i32) {
+        let Some(chat) = self.plan_chat.as_mut() else {
+            return;
+        };
+        scroll_turns(
+            &mut chat.scroll,
+            &mut chat.follow,
+            chat.max_scroll.get(),
+            delta,
+        );
+    }
+
+    fn step_draft_day(&mut self, delta: isize) {
+        let Some(chat) = self.plan_chat.as_mut() else {
+            return;
+        };
+        let Some(days) = chat.draft.as_ref().filter(|d| !d.is_empty()) else {
+            return;
+        };
+        let len = days.len() as isize;
+        chat.draft_day = (chat.draft_day as isize + delta).rem_euclid(len) as usize;
+    }
+
+    fn apply_plan_draft(&mut self) -> Result<()> {
+        if self.pending.is_some() {
+            self.status = self
+                .lang
+                .pick(
+                    "Yanıt gelene kadar bekleyin.",
+                    "Wait for the current response to finish.",
+                )
+                .into();
+            return Ok(());
+        }
+        let Some(chat) = self.plan_chat.as_ref() else {
+            return Ok(());
+        };
+        let Some(days) = chat.draft.clone().filter(|d| !d.is_empty()) else {
+            self.status = self
+                .lang
+                .pick(
+                    "Henüz kaydedilecek taslak plan yok. AI ile plan oluşturun.",
+                    "No draft plan to save yet. Discuss with AI to generate one.",
+                )
+                .into();
+            return Ok(());
+        };
+        let subject = chat.subject.clone();
+        let auto_start = chat.auto_start;
+        let msg = bot::apply_generated_plan(
+            &self.root,
+            &self.store,
+            &subject,
+            days,
+            auto_start,
+            Local::now().date_naive(),
+            self.lang,
+        )?;
+        self.plan_chat = None;
+        self.editing = None;
+        self.input.clear();
+        self.plan_view_day = None;
+        self.task_selected = 0;
+        self.show(&msg);
+        self.tab = 4;
+        self.status = self
+            .lang
+            .pick("✓ Çalışma planı oluşturuldu.", "✓ Study plan generated.")
+            .into();
+        self.refresh()
+    }
+
     /// `d`: seçili denemeyi silmek için onay ister; bir sonraki tuş karar verir.
     fn ask_deneme_delete(&mut self) {
         let Some(item) = self.deneme_items.get(self.deneme_selected) else {
@@ -2837,6 +3119,47 @@ impl App {
                 KeyCode::Down if input == Input::Answer => self.scroll_ask(1),
                 KeyCode::PageUp if input == Input::Answer => self.scroll_ask(-10),
                 KeyCode::PageDown if input == Input::Answer => self.scroll_ask(10),
+                // Planla sohbetinde Esc yazılanı siler / bekleyen işi durdurur / sohbetten çıkar.
+                KeyCode::Esc if input == Input::PlanChat && !self.input.is_empty() => {
+                    self.input.clear();
+                }
+                KeyCode::Esc if input == Input::PlanChat && self.pending.is_some() => {
+                    self.cancel_pending()?;
+                }
+                KeyCode::Esc if input == Input::PlanChat => {
+                    self.plan_chat = None;
+                    self.editing = None;
+                    self.scroll = 0;
+                }
+                KeyCode::Up if input == Input::PlanChat => self.scroll_plan_chat(-1),
+                KeyCode::Down if input == Input::PlanChat => self.scroll_plan_chat(1),
+                KeyCode::PageUp if input == Input::PlanChat => self.scroll_plan_chat(-10),
+                KeyCode::PageDown if input == Input::PlanChat => self.scroll_plan_chat(10),
+                KeyCode::Left if input == Input::PlanChat => self.step_draft_day(-1),
+                KeyCode::Right if input == Input::PlanChat => self.step_draft_day(1),
+                KeyCode::Char('s') if control && input == Input::PlanChat => {
+                    self.apply_plan_draft()?;
+                }
+                KeyCode::Char('b') if control && input == Input::PlanChat => {
+                    if let Some(chat) = self.plan_chat.as_mut() {
+                        chat.auto_start = !chat.auto_start;
+                        self.status = if chat.auto_start {
+                            self.lang.pick(
+                                "✓ Plan kaydedilince bugünden başlatılacak.",
+                                "✓ Plan will start today on save.",
+                            )
+                        } else {
+                            self.lang.pick(
+                                "✓ Plan yalnızca kaydedilecek (başlatılmayacak).",
+                                "✓ Plan will be saved without starting today.",
+                            )
+                        }
+                        .into();
+                    }
+                }
+                KeyCode::Char('n') if control && input == Input::PlanChat => {
+                    self.reset_plan_studio(ai_generate(&self.root))?;
+                }
                 KeyCode::Esc => {
                     self.input.clear();
                     self.editing = None;
@@ -2849,11 +3172,13 @@ impl App {
                 KeyCode::Char('u') if control => self.input.clear(),
                 KeyCode::Char(_) if control => self.status = ignored_key(&key, self.lang),
                 KeyCode::Char(ch) => self.input.push(ch),
-                KeyCode::Tab if matches!(input, Input::Answer | Input::LessonChat) => {
+                KeyCode::Tab
+                    if matches!(input, Input::Answer | Input::LessonChat | Input::PlanChat) =>
+                {
                     self.editing = None;
                     self.select_tab((self.tab + 1) % TABS.len())?;
                 }
-                KeyCode::BackTab if input == Input::LessonChat => {
+                KeyCode::BackTab if matches!(input, Input::LessonChat | Input::PlanChat) => {
                     self.editing = None;
                     self.select_tab((self.tab + TABS.len() - 1) % TABS.len())?;
                 }
@@ -2928,7 +3253,7 @@ impl App {
         match key.code {
             KeyCode::Tab => self.select_tab((self.tab + 1) % TABS.len())?,
             KeyCode::BackTab => self.select_tab((self.tab + TABS.len() - 1) % TABS.len())?,
-            KeyCode::Char(ch @ '1'..='6') => self.select_tab((ch as u8 - b'1') as usize)?,
+            KeyCode::Char(ch @ '1'..='7') => self.select_tab((ch as u8 - b'1') as usize)?,
             KeyCode::Up | KeyCode::Down
                 if self.tab == DENEME_TAB && !self.deneme_items.is_empty() =>
             {
@@ -2996,6 +3321,7 @@ impl App {
                 self.coach_step = None;
                 self.coach_ready = None;
                 self.deneme_chat = None;
+                self.plan_chat = None;
                 self.lesson = None;
                 self.refresh()?;
             }
@@ -3026,15 +3352,22 @@ impl App {
             KeyCode::Char('g')
                 if self.tab == 4 && self.session.is_none() && self.lesson.is_none() =>
             {
-                self.open_plan_gen_modal()?
+                self.open_plan_studio(ai_generate(&self.root))?
             }
             KeyCode::Char('e')
-                if self.tab == 4 && self.session.is_none() && self.lesson.is_none() =>
+                if (self.tab == 4 && self.session.is_none() && self.lesson.is_none())
+                    || self.tab == PLAN_TAB =>
             {
                 self.open_plan_edit_modal()?
             }
+            KeyCode::Char('n') if self.tab == PLAN_TAB => {
+                self.open_plan_studio(ai_generate(&self.root))?
+            }
             KeyCode::Enter if matches!(self.tab, 1 | 2) => self.quiz_enter()?,
             KeyCode::Enter if self.tab == 4 => self.plan_enter()?,
+            KeyCode::Enter if self.tab == PLAN_TAB => {
+                self.open_plan_studio(ai_generate(&self.root))?
+            }
             KeyCode::Enter if self.tab == DENEME_TAB => {
                 self.open_deneme_chat(ai_generate(&self.root))?
             }
@@ -3068,12 +3401,6 @@ impl App {
 
     fn handle_modal_key(&mut self, key: KeyEvent, control: bool) -> Result<()> {
         match self.modal.take() {
-            Some(Modal::PlanGen(mut modal)) => {
-                let keep = self.handle_plan_gen_key(&mut modal, key, control)?;
-                if keep {
-                    self.modal = Some(Modal::PlanGen(modal));
-                }
-            }
             Some(Modal::PlanEdit(mut modal)) => {
                 let keep = self.handle_plan_edit_key(&mut modal, key, control)?;
                 if keep {
@@ -3089,95 +3416,6 @@ impl App {
             None => {}
         }
         Ok(())
-    }
-
-    fn handle_plan_gen_key(
-        &mut self,
-        m: &mut PlanGenModal,
-        key: KeyEvent,
-        control: bool,
-    ) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc => return Ok(false),
-            KeyCode::Tab | KeyCode::Down => m.field = (m.field + 1) % 5,
-            KeyCode::BackTab | KeyCode::Up => m.field = (m.field + 4) % 5,
-            KeyCode::Left | KeyCode::Right if m.field == 1 => {
-                let delta = if key.code == KeyCode::Right { 1 } else { 2 };
-                m.intensity = (m.intensity + delta) % 3;
-            }
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if m.field == 3 => {
-                m.auto_start = !m.auto_start;
-            }
-            KeyCode::Backspace => match m.field {
-                0 => {
-                    m.days_or_date.pop();
-                    m.error = None;
-                }
-                2 => {
-                    m.focus.pop();
-                    m.error = None;
-                }
-                _ => {}
-            },
-            KeyCode::Char('u') if control => match m.field {
-                0 => {
-                    m.days_or_date.clear();
-                    m.error = None;
-                }
-                2 => {
-                    m.focus.clear();
-                    m.error = None;
-                }
-                _ => {}
-            },
-            KeyCode::Char('s') if control => {
-                return self.submit_plan_gen_with(m, ai_generate(&self.root));
-            }
-            KeyCode::Enter => {
-                return self.submit_plan_gen_with(m, ai_generate(&self.root));
-            }
-            KeyCode::Char(ch) if !control => match m.field {
-                0 => {
-                    m.days_or_date.push(ch);
-                    m.error = None;
-                }
-                2 => {
-                    m.focus.push(ch);
-                    m.error = None;
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        Ok(true)
-    }
-
-    fn submit_plan_gen_with(
-        &mut self,
-        m: &mut PlanGenModal,
-        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
-    ) -> Result<bool> {
-        match m.validate(self.lang) {
-            Ok(days) => {
-                let tasks_per_day = m.tasks_per_day();
-                let focus = m.focus.trim().to_string();
-                let auto_start = m.auto_start;
-                self.begin_ai_with(
-                    JobKind::GeneratePlan {
-                        days,
-                        tasks_per_day,
-                        focus,
-                        auto_start,
-                    },
-                    generate,
-                )?;
-                Ok(false)
-            }
-            Err(err) => {
-                m.error = Some(err);
-                Ok(true)
-            }
-        }
     }
 
     fn handle_plan_edit_key(
@@ -4203,7 +4441,11 @@ mod tests {
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, DENEME_TAB);
         key(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, PLAN_TAB);
+        key(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, 0);
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, PLAN_TAB);
         key(&mut app, KeyCode::BackTab);
         assert_eq!(app.tab, DENEME_TAB);
         key(&mut app, KeyCode::BackTab);
@@ -5110,7 +5352,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_plan_generator_and_manual_editor_modals_persist_course_json() {
+    fn tui_plan_studio_discussion_draft_and_manual_editor_persist_course_json() {
         let (root, mut app) = setup();
         let meta = crate::course::CourseConfig {
             title: Some("Özel Başlık".into()),
@@ -5121,24 +5363,36 @@ mod tests {
         meta.save(root.path(), "Ders").unwrap();
         app.refresh().unwrap();
 
-        // Today tab -> 'g' opens AI Plan Generator modal.
-        key(&mut app, KeyCode::Char('5'));
-        assert_eq!(app.tab, 4);
-        key(&mut app, KeyCode::Char('g'));
-        assert!(matches!(app.modal, Some(Modal::PlanGen(_))));
+        // Tab 7 opens Planla idle screen without firing an AI request automatically.
+        key(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.tab, PLAN_TAB);
+        assert!(app.plan_chat.is_none());
+        assert!(app.pending.is_none());
 
-        // Fill in 2 days and a focus note, then submit via test generator.
-        let mut gen_modal = match app.modal.take() {
-            Some(Modal::PlanGen(mut m)) => {
-                m.days_or_date = "2".into();
-                m.focus = "Bağlaçlar".into();
-                m
-            }
-            _ => unreachable!(),
-        };
-        app.submit_plan_gen_with(&mut gen_modal, |prompt, _| {
+        // Start planning via open_plan_studio (same path as Today -> 'g' and /plan olustur).
+        app.open_plan_studio(|_prompt, _| {
+            Ok(serde_json::json!({
+                "reply": "Hedef süreniz kaç gün ve günde kaç saat ayırabilirsiniz?",
+                "days": []
+            })
+            .to_string())
+        })
+        .unwrap();
+        complete(&mut app);
+        let chat = app.plan_chat.as_ref().unwrap();
+        assert_eq!(chat.turns.len(), 1);
+        assert_eq!(
+            chat.turns[0].reply,
+            CoachReply::Answer("Hedef süreniz kaç gün ve günde kaç saat ayırabilirsiniz?".into())
+        );
+        assert!(chat.draft.is_none());
+
+        // Reply with preferences -> AI returns a 2-day draft plan.
+        app.input = "2 gün, Bağlaçlar odaklı olsun".into();
+        app.send_plan_chat(|prompt, _| {
             assert!(prompt.contains("Bağlaçlar"));
             Ok(serde_json::json!({
+                "reply": "İşte 2 günlük taslak planınız. Değişiklik ister misiniz?",
                 "days": [
                     {"day": 1, "title": "Gün 1", "tasks": [{"command": "/anlat Bağlaçlar", "label": "Konu: Bağlaçlar"}]},
                     {"day": 2, "title": "Gün 2", "tasks": [{"command": "/quiz Bağlaçlar 5", "label": "Quiz: Bağlaçlar"}]}
@@ -5148,6 +5402,35 @@ mod tests {
         })
         .unwrap();
         complete(&mut app);
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.plan_chat
+                .as_ref()
+                .and_then(|c| c.draft.as_ref())
+                .map(Vec::len),
+            Some(2)
+        );
+
+        // Navigate draft days with Right/Left while editing.
+        key(&mut app, KeyCode::Right);
+        assert_eq!(app.plan_chat.as_ref().unwrap().draft_day, 1);
+        key(&mut app, KeyCode::Left);
+        assert_eq!(app.plan_chat.as_ref().unwrap().draft_day, 0);
+
+        // Toggle auto_start with Ctrl+B, then toggle back to true.
+        app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(!app.plan_chat.as_ref().unwrap().auto_start);
+        app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.plan_chat.as_ref().unwrap().auto_start);
+
+        // Approve and save with Ctrl+S -> switches to Today tab and persists course.json.
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.plan_chat.is_none());
+        assert_eq!(app.editing, None);
+        assert_eq!(app.tab, 4);
         assert_eq!(app.course.title.as_deref(), Some("Özel Başlık"));
         assert_eq!(app.course.plan.len(), 2);
 
@@ -5173,6 +5456,21 @@ mod tests {
         assert_eq!(saved.plan.len(), 3);
         assert_eq!(saved.plan[2].title, "Gün 3!");
         assert_eq!(saved.plan[2].tasks[0].label, "Okuma 10 sayfa");
+
+        // Cancelling a pending PlanChat turn via /iptal pops the Waiting turn,
+        // and switching course via /ders clears plan_chat cleanly.
+        app.open_plan_studio(|_prompt, _| {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(r#"{"reply":"late","days":[]}"#.into())
+        })
+        .unwrap();
+        assert_eq!(app.plan_chat.as_ref().unwrap().turns.len(), 1);
+        app.command("/iptal", "").unwrap();
+        assert!(app.pending.is_none());
+        assert!(app.plan_chat.as_ref().unwrap().turns.is_empty());
+
+        app.command("/ders", "Diğer").unwrap();
+        assert!(app.plan_chat.is_none());
     }
 
     #[test]

@@ -293,6 +293,32 @@ pub fn vocab_request(course: &CourseConfig, topic: &str, count: usize, lang: Lan
     }
 }
 
+fn plan_day_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "day": { "type": "integer", "minimum": 1 },
+            "title": { "type": "string", "minLength": 1 },
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": crate::plan::MAX_TASKS_PER_DAY,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "command": { "type": "string" },
+                        "label": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["command", "label"]
+                }
+            }
+        },
+        "required": ["day", "title", "tasks"]
+    })
+}
+
 pub fn plan_schema(days: usize) -> String {
     json!({
         "type": "object",
@@ -302,32 +328,27 @@ pub fn plan_schema(days: usize) -> String {
                 "type": "array",
                 "minItems": days,
                 "maxItems": days,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "day": { "type": "integer", "minimum": 1 },
-                        "title": { "type": "string", "minLength": 1 },
-                        "tasks": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": crate::plan::MAX_TASKS_PER_DAY,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "command": { "type": "string" },
-                                    "label": { "type": "string", "minLength": 1 }
-                                },
-                                "required": ["command", "label"]
-                            }
-                        }
-                    },
-                    "required": ["day", "title", "tasks"]
-                }
+                "items": plan_day_schema()
             }
         },
         "required": ["days"]
+    })
+    .to_string()
+}
+
+pub fn plan_chat_schema() -> String {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "reply": { "type": "string", "minLength": 1 },
+            "days": {
+                "type": "array",
+                "maxItems": crate::plan::MAX_PLAN_DAYS,
+                "items": plan_day_schema()
+            }
+        },
+        "required": ["reply", "days"]
     })
     .to_string()
 }
@@ -366,18 +387,29 @@ struct GeneratedPlan {
     days: Vec<DayConfig>,
 }
 
-pub fn parse_plan(raw: &str, expected_days: usize) -> Result<Vec<DayConfig>> {
-    let cleaned = strip_code_fence(raw);
-    let parsed: GeneratedPlan = serde_json::from_str(cleaned)?;
-    if parsed.days.len() != expected_days {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanChatReply {
+    pub reply: String,
+    pub days: Vec<DayConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPlanChatReply {
+    reply: String,
+    days: Vec<DayConfig>,
+}
+
+fn normalize_plan_days(days: Vec<DayConfig>) -> Result<Vec<DayConfig>> {
+    if days.len() > crate::plan::MAX_PLAN_DAYS {
         return Err(invalid(format!(
-            "AI {} günlük plan döndürdü; {expected_days} gün bekleniyordu / AI returned {} day(s); expected {expected_days}.",
-            parsed.days.len(),
-            parsed.days.len()
+            "Plan en fazla {} gün olabilir / Plan can be at most {} days.",
+            crate::plan::MAX_PLAN_DAYS,
+            crate::plan::MAX_PLAN_DAYS
         )));
     }
-    let mut normalized = Vec::with_capacity(expected_days);
-    for (idx, day) in parsed.days.into_iter().enumerate() {
+    let mut normalized = Vec::with_capacity(days.len());
+    for (idx, day) in days.into_iter().enumerate() {
         let title = day.title.trim().to_string();
         if title.is_empty() {
             return Err(invalid(
@@ -415,19 +447,42 @@ pub fn parse_plan(raw: &str, expected_days: usize) -> Result<Vec<DayConfig>> {
     Ok(normalized)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn plan_request(
+pub fn parse_plan(raw: &str, expected_days: usize) -> Result<Vec<DayConfig>> {
+    let cleaned = strip_code_fence(raw);
+    let parsed: GeneratedPlan = serde_json::from_str(cleaned)?;
+    if parsed.days.len() != expected_days {
+        return Err(invalid(format!(
+            "AI {} günlük plan döndürdü; {expected_days} gün bekleniyordu / AI returned {} day(s); expected {expected_days}.",
+            parsed.days.len(),
+            parsed.days.len()
+        )));
+    }
+    normalize_plan_days(parsed.days)
+}
+
+pub fn parse_plan_chat(raw: &str) -> Result<PlanChatReply> {
+    let cleaned = strip_code_fence(raw);
+    let parsed: RawPlanChatReply = serde_json::from_str(cleaned)?;
+    let reply = parsed.reply.trim().to_string();
+    if reply.is_empty() {
+        return Err(invalid(
+            "AI plan danışmanı boş yanıt döndürdü / AI plan assistant returned an empty reply.",
+        ));
+    }
+    let days = if parsed.days.is_empty() {
+        Vec::new()
+    } else {
+        normalize_plan_days(parsed.days)?
+    };
+    Ok(PlanChatReply { reply, days })
+}
+
+fn plan_context_blocks(
     course: &CourseConfig,
-    subject: &str,
-    days: usize,
-    tasks_per_day: usize,
-    focus: &str,
     catalog: &[String],
     weak_topics: &[(String, i64, i64)],
-    due_reviews: i64,
     lang: Lang,
-) -> (String, Option<String>) {
-    let title = course.display_title(subject);
+) -> (String, String, String) {
     let catalog_block = if catalog.is_empty() {
         lang.pick("(dosya listesi yok)", "(no file catalog)")
             .to_string()
@@ -456,6 +511,24 @@ pub fn plan_request(
             .collect::<Vec<_>>()
             .join(", ")
     };
+    (catalog_block, categories_block, weak_block)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_request(
+    course: &CourseConfig,
+    subject: &str,
+    days: usize,
+    tasks_per_day: usize,
+    focus: &str,
+    catalog: &[String],
+    weak_topics: &[(String, i64, i64)],
+    due_reviews: i64,
+    lang: Lang,
+) -> (String, Option<String>) {
+    let title = course.display_title(subject);
+    let (catalog_block, categories_block, weak_block) =
+        plan_context_blocks(course, catalog, weak_topics, lang);
     let focus_trimmed = focus.trim();
     let (focus_block, inner_nonce) = if focus_trimmed.is_empty() {
         (String::new(), None)
@@ -519,6 +592,116 @@ pub fn plan_request(
         }
     };
     (text, inner_nonce)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_chat_request(
+    course: &CourseConfig,
+    subject: &str,
+    question: &str,
+    current_draft: Option<&[DayConfig]>,
+    catalog: &[String],
+    weak_topics: &[(String, i64, i64)],
+    due_reviews: i64,
+    lang: Lang,
+) -> (String, Option<String>) {
+    let title = course.display_title(subject);
+    let (catalog_block, categories_block, weak_block) =
+        plan_context_blocks(course, catalog, weak_topics, lang);
+    let nonce = untrusted_nonce();
+    let draft_source = current_draft.unwrap_or(&course.plan);
+    let draft_label = if current_draft.is_some() {
+        "draft"
+    } else {
+        "existing_plan"
+    };
+    let draft_block = if draft_source.is_empty() {
+        String::new()
+    } else {
+        let json_plan = serde_json::to_string(draft_source).unwrap_or_default();
+        let fenced = fence_untrusted(draft_label, &nonce, &json_plan);
+        match (lang, current_draft.is_some()) {
+            (Lang::Tr, true) => {
+                format!("\nÜzerinde çalışılan mevcut taslak plan (JSON):\n{fenced}")
+            }
+            (Lang::Tr, false) => {
+                format!("\nDerste halihazırda kayıtlı plan (JSON):\n{fenced}")
+            }
+            (Lang::En, true) => format!("\nCurrent working draft schedule (JSON):\n{fenced}"),
+            (Lang::En, false) => format!("\nCurrently saved course schedule (JSON):\n{fenced}"),
+        }
+    };
+    let q_trimmed = question.trim();
+    let asked_block = if q_trimmed.is_empty() {
+        match lang {
+            Lang::Tr => {
+                "(İlk açılış turu: öğrenci yeni bir planlama tartışması başlattı.)".to_string()
+            }
+            Lang::En => {
+                "(Opening turn: the student just started a planning discussion.)".to_string()
+            }
+        }
+    } else {
+        let fenced = fence_untrusted("message", &nonce, q_trimmed);
+        match lang {
+            Lang::Tr => format!("Öğrencinin mesajı:\n{fenced}"),
+            Lang::En => format!("Student message:\n{fenced}"),
+        }
+    };
+    let text = match lang {
+        Lang::Tr => {
+            let cat_line = if categories_block.is_empty() {
+                String::new()
+            } else {
+                format!("\nSınav kategorileri: {categories_block}")
+            };
+            format!(
+                "Sen '{title}' dersi için öğrenciyle birlikte çalışan etkileşimli ÇALIŞMA PLANI danışmanısın.{cat_line}\n\
+                Mevcut ders materyalleri:\n{catalog_block}\n\
+                Öğrencinin zayıf konuları: {weak_block} · Bekleyen tekrar: {due_reviews}{draft_block}\n\
+                {asked_block}\n\n\
+                GÖREVİN VE JSON ÇIKTI KURALLARI:\n\
+                1) Yalnızca `{{\"reply\": \"...\", \"days\": [...]}}` biçiminde geçerli JSON döndür.\n\
+                2) İlk açılış turunda veya planı netleştirmek için önemli bilgiler eksikse (ör. toplam gün/hedef sınav tarihi, günlük çalışma temposu, odaklanmak istediği konular, mevcut plan varsa sıfırdan mı yoksa revize mi istediği) ÖNCE kısa, net 2-4 soru sor ve `days` dizisini boş (`[]`) bırak.\n\
+                3) Öğrenci yeterli bilgi verdiğinde veya plan taslağı oluşturmanı/güncellemeni istediğinde: `reply` alanında yaklaşımını özetle (varsa değişiklik isteyip istemediğini sor), `days` dizisinde tam 1..=90 günlük planı ver.\n\
+                4) Mevcut bir taslak üzerinde sadece soru soruluyorsa veya değişiklik gerekmiyorsa `reply` ile yanıtla ve `days` dizisini `[]` bırak (taslak korunur); değişiklik istenirse güncel tam `days` dizisini döndür.\n\
+                5) `days` dolu olduğunda her gün ardışık `day: 1..=N`, kısa `title` ve 1..=6 görev içermeli. Her görevde `label` Türkçe açıklayıcı görev adı, `command` ise yalnızca şu komutlardan biri (veya elle okuma görevi için `\"\"`) olsun:\n\
+                   - \"/anlat <konu>\"\n\
+                   - \"/quiz <konu> [5-10]\"\n\
+                   - \"/kelime <konu> [15-25]\"\n\
+                   - \"/tekrar\"\n\
+                   - \"/deneme\"\n\
+                   - \"\"\n\
+                6) JSON dışında metin yazma."
+            )
+        }
+        Lang::En => {
+            let cat_line = if categories_block.is_empty() {
+                String::new()
+            } else {
+                format!("\nExam categories: {categories_block}")
+            };
+            format!(
+                "You are an interactive STUDY PLANNER collaborating with the student for '{title}'.{cat_line}\n\
+                Available course files:\n{catalog_block}\n\
+                Weakest topics: {weak_block} · Due reviews: {due_reviews}{draft_block}\n\
+                {asked_block}\n\n\
+                ROLE & JSON OUTPUT RULES:\n\
+                1) Return valid JSON ONLY in the form `{{\"reply\": \"...\", \"days\": [...]}}`.\n\
+                2) On the opening turn or whenever key details are missing (e.g., total days/target exam date, daily study intensity, priority/weak topics, or whether to revise an existing plan vs start fresh), ask 2-4 concise clarifying questions first in `reply` and set `days` to `[]`.\n\
+                3) Once you have enough context or the student asks to draft/revise the schedule: summarize the plan in `reply` (asking if they want tweaks) and provide the full 1..=90 day schedule in `days`.\n\
+                4) If answering a question without modifying an existing draft, reply in `reply` and set `days` to `[]` (the existing draft stays intact); when modifying, return the full updated `days` array.\n\
+                5) Whenever `days` is non-empty, number days sequentially `1..=N` with concise `title` and 1..=6 tasks. Each task needs a clear English `label` and `command` equal to `\"\"` or one of:\n\
+                   - \"/lesson <topic>\"\n\
+                   - \"/quiz <topic> [5-10]\"\n\
+                   - \"/cards <topic> [15-25]\"\n\
+                   - \"/review\"\n\
+                   - \"/exam\"\n\
+                6) Return JSON only."
+            )
+        }
+    };
+    (text, Some(nonce))
 }
 
 pub fn quiz_schema_for(count: usize, choices_count: usize) -> String {
@@ -2946,6 +3129,48 @@ mod tests {
         let schema: Value = serde_json::from_str(&plan_schema(2)).unwrap();
         assert_eq!(schema["properties"]["days"]["minItems"], 2);
         assert_eq!(schema["properties"]["days"]["maxItems"], 2);
+    }
+
+    #[test]
+    fn parse_plan_chat_supports_questions_and_draft_updates() {
+        let questions_only = r#"{"reply":"Hedef tarihiniz nedir?","days":[]}"#;
+        let q = parse_plan_chat(questions_only).unwrap();
+        assert_eq!(q.reply, "Hedef tarihiniz nedir?");
+        assert!(q.days.is_empty());
+
+        let with_draft = r#"```json
+        {
+          "reply": "İşte 2 günlük taslak plan.",
+          "days": [
+            {
+              "day": 7,
+              "title": "Temeller",
+              "tasks": [
+                { "command": "/anlat Zamanlar", "label": "Konu: Zamanlar" },
+                { "command": "/badcmd", "label": "Okuma" }
+              ]
+            },
+            {
+              "day": 9,
+              "title": "Pratik",
+              "tasks": [
+                { "command": "/tekrar", "label": "Tekrar" }
+              ]
+            }
+          ]
+        }
+        ```"#;
+        let d = parse_plan_chat(with_draft).unwrap();
+        assert_eq!(d.reply, "İşte 2 günlük taslak plan.");
+        assert_eq!(d.days.len(), 2);
+        assert_eq!(d.days[0].day, 1);
+        assert_eq!(d.days[0].tasks[1].command, "");
+        assert_eq!(d.days[1].day, 2);
+
+        assert!(parse_plan_chat(r#"{"reply":"   ","days":[]}"#).is_err());
+
+        let schema: Value = serde_json::from_str(&plan_chat_schema()).unwrap();
+        assert_eq!(schema["required"], json!(["reply", "days"]));
     }
 
     #[test]

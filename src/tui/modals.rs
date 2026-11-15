@@ -3,70 +3,13 @@ use crate::{
     config::{self, AiConfig, AiEffort, AiProvider},
     course::{DayConfig, TaskConfig},
     i18n::Lang,
-    invalid, plan,
+    invalid,
 };
-use chrono::Local;
 
 #[derive(Clone, Debug)]
 pub enum Modal {
-    PlanGen(PlanGenModal),
     PlanEdit(PlanEditModal),
     AiSettings(Box<AiSettingsModal>),
-}
-
-#[derive(Clone, Debug)]
-pub struct PlanGenModal {
-    pub days_or_date: String,
-    pub intensity: usize,
-    pub focus: String,
-    pub auto_start: bool,
-    pub field: usize,
-    pub error: Option<String>,
-}
-
-impl PlanGenModal {
-    pub fn new(default_days: usize) -> Self {
-        Self {
-            days_or_date: default_days.max(1).to_string(),
-            intensity: 1,
-            focus: String::new(),
-            auto_start: true,
-            field: 0,
-            error: None,
-        }
-    }
-
-    pub fn tasks_per_day(&self) -> usize {
-        match self.intensity {
-            0 => 2,
-            1 => 3,
-            _ => 4,
-        }
-    }
-
-    pub fn validate(&self, lang: Lang) -> std::result::Result<usize, String> {
-        let today = Local::now().date_naive();
-        plan::parse_days_or_target_date(&self.days_or_date, today).map_err(|kind| match kind {
-            "past" => lang
-                .pick(
-                    "Hedef tarih bugünden önce olamaz.",
-                    "Target date cannot be in the past.",
-                )
-                .to_string(),
-            "range" => lang
-                .pick(
-                    "Gün sayısı 1–90 arasında olmalı.",
-                    "Plan length must be between 1 and 90 days.",
-                )
-                .to_string(),
-            _ => lang
-                .pick(
-                    "Geçerli gün (1-90) veya tarih (YYYY-MM-DD / GG.AA.YYYY) girin.",
-                    "Enter days (1-90) or date (YYYY-MM-DD / DD.MM.YYYY).",
-                )
-                .to_string(),
-        })
-    }
 }
 
 #[derive(Clone, Debug)]
