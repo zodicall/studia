@@ -39,7 +39,7 @@ If you work in an offline environment, `cargo test --offline --locked` runs the 
 - **Safety & Stability**:
   - Zero `.unwrap()`, `.expect()`, or `todo!()` in non-`#[cfg(test)]` production paths.
   - Zero `eprintln!` inside TUI code (`src/tui.rs`, `src/tui/`).
-  - Never commit `.env`, databases (`*.db`), private study materials (`kaynaklar/`, `data/`, `anki/`), personal filesystem paths, or tokens.
+  - Never commit `.env`, databases (`*.db`), private study materials (`resources/`, `data/`, `anki/`), personal filesystem paths, or tokens.
 
 ## Licensing & Copyright Policy
 

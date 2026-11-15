@@ -9,8 +9,8 @@
 
 | ID | Requirement |
 | :--- | :--- |
-| `REL-1` | Ship only clean public project files in the repository. Personal/local workspace directories (`kaynaklar/`, `data/`, `.cargo/`, `tools/`) stay excluded via `.gitignore`. |
-| `REL-2` | Configure `Cargo.toml` (`rust-version = "1.89"`, `license = "MIT"`, `description`, `repository`, `readme = "README.md"`, `keywords`, valid `crates.io` `categories = ["command-line-utilities"]`). Include standard MIT `LICENSE` (`2026`), `.gitattributes` (`* text=auto eol=lf`), `.gitignore` (ignoring `.env`, `.env.*`, `!.env.example`, `*.db`, `data/`, `kaynaklar/`, `anki/`, `target/`, `target_test/`, `.cargo/`, `tools/`), and clean `.env.example`. |
+| `REL-1` | Ship only clean public project files in the repository. Personal/local workspace directories (`resources/`, `data/`, `.cargo/`, `tools/`) stay excluded via `.gitignore`. |
+| `REL-2` | Configure `Cargo.toml` (`rust-version = "1.89"`, `license = "MIT"`, `description`, `repository`, `readme = "README.md"`, `keywords`, valid `crates.io` `categories = ["command-line-utilities"]`). Include standard MIT `LICENSE` (`2026`), `.gitattributes` (`* text=auto eol=lf`), `.gitignore` (ignoring `.env`, `.env.*`, `!.env.example`, `*.db`, `data/`, `resources/`, `anki/`, `target/`, `target_test/`, `.cargo/`, `tools/`), and clean `.env.example`. |
 
 ---
 

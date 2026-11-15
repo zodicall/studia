@@ -22,16 +22,16 @@
 
 - **Terminal TUI & Telegram Bot**: Study locally in a 6-tab keyboard-driven terminal UI (`Ask`, `Quiz`, `Review`, `Stats`, `Today`, `Exams`) or remotely via Telegram using the same SQLite database (`data/studia.db`).
 - **Live Bilingual Experience (`en` / `tr`)**: Auto-detects OS language (`--lang > stored > STUDIA_LANG > OS locale > en`), switchable live with `F4` in the TUI or `/lang tr|en` in Telegram/TUI.
-- **Course-Agnostic Design**: Drop notes under `kaynaklar/<course>/` and optionally customize persona, mock exam question counts/categories/rules, and multi-day study plans in `course.json`.
+- **Course-Agnostic Design**: Drop notes under `resources/<course>/` and optionally customize persona, mock exam question counts/categories/rules, and multi-day study plans in `course.json`.
 - **Flexible AI Backends**: Works with Gemini HTTP API, OpenAI (or Ollama / any OpenAI-compatible endpoint via `STUDIA_AI_BASE_URL`), AI CLIs (`agy`, `claude`, `codex`, `gemini`), or custom command templates (`STUDIA_AI_PROVIDER=custom`).
 - **Spaced Repetition & Anki**: Incorrect answers enter a 5-box Leitner schedule and generate fresh AI variation questions on review; flashcards export directly to tab-separated `.txt` decks under `anki/`.
-- **Offline Diagnostics**: `studia doctor` verifies `kaynaklar/`, `curl`, `pdftotext`, AI configuration, `.env` file permissions, and SQLite integrity (`PRAGMA quick_check`).
+- **Offline Diagnostics**: `studia doctor` verifies `resources/`, `curl`, `pdftotext`, AI configuration, `.env` file permissions, and SQLite integrity (`PRAGMA quick_check`).
 
 ## How It Works
 
 ```mermaid
 flowchart LR
-  Notes["kaynaklar/course/\npdf · docx · md · txt · course.json"] --> Indexer["Local Indexer"]
+  Notes["resources/course/\npdf · docx · md · txt · course.json"] --> Indexer["Local Indexer"]
   Indexer --> DB[("SQLite (data/studia.db)\nLeitner 1-5 · Plans · History")]
   DB <--> TUI["Terminal TUI (ratatui)"]
   DB <--> Bot["Telegram Bot (studia listen)"]
@@ -66,9 +66,9 @@ cargo build --release --locked
 2. Create a course folder and add your study notes (or copy a template from [`examples/`](examples/)):
 
    ```bash
-   mkdir -p kaynaklar/Calculus
-   # Add .md, .txt, .docx, or .pdf files inside kaynaklar/Calculus/
-   cp examples/general-course/course.json kaynaklar/Calculus/course.json
+   mkdir -p resources/Calculus
+   # Add .md, .txt, .docx, or .pdf files inside resources/Calculus/
+   cp examples/general-course/course.json resources/Calculus/course.json
    ```
 
 3. Run offline diagnostics, index sources, and launch the TUI:
@@ -119,7 +119,7 @@ When `STUDIA_AI_PROVIDER=auto`, the order checked is: `GEMINI_API_KEY` → `OPEN
 
 ## Customizing Courses (`course.json`)
 
-Place an optional `course.json` inside `kaynaklar/<course>/` to tailor:
+Place an optional `course.json` inside `resources/<course>/` to tailor:
 
 - **`title` & `persona`**: Display name and AI tutor instructions.
 - **`exam`**: Question count (`1..=200`), choices count (`4` or `5`), weighted categories, and exam rules.

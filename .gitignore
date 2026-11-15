@@ -1,7 +1,7 @@
 target/
 target_test/
 data/
-kaynaklar/
+resources/
 anki/
 .cargo/
 tools/

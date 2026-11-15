@@ -76,9 +76,9 @@ const PLAN_FINISHED: &str =
 const PLAN_FINISHED_EN: &str =
     "Study plan finished: exam day has passed. Run /plan start [date] to start a new plan.";
 const PLAN_NONE: &str =
-    "Bu ders için çalışma planı tanımlı değil (kaynaklar/<ders>/course.json ile ekleyebilirsiniz).";
+    "Bu ders için çalışma planı tanımlı değil (resources/<ders>/course.json ile ekleyebilirsiniz).";
 const PLAN_NONE_EN: &str =
-    "No study plan defined for this course (you can add one via kaynaklar/<course>/course.json).";
+    "No study plan defined for this course (you can add one via resources/<course>/course.json).";
 const STALE_BUTTON: &str = "Bu düğme artık geçerli değil.";
 const STALE_BUTTON_EN: &str = "This button is no longer active.";
 
@@ -552,8 +552,8 @@ pub fn subjects_text_in(store: &Store, root: &Path, wrong: bool, lang: Lang) -> 
     }
     Ok(if lines.is_empty() {
         lang.pick(
-            "Ders yok. kaynaklar/<ders>/ klasörüne belge ekleyin.",
-            "No courses found. Add materials under kaynaklar/<course>/.",
+            "Ders yok. resources/<ders>/ klasörüne belge ekleyin.",
+            "No courses found. Add materials under resources/<course>/.",
         )
         .into()
     } else {
@@ -866,7 +866,7 @@ impl Session {
         started: DateTime<Utc>,
     ) -> Result<Self> {
         if questions.is_empty() {
-            return Err(invalid("Cevaplanmamış soru yok."));
+            return Err(invalid("Cevaplanmamış soru yok / No unanswered questions."));
         }
         let kind = if is_exam { "exam" } else { "quiz" };
         let id = store.start_session_with_kind(subject, topic, kind, &started.to_rfc3339())?;
@@ -1870,7 +1870,13 @@ pub fn failure_text_in(kind: &JobKind, lang: Lang) -> &'static str {
     }
 }
 
-pub fn save_job(store: &mut Store, subject: &str, kind: &JobKind, raw: &str) -> Result<JobResult> {
+pub fn save_job_in(
+    store: &mut Store,
+    subject: &str,
+    kind: &JobKind,
+    raw: &str,
+    lang: Lang,
+) -> Result<JobResult> {
     match kind {
         JobKind::Answer { question } => {
             let answer = ai::parse_answer(raw)?;
@@ -1879,7 +1885,11 @@ pub fn save_job(store: &mut Store, subject: &str, kind: &JobKind, raw: &str) -> 
         }
         JobKind::Deneme { count } => {
             let questions = ai::parse_quiz(raw, *count)?;
-            let stored = store.add_exam_questions(subject, "Deneme Sınavı", questions)?;
+            let stored = store.add_exam_questions(
+                subject,
+                lang.pick("Deneme Sınavı", "Mock Exam"),
+                questions,
+            )?;
             Ok(JobResult::Quiz(stored))
         }
         JobKind::Quiz { topic, count } => Ok(JobResult::Quiz(store.add_questions(
@@ -1889,7 +1899,8 @@ pub fn save_job(store: &mut Store, subject: &str, kind: &JobKind, raw: &str) -> 
         )?)),
         JobKind::ReviewVariations { due_questions } => {
             let variations = ai::parse_quiz(raw, due_questions.len())?;
-            let mut stored = store.add_questions(subject, "tekrar", variations)?;
+            let mut stored =
+                store.add_questions(subject, lang.pick("tekrar", "review"), variations)?;
             for (s, due) in stored.iter_mut().zip(due_questions) {
                 s.review_target = Some(due.id);
             }
@@ -1939,7 +1950,18 @@ pub fn vocab_request_in(args: &str, lang: Lang) -> Result<(String, usize)> {
     Ok((topic.trim().into(), count))
 }
 
+#[cfg(test)]
 pub fn write_anki(root: &Path, subject: &str, topic: &str, cards: &[ai::Card]) -> Result<PathBuf> {
+    write_anki_in(root, subject, topic, cards, Lang::Tr)
+}
+
+pub fn write_anki_in(
+    root: &Path,
+    subject: &str,
+    topic: &str,
+    cards: &[ai::Card],
+    lang: Lang,
+) -> Result<PathBuf> {
     let mut slug = String::new();
     for ch in sources::fold_tr(topic).chars() {
         if ch.is_ascii_alphanumeric() {
@@ -1956,7 +1978,7 @@ pub fn write_anki(root: &Path, subject: &str, topic: &str, cards: &[ai::Card]) -
         .trim_end_matches('-')
         .to_string();
     let slug = if slug.is_empty() {
-        "kelime".to_string()
+        lang.pick("kelime", "cards").to_string()
     } else {
         slug
     };
@@ -2036,7 +2058,7 @@ fn chunks(text: &str) -> Vec<String> {
         output.push(chunk);
     }
     if output.is_empty() {
-        output.push("Yanıt boş.".into());
+        output.push("Yanıt boş / Empty response.".into());
     }
     output
 }
@@ -3488,7 +3510,7 @@ impl Bot {
         let title = course.display_title(&pending.subject).to_string();
         let result = (|| {
             let raw = result?;
-            match save_job(&mut self.store, &pending.subject, &pending.kind, &raw)? {
+            match save_job_in(&mut self.store, &pending.subject, &pending.kind, &raw, lang)? {
                 JobResult::Answer(answer) => self.edit(pending.message_id, &answer, caller),
                 JobResult::Quiz(questions) => {
                     let exam_title = match lang {
@@ -3532,7 +3554,7 @@ impl Bot {
                         JobKind::Vocab { topic, .. } => topic.as_str(),
                         _ => lang.pick("Kartlar", "Cards"),
                     };
-                    let path = write_anki(&self.root, &pending.subject, topic, &cards)?;
+                    let path = write_anki_in(&self.root, &pending.subject, topic, &cards, lang)?;
                     let path_str = path.to_string_lossy().replace('\\', "/");
                     let preview = cards
                         .iter()
@@ -4431,9 +4453,9 @@ impl Bot {
                 ("allowed_updates", r#"["callback_query","message"]"#),
             ],
         )?;
-        let updates = response["result"]
-            .as_array()
-            .ok_or_else(|| invalid("Telegram güncelleme listesi eksik."))?;
+        let updates = response["result"].as_array().ok_or_else(|| {
+            invalid("Telegram güncelleme listesi eksik / Missing Telegram updates list.")
+        })?;
         for update in updates {
             let Some(id) = update["update_id"].as_i64() else {
                 continue;
@@ -4441,9 +4463,9 @@ impl Bot {
             if id < self.store.offset()? {
                 continue;
             }
-            let next = id
-                .checked_add(1)
-                .ok_or_else(|| invalid("Telegram update_id geçersiz."))?;
+            let next = id.checked_add(1).ok_or_else(|| {
+                invalid("Telegram update_id geçersiz / Invalid Telegram update_id.")
+            })?;
             // Commit before handling, including rejected updates: never replay AI work.
             self.store.set_state("offset", &next.to_string())?;
             self.complete_job(caller)?;
@@ -4552,8 +4574,8 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, Bot) {
         let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("kaynaklar/Ders")).unwrap();
-        fs::write(root.path().join("kaynaklar/Ders/ders.md"), "Kaynak bilgi.").unwrap();
+        fs::create_dir_all(root.path().join("resources/Ders")).unwrap();
+        fs::write(root.path().join("resources/Ders/ders.md"), "Kaynak bilgi.").unwrap();
         sources::index(root.path(), false).unwrap();
         let bot = Bot::open(root.path(), "42").unwrap();
         (root, bot)
@@ -4634,9 +4656,9 @@ mod tests {
                 },
             ],
         };
-        fs::create_dir_all(root.join("kaynaklar").join(subject)).unwrap();
+        fs::create_dir_all(root.join("resources").join(subject)).unwrap();
         fs::write(
-            root.join("kaynaklar").join(subject).join("course.json"),
+            root.join("resources").join(subject).join("course.json"),
             serde_json::to_string_pretty(&cfg).unwrap(),
         )
         .unwrap();
@@ -5375,7 +5397,7 @@ mod tests {
     #[test]
     fn review_command_reuses_quiz_flow_limits_and_reports_subject_counts() {
         let (root, mut bot) = setup();
-        fs::create_dir_all(root.path().join("kaynaklar/Diğer")).unwrap();
+        fs::create_dir_all(root.path().join("resources/Diğer")).unwrap();
         bot.store.set_state("active_subject", "Ders").unwrap();
         let saved = bot
             .store
@@ -6577,10 +6599,10 @@ mod tests {
     fn telegram_subject_menu_and_switching() {
         let (root, mut bot) = setup();
         let mut calls = vec![];
-        fs::create_dir_all(root.path().join("kaynaklar/Rust101")).unwrap();
-        fs::write(root.path().join("kaynaklar/Rust101/notes.md"), "Ownership.").unwrap();
-        fs::create_dir_all(root.path().join("kaynaklar/Math")).unwrap();
-        fs::write(root.path().join("kaynaklar/Math/notes.md"), "Calculus.").unwrap();
+        fs::create_dir_all(root.path().join("resources/Rust101")).unwrap();
+        fs::write(root.path().join("resources/Rust101/notes.md"), "Ownership.").unwrap();
+        fs::create_dir_all(root.path().join("resources/Math")).unwrap();
+        fs::write(root.path().join("resources/Math/notes.md"), "Calculus.").unwrap();
 
         assert_eq!(menu_command("📚 Ders Seç"), Some("/dersler"));
         assert_eq!(menu_command("📚 Ders"), Some("/dersler"));
@@ -6694,10 +6716,10 @@ mod tests {
         let (root, mut bot) = setup();
         let long_name = "Çok_Uzun_UTF8_Ders_Klasörü_İsmi_Örnek_Mühendislik_Matematik_Ve_İstatistik_Bölümü_Dersleri_101";
         assert!(long_name.len() > 100);
-        fs::create_dir_all(root.path().join("kaynaklar").join(long_name)).unwrap();
+        fs::create_dir_all(root.path().join("resources").join(long_name)).unwrap();
         fs::write(
             root.path()
-                .join("kaynaklar")
+                .join("resources")
                 .join(long_name)
                 .join("notes.md"),
             "Uzun ders notu.",
@@ -6771,9 +6793,9 @@ mod tests {
     #[test]
     fn spec_bot_4_explicit_is_exam_uses_course_config_without_hardcoded_labels() {
         let (root, mut bot) = setup();
-        fs::create_dir_all(root.path().join("kaynaklar/bio101")).unwrap();
+        fs::create_dir_all(root.path().join("resources/bio101")).unwrap();
         fs::write(
-            root.path().join("kaynaklar/bio101/notes.md"),
+            root.path().join("resources/bio101/notes.md"),
             "ATP and mitosis.",
         )
         .unwrap();
@@ -6792,7 +6814,7 @@ mod tests {
             "plan": []
         });
         fs::write(
-            root.path().join("kaynaklar/bio101/course.json"),
+            root.path().join("resources/bio101/course.json"),
             serde_json::to_string_pretty(&cfg).unwrap(),
         )
         .unwrap();
@@ -7021,8 +7043,8 @@ mod tests {
     #[test]
     fn spec_sec_session_and_awaiting_hygiene() {
         let (root, mut bot) = setup();
-        fs::create_dir_all(root.path().join("kaynaklar/Math")).unwrap();
-        fs::write(root.path().join("kaynaklar/Math/notes.md"), "Integrals.").unwrap();
+        fs::create_dir_all(root.path().join("resources/Math")).unwrap();
+        fs::write(root.path().join("resources/Math/notes.md"), "Integrals.").unwrap();
 
         let mut calls = vec![];
         // Awaiting state is cleared when switching course via subject_callback.
@@ -7133,7 +7155,7 @@ mod tests {
             "STUDIA_TELEGRAM_TOKEN=12345:secret-bot-token\n",
         )
         .unwrap();
-        let leaked_path = root.path().join("kaynaklar/secret.md");
+        let leaked_path = root.path().join("resources/secret.md");
         let raw_err = format!(
             "failed reading {} with token 12345:secret-bot-token",
             leaked_path.display()

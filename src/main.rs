@@ -121,22 +121,22 @@ fn doctor_report(root: &Path, lang: Lang) -> String {
         root.display()
     ));
 
-    let sources_dir = root.join("kaynaklar");
+    let sources_dir = sources::sources_dir(root);
     if sources_dir.is_dir() {
         match sources::subjects(root) {
             Ok(subs) => lines.push(format!(
-                "[OK] kaynaklar/: {} {}",
+                "[OK] resources/: {} {}",
                 subs.len(),
                 lang.pick("ders bulundu", "course(s) found")
             )),
-            Err(err) => lines.push(format!("[WARN] kaynaklar/: {}", err)),
+            Err(err) => lines.push(format!("[WARN] resources/: {}", err)),
         }
     } else {
         lines.push(format!(
             "[WARN] {}",
             lang.pick(
-                "kaynaklar/ henüz yok; ilk dersinizi eklemek için kaynaklar/<ders>/ oluşturun.",
-                "kaynaklar/ not found yet; create kaynaklar/<course>/ to add study materials."
+                "resources/ henüz yok; ilk dersinizi eklemek için resources/<ders>/ oluşturun.",
+                "resources/ not found yet; create resources/<course>/ to add study materials."
             )
         ));
     }

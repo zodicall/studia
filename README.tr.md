@@ -22,16 +22,16 @@
 
 - **Terminal Arayüzü (TUI) ve Telegram Botu**: 6 sekmeli klavye odaklı terminal arayüzünden (`Sor`, `Quiz`, `Tekrar`, `İstatistik`, `Bugün`, `Denemeler`) veya Telegram üzerinden (`studia listen`) aynı ilerleme ve veritabanıyla (`data/studia.db`) çalışın.
 - **Canlı Çift Dil Desteği (`tr` / `en`)**: Başlangıçta sistem dilini otomatik algılar (`--lang > veritabanı > STUDIA_LANG > sistem dili > en`); çalışma sırasında TUI'da `F4` tuşuyla veya bot/TUI komut satırında `/lang tr|en` ile anında değiştirilebilir.
-- **Dersten Bağımsız Yapı**: `kaynaklar/<ders>/` altına notlarınızı ekleyin; isterseniz `course.json` ile eğitmen kimliği, deneme sınavı soru/şık sayısı, kategori dağılımı ve günlük çalışma planı tanımlayın.
+- **Dersten Bağımsız Yapı**: `resources/<ders>/` altına notlarınızı ekleyin; isterseniz `course.json` ile eğitmen kimliği, deneme sınavı soru/şık sayısı, kategori dağılımı ve günlük çalışma planı tanımlayın.
 - **Esnek Yapay Zeka Sağlayıcıları**: Gemini HTTP API, OpenAI (veya `STUDIA_AI_BASE_URL` üzerinden Ollama gibi OpenAI uyumlu sunucular), CLI araçları (`agy`, `claude`, `codex`, `gemini`) ve özel komut şablonları (`STUDIA_AI_PROVIDER=custom`) desteklenir.
 - **Aralıklı Tekrar ve Anki Kartları**: Yanlış yanıtlanan sorular 5 kutulu Leitner tekrar kuyruğuna alınır ve tekrarda aynı kuralı farklı bağlamda test eden taze varyasyonlar üretilir; kavram kartları `anki/` altına `.txt` olarak kaydedilir.
-- **Çevrimdışı Sistem Kontrolü**: `studia doctor` komutu `kaynaklar/`, `curl`, `pdftotext`, AI ayarları, `.env` dosya izinleri ve SQLite bütünlüğünü (`PRAGMA quick_check`) denetler.
+- **Çevrimdışı Sistem Kontrolü**: `studia doctor` komutu `resources/`, `curl`, `pdftotext`, AI ayarları, `.env` dosya izinleri ve SQLite bütünlüğünü (`PRAGMA quick_check`) denetler.
 
 ## Nasıl Çalışır?
 
 ```mermaid
 flowchart LR
-  Notes["kaynaklar/ders/\npdf · docx · md · txt · course.json"] --> Indexer["Yerel İndeksleyici"]
+  Notes["resources/ders/\npdf · docx · md · txt · course.json"] --> Indexer["Yerel İndeksleyici"]
   Indexer --> DB[("SQLite (data/studia.db)\nLeitner 1-5 · Planlar · Geçmiş")]
   DB <--> TUI["Terminal TUI (ratatui)"]
   DB <--> Bot["Telegram Botu (studia listen)"]
@@ -66,9 +66,9 @@ cargo build --release --locked
 2. Bir ders klasörü oluşturup kaynak belgelerinizi ekleyin (isterseniz [`examples/`](examples/) içindeki şablonlardan birini kopyalayın):
 
    ```bash
-   mkdir -p kaynaklar/Matematik
-   # kaynaklar/Matematik/ içine .md, .txt, .docx veya .pdf dosyaları ekleyin
-   cp examples/general-course/course.json kaynaklar/Matematik/course.json
+   mkdir -p resources/Matematik
+   # resources/Matematik/ içine .md, .txt, .docx veya .pdf dosyaları ekleyin
+   cp examples/general-course/course.json resources/Matematik/course.json
    ```
 
 3. Sistem kontrolünü çalıştırın, kaynakları indeksleyin ve TUI'yı başlatın:
@@ -119,7 +119,7 @@ cargo build --release --locked
 
 ## Ders Özelleştirme (`course.json`)
 
-İsteğe bağlı olarak `kaynaklar/<ders>/course.json` ekleyerek şunları tanımlayabilirsiniz:
+İsteğe bağlı olarak `resources/<ders>/course.json` ekleyerek şunları tanımlayabilirsiniz:
 
 - **`title` & `persona`**: Görünen ders adı ve yapay zeka eğitmen yönergesi.
 - **`exam`**: Soru sayısı (`1..=200`), şık sayısı (`4` veya `5`), kategori dağılımı ve sınav kuralları.

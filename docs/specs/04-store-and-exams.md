@@ -25,11 +25,11 @@
 
 | ID | Requirement |
 | :--- | :--- |
-| `EXAM-1` | `discover_banks(root, subject)` dynamically discovers valid `Bank` JSON files under `<root>/data/denemeler/<subject>/*.json` and `<root>/kaynaklar/<subject>/exams/*.json`, sorted deterministically by slug/filename without hardcoded exam lists. |
+| `EXAM-1` | `discover_banks(root, subject)` dynamically discovers valid `Bank` JSON files under `<root>/data/exams/<subject>/*.json` and `<root>/resources/<subject>/exams/*.json`, sorted deterministically by slug/filename without hardcoded exam lists. |
 | `EXAM-2` | Validated slug (`COURSE-4`) prevents traversal (`../`); completion state tracks per-subject/bank (`deneme:used:{subject}:{slug}`). |
 | `EXAM-3` | `exam::import_with` supports arbitrary question counts (`1..=answers.len()`) by chunking dynamically in batches of `40` (`(1..=answers.len())` windows of `40`, fixing `< 40`-question slice panic), accepts configured `choices_count` (`4..=5`), and verifies `answer_index < choices.len()` before indexing `choices[answer_index]`. Exam breakdown groups by `CourseConfig.exam.categories` if present or dynamically by question `topic`, formatting timestamps via `chrono::Local`. |
 
 ### Acceptance Criteria (`EXAM-*`)
-- **Given** `<root>/kaynaklar/Biology/exams/midterm.json` -> **Then** `discover_banks` finds `"midterm"` for `"Biology"` without touching any Rust source list.
+- **Given** `<root>/resources/Biology/exams/midterm.json` -> **Then** `discover_banks` finds `"midterm"` for `"Biology"` without touching any Rust source list.
 - **Given** `exam::import_with` called with a 15-question answer key -> **Then** it processes `1..=15` in a single chunk without panicking.
 - **Given** `parse_items` receives a 4-choice question with answer index `4` (`E`) -> **Then** it returns an actionable validation `Err` instead of panicking on out-of-bounds access.

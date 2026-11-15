@@ -439,8 +439,8 @@ impl App {
             .map(|s| s.name.clone())
             .ok_or_else(|| {
                 invalid(self.lang.pick(
-                    "kaynaklar/<ders>/ klasörüne belge ekleyin.",
-                    "Add study files under kaynaklar/<course>/.",
+                    "resources/<ders>/ klasörüne belge ekleyin.",
+                    "Add study files under resources/<course>/.",
                 ))
             })
     }
@@ -842,10 +842,12 @@ impl App {
             && let JobKind::DenemeCoach { session, .. } = kind
         {
             let reply = match result {
-                Ok(raw) => match bot::save_job(&mut self.store, subject, kind, &raw) {
-                    Ok(JobResult::Answer(answer)) => CoachReply::Answer(answer),
-                    _ => CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
-                },
+                Ok(raw) => {
+                    match bot::save_job_in(&mut self.store, subject, kind, &raw, self.lang) {
+                        Ok(JobResult::Answer(answer)) => CoachReply::Answer(answer),
+                        _ => CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
+                    }
+                }
                 Err(_) => CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
             };
             self.finish_deneme_chat(*session, reply);
@@ -855,10 +857,12 @@ impl App {
             && let JobKind::LessonChat { topic, .. } = kind
         {
             let reply = match result {
-                Ok(raw) => match bot::save_job(&mut self.store, subject, kind, &raw) {
-                    Ok(JobResult::Answer(answer)) => CoachReply::Answer(answer),
-                    _ => CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
-                },
+                Ok(raw) => {
+                    match bot::save_job_in(&mut self.store, subject, kind, &raw, self.lang) {
+                        Ok(JobResult::Answer(answer)) => CoachReply::Answer(answer),
+                        _ => CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
+                    }
+                }
                 Err(_) => CoachReply::Failed(bot::failure_text_in(kind, self.lang)),
             };
             self.finish_lesson_chat(subject, topic, reply)?;
@@ -869,7 +873,7 @@ impl App {
             Work::Index => self.status = format!("✓ {raw}"),
             Work::Coach { .. } => unreachable!(),
             Work::Ai { subject, kind } => {
-                let saved = bot::save_job(&mut self.store, &subject, &kind, &raw)?;
+                let saved = bot::save_job_in(&mut self.store, &subject, &kind, &raw, self.lang)?;
                 if let Some((start, day, index)) = plan_task {
                     plan::mark_done(&self.store, &subject, start, day, index)?;
                 }
@@ -930,7 +934,8 @@ impl App {
                             JobKind::Vocab { topic, .. } => topic.clone(),
                             _ => unreachable!(),
                         };
-                        let path = bot::write_anki(&self.root, &subject, &topic, &cards)?;
+                        let path =
+                            bot::write_anki_in(&self.root, &subject, &topic, &cards, self.lang)?;
                         let preview = cards
                             .iter()
                             .take(10)
@@ -2775,9 +2780,9 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("kaynaklar/Ders")).unwrap();
-        fs::create_dir_all(root.path().join("kaynaklar/Diğer")).unwrap();
-        fs::write(root.path().join("kaynaklar/Ders/ders.md"), "Kaynak bilgi.").unwrap();
+        fs::create_dir_all(root.path().join("resources/Ders")).unwrap();
+        fs::create_dir_all(root.path().join("resources/Diğer")).unwrap();
+        fs::write(root.path().join("resources/Ders/ders.md"), "Kaynak bilgi.").unwrap();
         let app = App::open(root.path()).unwrap();
         (root, app)
     }
@@ -2858,7 +2863,7 @@ mod tests {
             ],
         };
         fs::write(
-            root.join("kaynaklar").join(subject).join("course.json"),
+            root.join("resources").join(subject).join("course.json"),
             serde_json::to_string_pretty(&cfg).unwrap(),
         )
         .unwrap();
@@ -3829,10 +3834,10 @@ mod tests {
     }
 
     #[test]
-    fn exam_bank_is_discovered_from_kaynaklar_and_marked_used_on_start() {
+    fn exam_bank_is_discovered_from_resources_and_marked_used_on_start() {
         let (_root, mut app) = setup();
         start_plan_today(&mut app);
-        let bank_dir = app.root.join("kaynaklar/Ders/exams");
+        let bank_dir = app.root.join("resources/Ders/exams");
         fs::create_dir_all(&bank_dir).unwrap();
         let raw_items = exam::fake_items(&(1..=3));
         let questions = exam::import_with("Midterm Exam", "text", &[0, 1, 2], 5, |range, _, _| {
@@ -4139,15 +4144,15 @@ mod tests {
     #[test]
     fn spec_tui_2_subject_switch_refreshes_immediately_and_resets_plan_view() {
         let (root, mut app) = setup();
-        fs::create_dir_all(root.path().join("kaynaklar/A_Plan")).unwrap();
+        fs::create_dir_all(root.path().join("resources/A_Plan")).unwrap();
         fs::write(
-            root.path().join("kaynaklar/A_Plan/notes.md"),
+            root.path().join("resources/A_Plan/notes.md"),
             "Planlı ders.",
         )
         .unwrap();
         write_test_course(root.path(), "A_Plan");
-        fs::create_dir_all(root.path().join("kaynaklar/B_Empty")).unwrap();
-        fs::write(root.path().join("kaynaklar/B_Empty/notes.md"), "Boş ders.").unwrap();
+        fs::create_dir_all(root.path().join("resources/B_Empty")).unwrap();
+        fs::write(root.path().join("resources/B_Empty/notes.md"), "Boş ders.").unwrap();
         sources::index(root.path(), false).unwrap();
         app.refresh().unwrap();
 

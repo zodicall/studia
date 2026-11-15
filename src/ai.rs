@@ -379,13 +379,15 @@ fn reconcile_answers(questions: &mut [Question]) -> Result<()> {
     for (number, q) in questions.iter_mut().enumerate() {
         if q.answer_index >= q.choices.len() {
             return Err(invalid(format!(
-                "Soru {}: doğru şık indeksi geçersiz.",
+                "Soru {}: doğru şık indeksi geçersiz / Question {}: invalid answer index.",
+                number + 1,
                 number + 1
             )));
         }
         q.answer_index = named_choice(&q.explanation, &q.choices).ok_or_else(|| {
             invalid(format!(
-                "Soru {}: doğru şık açıklamayla eşleşmedi.",
+                "Soru {}: doğru şık açıklamayla eşleşmedi / Question {}: answer does not match explanation.",
+                number + 1,
                 number + 1
             ))
         })?;
@@ -396,7 +398,8 @@ fn reconcile_answers(questions: &mut [Question]) -> Result<()> {
 fn validate_questions(questions: &[Question], count: usize) -> Result<()> {
     if !(1..=80).contains(&count) || questions.len() != count {
         return Err(invalid(format!(
-            "AI {count} soru istedi, {} soru üretti.",
+            "AI {count} soru istedi, {} soru üretti / Requested {count} questions, AI returned {}.",
+            questions.len(),
             questions.len()
         )));
     }
@@ -404,13 +407,14 @@ fn validate_questions(questions: &[Question], count: usize) -> Result<()> {
         let number = number + 1;
         if !(4..=5).contains(&q.choices.len()) {
             return Err(invalid(format!(
-                "Soru {number}: {} şık var.",
+                "Soru {number}: {} şık var / Question {number} has {} choices.",
+                q.choices.len(),
                 q.choices.len()
             )));
         }
         if q.answer_index >= q.choices.len() {
             return Err(invalid(format!(
-                "Soru {number}: doğru şık indeksi geçersiz."
+                "Soru {number}: doğru şık indeksi geçersiz / Question {number}: invalid answer index."
             )));
         }
         if q.question.trim().is_empty()
@@ -419,15 +423,19 @@ fn validate_questions(questions: &[Question], count: usize) -> Result<()> {
             || q.choices.iter().any(|choice| choice.trim().is_empty())
         {
             return Err(invalid(format!(
-                "Soru {number}: metin, açıklama, kaynak ya da şık boş."
+                "Soru {number}: metin, açıklama, kaynak ya da şık boş / Question {number}: text, explanation, source, or choice is empty."
             )));
         }
         if has_duplicates(q.choices.iter().map(|c| c.trim().to_lowercase())) {
-            return Err(invalid(format!("Soru {number}: yinelenen şık var.")));
+            return Err(invalid(format!(
+                "Soru {number}: yinelenen şık var / Question {number}: duplicate choices."
+            )));
         }
     }
     if has_duplicates(questions.iter().map(|q| q.question.trim().to_lowercase())) {
-        return Err(invalid("Aynı soru metni birden fazla kez üretildi."));
+        return Err(invalid(
+            "Aynı soru metni birden fazla kez üretildi / Duplicate question text generated.",
+        ));
     }
     Ok(())
 }

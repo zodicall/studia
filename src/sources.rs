@@ -12,6 +12,16 @@ const MAX_PDF_CACHE_CHARS: usize = 500_000;
 const MAX_PDF_OBJECTS: usize = 50_000;
 const MAX_DIR_DEPTH: usize = 16;
 
+/// Returns the root directory for course study materials (`<root>/resources`).
+pub fn sources_dir(root: &Path) -> PathBuf {
+    root.join("resources")
+}
+
+/// Returns the root directory for extracted text cache (`<root>/data/text`).
+pub fn cache_dir(root: &Path) -> PathBuf {
+    root.join("data").join("text")
+}
+
 fn truncate(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
@@ -26,7 +36,9 @@ fn push_bounded(out: &mut String, count: &mut usize, text: &str) {
 
 fn extract(name: &str, bytes: &[u8]) -> Result<Option<String>> {
     if bytes.len() > MAX_BYTES {
-        return Err(invalid("Dosya 25 MB sınırını aşıyor."));
+        return Err(invalid(
+            "Dosya 25 MB sınırını aşıyor / File exceeds 25 MB limit.",
+        ));
     }
     match name
         .rsplit('.')
@@ -39,7 +51,9 @@ fn extract(name: &str, bytes: &[u8]) -> Result<Option<String>> {
         "pdf" => {
             let document = lopdf::Document::load_mem(bytes)?;
             if document.objects.len() > MAX_PDF_OBJECTS {
-                return Err(invalid("PDF çok karmaşık (50.000 nesne sınırını aşıyor)."));
+                return Err(invalid(
+                    "PDF çok karmaşık (50.000 nesne sınırını aşıyor) / PDF is too complex (exceeds 50,000 object limit).",
+                ));
             }
             let pages = document.get_pages();
             let mut output = String::new();
@@ -61,7 +75,9 @@ fn extract(name: &str, bytes: &[u8]) -> Result<Option<String>> {
                 }
             }
             if readable == 0 && !pages.is_empty() {
-                return Err(invalid("PDF sayfaları okunamadı."));
+                return Err(invalid(
+                    "PDF sayfaları okunamadı / Failed to read PDF pages.",
+                ));
             }
             Ok(Some(output))
         }
@@ -69,12 +85,16 @@ fn extract(name: &str, bytes: &[u8]) -> Result<Option<String>> {
             let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
             let entry = archive.by_name("word/document.xml")?;
             if entry.size() > MAX_BYTES as u64 {
-                return Err(invalid("Belge içeriği 25 MB sınırını aşıyor."));
+                return Err(invalid(
+                    "Belge içeriği 25 MB sınırını aşıyor / Document content exceeds 25 MB limit.",
+                ));
             }
             let mut xml = Vec::new();
             entry.take(MAX_BYTES as u64 + 1).read_to_end(&mut xml)?;
             if xml.len() > MAX_BYTES {
-                return Err(invalid("Belge içeriği 25 MB sınırını aşıyor."));
+                return Err(invalid(
+                    "Belge içeriği 25 MB sınırını aşıyor / Document content exceeds 25 MB limit.",
+                ));
             }
             let mut reader = quick_xml::Reader::from_reader(xml.as_slice());
             let mut output = String::new();
@@ -116,7 +136,7 @@ fn extract(name: &str, bytes: &[u8]) -> Result<Option<String>> {
 }
 
 pub fn subjects(root: &Path) -> Result<Vec<String>> {
-    let directory = root.join("kaynaklar");
+    let directory = sources_dir(root);
     let Ok(canon_root) = fs::canonicalize(&directory) else {
         return Ok(vec![]);
     };
@@ -127,8 +147,8 @@ pub fn subjects(root: &Path) -> Result<Vec<String>> {
         let Ok(meta) = fs::metadata(&path) else {
             continue;
         };
-        // metadata follows junctions/symlinks inside kaynaklar while broken links skip safely;
-        // canonical containment ensures targets cannot escape the kaynaklar root.
+        // metadata follows junctions/symlinks inside resources while broken links skip safely;
+        // canonical containment ensures targets cannot escape the resources root.
         if !meta.is_dir() {
             continue;
         }
@@ -212,19 +232,20 @@ fn cache_name(relative: &Path) -> String {
 }
 
 pub fn index(root: &Path, force: bool) -> Result<usize> {
-    let sources_root = root.join("kaynaklar");
+    let sources_root = sources_dir(root);
     fs::create_dir_all(&sources_root)?;
-    let canon_kaynaklar = fs::canonicalize(&sources_root)?;
-    crate::config::ensure_private_dir(&root.join("data/metin"))?;
+    let canon_sources = fs::canonicalize(&sources_root)?;
+    let cache_root = cache_dir(root);
+    crate::config::ensure_private_dir(&cache_root)?;
     let mut updated = 0;
     let subjects = subjects(root)?;
     for subject in &subjects {
         let source = sources_root.join(subject);
-        let cache = root.join("data/metin").join(subject);
+        let cache = cache_root.join(subject);
         crate::config::ensure_private_dir(&cache)?;
         let mut paths = vec![];
         let mut visited = BTreeSet::new();
-        files(&source, &canon_kaynaklar, 0, &mut visited, &mut paths)?;
+        files(&source, &canon_sources, 0, &mut visited, &mut paths)?;
         let mut expected = BTreeSet::new();
         for path in paths {
             let name = cache_name(path.strip_prefix(&source)?);
@@ -241,7 +262,7 @@ pub fn index(root: &Path, force: bool) -> Result<usize> {
             if force || newer {
                 let name = path
                     .file_name()
-                    .ok_or_else(|| invalid("Dosya adı eksik."))?
+                    .ok_or_else(|| invalid("Dosya adı eksik / Missing file name."))?
                     .to_string_lossy();
                 if metadata.len() > MAX_BYTES as u64 {
                     crate::telegram::log_file(
@@ -286,7 +307,7 @@ pub fn index(root: &Path, force: bool) -> Result<usize> {
         }
     }
     // A removed subject must not leave sources available to a later prompt.
-    for entry in fs::read_dir(root.join("data/metin"))? {
+    for entry in fs::read_dir(&cache_root)? {
         let entry = entry?;
         if entry.file_type()?.is_dir()
             && !subjects.contains(&entry.file_name().to_string_lossy().into_owned())
@@ -421,16 +442,18 @@ pub fn text(root: &Path, subject: &str, query: &str) -> Result<String> {
     crate::course::validate_identifier(subject)?;
     // Only names obtained from the first-level material folders may be selected.
     if !subjects(root)?.iter().any(|name| name == subject) {
-        return Err(invalid("Ders bulunamadı."));
+        return Err(invalid("Ders bulunamadı / Course not found."));
     }
-    let cache_root = root.join("data/metin");
+    let cache_root = cache_dir(root);
     let directory = cache_root.join(subject);
     let mut paths = vec![];
     if directory.exists() {
         let canon_cache_root = fs::canonicalize(&cache_root)?;
         let canon_dir = fs::canonicalize(&directory)?;
         if !canon_dir.starts_with(&canon_cache_root) {
-            return Err(invalid("Önbellek dizini geçersiz."));
+            return Err(invalid(
+                "Önbellek dizini geçersiz / Invalid cache directory.",
+            ));
         }
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
@@ -484,7 +507,7 @@ pub fn text(root: &Path, subject: &str, query: &str) -> Result<String> {
     }
     if chunks.is_empty() {
         return Err(invalid(
-            "Bu derste metin kaynağı yok. kaynaklar klasörüne belge ekleyin.",
+            "Bu derste metin kaynağı yok. resources/ klasörüne belge ekleyin / No text sources in this course. Add documents to resources/.",
         ));
     }
     chunks.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -513,7 +536,7 @@ mod tests {
     #[test]
     fn duplicate_and_archive_folders_are_not_indexed_and_big_files_do_not_stop_the_rest() {
         let root = tempfile::tempdir().unwrap();
-        let subject = root.path().join("kaynaklar/Ders");
+        let subject = root.path().join("resources/Ders");
         for dir in ["_duplicates", "99_ARCHIVE", "Kitaplar"] {
             fs::create_dir_all(subject.join(dir)).unwrap();
         }
@@ -533,20 +556,20 @@ mod tests {
     #[test]
     fn cache_rebuild_refresh_prune_and_nested_filename_collisions() {
         let root = tempfile::tempdir().unwrap();
-        fs::create_dir_all(root.path().join("kaynaklar/Ders/nested")).unwrap();
+        fs::create_dir_all(root.path().join("resources/Ders/nested")).unwrap();
         for (name, text) in [
             ("a.md", "ilk"),
             ("nested/a.md", "alt"),
             ("nested%2Fa.md", "yüzde"),
         ] {
-            fs::write(root.path().join("kaynaklar/Ders").join(name), text).unwrap();
+            fs::write(root.path().join("resources/Ders").join(name), text).unwrap();
         }
         assert_eq!(index(root.path(), false).unwrap(), 3);
         assert_eq!(index(root.path(), false).unwrap(), 0);
         let context = text(root.path(), "Ders", "").unwrap();
         assert!(context.contains("### nested/a.md\nalt"));
         assert!(context.contains("### nested%2Fa.md\nyüzde"));
-        let path = root.path().join("kaynaklar/Ders/a.md");
+        let path = root.path().join("resources/Ders/a.md");
         fs::write(&path, "yeni").unwrap();
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
@@ -648,8 +671,8 @@ mod tests {
     #[test]
     fn large_subject_keeps_only_matching_chunks() {
         let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join("data/metin/Ders");
-        fs::create_dir_all(root.path().join("kaynaklar/Ders")).unwrap();
+        let cache = root.path().join("data/text/Ders");
+        fs::create_dir_all(root.path().join("resources/Ders")).unwrap();
         fs::create_dir_all(&cache).unwrap();
         for index in 0..30 {
             fs::write(
@@ -667,11 +690,11 @@ mod tests {
     #[test]
     fn spec_src_1_2_3_limits_skipped_dirs_and_no_legacy_heuristics() {
         let root = tempfile::tempdir().unwrap();
-        let kaynaklar = root.path().join("kaynaklar");
-        fs::create_dir_all(kaynaklar.join(".hidden")).unwrap();
-        fs::write(kaynaklar.join(".hidden/secret.txt"), "hidden subject").unwrap();
+        let resources = root.path().join("resources");
+        fs::create_dir_all(resources.join(".hidden")).unwrap();
+        fs::write(resources.join(".hidden/secret.txt"), "hidden subject").unwrap();
 
-        let subject = kaynaklar.join("Ders");
+        let subject = resources.join("Ders");
         for dir in [".git", "exams", "notes"] {
             fs::create_dir_all(subject.join(dir)).unwrap();
         }
@@ -724,8 +747,8 @@ mod tests {
         {
             use std::os::unix::fs::symlink;
             symlink(
-                kaynaklar.join("missing_target"),
-                kaynaklar.join("broken_link"),
+                resources.join("missing_target"),
+                resources.join("broken_link"),
             )
             .unwrap();
             symlink(&subject, subject.join("notes/loop_back")).unwrap();
@@ -765,22 +788,22 @@ mod tests {
         let err = extract("bomb.pdf", &pdf).unwrap_err().to_string();
         assert!(err.contains("50.000"), "unexpected error: {err}");
 
-        // Symlinks pointing outside kaynaklar / data/metin must be skipped/rejected.
+        // Symlinks pointing outside resources / data/text must be skipped/rejected.
         #[cfg(unix)]
         {
             use std::os::unix::fs::{PermissionsExt, symlink};
             let root = tempfile::tempdir().unwrap();
-            let kaynaklar = root.path().join("kaynaklar");
+            let resources = root.path().join("resources");
             let outside = root.path().join("outside");
-            fs::create_dir_all(kaynaklar.join("Safe")).unwrap();
+            fs::create_dir_all(resources.join("Safe")).unwrap();
             fs::create_dir_all(&outside).unwrap();
-            fs::write(kaynaklar.join("Safe/ok.txt"), "safe content").unwrap();
+            fs::write(resources.join("Safe/ok.txt"), "safe content").unwrap();
             fs::write(outside.join("secret.txt"), "leaked secret").unwrap();
 
-            symlink(&outside, kaynaklar.join("EscapedSubject")).unwrap();
+            symlink(&outside, resources.join("EscapedSubject")).unwrap();
             symlink(
                 outside.join("secret.txt"),
-                kaynaklar.join("Safe/escaped.txt"),
+                resources.join("Safe/escaped.txt"),
             )
             .unwrap();
 
@@ -790,9 +813,9 @@ mod tests {
             assert!(ctx.contains("safe content"));
             assert!(!ctx.contains("leaked secret"));
 
-            let cache_dir = root.path().join("data/metin/Safe");
+            let cache_dir = root.path().join("data/text/Safe");
             assert_eq!(
-                fs::metadata(root.path().join("data/metin"))
+                fs::metadata(root.path().join("data/text"))
                     .unwrap()
                     .permissions()
                     .mode()

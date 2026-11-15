@@ -23,13 +23,13 @@ const BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
 const NARROW: u16 = 80;
 
 const ONBOARDING: &str = "Başlamak için:\n\
-1. kaynaklar/ içinde bir ders klasörü açın, örn. kaynaklar/Matematik\n\
+1. resources/ içinde bir ders klasörü açın, örn. resources/Matematik\n\
 2. Belgelerinizi (.md, .txt, .pdf, .docx) bu klasöre koyun\n\
 3. r tuşuyla dizinleyin\n\
 4. 2 ile Quiz'e geçip n ile ilk quizi üretin";
 
 const ONBOARDING_EN: &str = "Getting started:\n\
-1. Create a course folder under kaynaklar/, e.g. kaynaklar/Calculus\n\
+1. Create a course folder under resources/, e.g. resources/Calculus\n\
 2. Add your study files (.md, .txt, .pdf, .docx) there\n\
 3. Press r to index sources\n\
 4. Press 2 for Quiz and n to generate your first quiz";
@@ -511,8 +511,8 @@ fn draw_subjects(frame: &mut Frame, area: Rect, app: &App) {
             area,
             heading,
             app.lang.pick(
-                "Henüz ders yok.\nkaynaklar/<ders>/ klasörü ekleyin, sonra r ile dizinleyin.",
-                "No courses yet.\nAdd a kaynaklar/<course>/ folder, then press r to index.",
+                "Henüz ders yok.\nresources/<ders>/ klasörü ekleyin, sonra r ile dizinleyin.",
+                "No courses yet.\nAdd a resources/<course>/ folder, then press r to index.",
             ),
             0,
         );
@@ -948,8 +948,8 @@ fn draw_plan(frame: &mut Frame, content: Rect, app: &App) {
                 "Study Plan · Flexible Course",
             ),
             app.lang.pick(
-                "Bu ders için çalışma planı tanımlı değil (isteğe bağlı: kaynaklar/<ders>/course.json).\n\nDoğrudan Soru/Özet (1), Quiz (2), Tekrar (3) veya Deneme (5) sekmelerini kullanabilirsiniz.",
-                "No study plan defined for this course (optional: kaynaklar/<course>/course.json).\n\nYou can use Ask (1), Quiz (2), Review (3), or Exams (5) directly.",
+                "Bu ders için çalışma planı tanımlı değil (isteğe bağlı: resources/<ders>/course.json).\n\nDoğrudan Soru/Özet (1), Quiz (2), Tekrar (3) veya Deneme (5) sekmelerini kullanabilirsiniz.",
+                "No study plan defined for this course (optional: resources/<course>/course.json).\n\nYou can use Ask (1), Quiz (2), Review (3), or Exams (5) directly.",
             ),
             0,
         );
@@ -1558,8 +1558,8 @@ mod tests {
 
     fn app_with_subject() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("kaynaklar/Ders")).unwrap();
-        std::fs::write(root.path().join("kaynaklar/Ders/ders.md"), "Kaynak.").unwrap();
+        std::fs::create_dir_all(root.path().join("resources/Ders")).unwrap();
+        std::fs::write(root.path().join("resources/Ders/ders.md"), "Kaynak.").unwrap();
         let app = App::open(root.path()).unwrap();
         (root, app)
     }

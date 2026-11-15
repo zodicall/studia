@@ -299,7 +299,7 @@ pub fn command_output_with_timeout(
 
     writer
         .join()
-        .map_err(|_| invalid("CLI stdin yazılamadı."))?
+        .map_err(|_| invalid("CLI stdin yazılamadı / Failed to write to CLI stdin."))?
         .map_err(|err| invalid(config::redact_secrets(&err.to_string(), secrets)))?;
 
     let (bytes, truncated) = rx
@@ -323,11 +323,13 @@ pub fn command_output_with_timeout(
 
 fn parse_response(output: Result<String>) -> Result<Value> {
     // Never propagate curl output, URLs, API descriptions, or parse error details.
-    let raw = output.map_err(|_| invalid("Telegram isteği başarısız."))?;
-    let response: Value =
-        serde_json::from_str(&raw).map_err(|_| invalid("Telegram yanıtı geçerli JSON değil."))?;
+    let raw =
+        output.map_err(|_| invalid("Telegram isteği başarısız / Telegram request failed."))?;
+    let response: Value = serde_json::from_str(&raw).map_err(|_| {
+        invalid("Telegram yanıtı geçerli JSON değil / Telegram response is not valid JSON.")
+    })?;
     if response["ok"] != true {
-        return Err(invalid("Telegram API hatası."));
+        return Err(invalid("Telegram API hatası / Telegram API error."));
     }
     Ok(response)
 }

@@ -158,7 +158,7 @@ impl CourseConfig {
 
     pub fn load_or_default(root: &Path, subject: &str) -> Result<Self> {
         validate_identifier(subject)?;
-        let sources_root = root.join("kaynaklar");
+        let sources_root = crate::sources::sources_dir(root);
         let path = sources_root.join(subject).join("course.json");
         let meta = match fs::metadata(&path) {
             Ok(meta) => meta,
@@ -177,7 +177,7 @@ impl CourseConfig {
         };
         if canon_path == canon_root || !canon_path.starts_with(&canon_root) {
             return Err(invalid(format!(
-                "course.json escapes kaynaklar root: {}",
+                "course.json resources kökünün dışına taşıyor / escapes resources root: {}",
                 path.display()
             )));
         }
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn spec_course_2_zero_config_fallback_without_course_json() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("kaynaklar/Rust101")).unwrap();
+        fs::create_dir_all(dir.path().join("resources/Rust101")).unwrap();
         let cfg = CourseConfig::load_or_default(dir.path(), "Rust101").unwrap();
         assert_eq!(cfg.display_title("Rust101"), "Rust101");
         assert_eq!(cfg.choices_count(), 5);
@@ -237,16 +237,16 @@ mod tests {
         assert!(validate_identifier("Algorithms_101").is_ok());
 
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("kaynaklar/Bad")).unwrap();
+        fs::create_dir_all(dir.path().join("resources/Bad")).unwrap();
         fs::write(
-            dir.path().join("kaynaklar/Bad/course.json"),
+            dir.path().join("resources/Bad/course.json"),
             r#"{"exam":{"choices_count":7}}"#,
         )
         .unwrap();
         assert!(CourseConfig::load_or_default(dir.path(), "Bad").is_err());
 
         fs::write(
-            dir.path().join("kaynaklar/Bad/course.json"),
+            dir.path().join("resources/Bad/course.json"),
             r#"{"plan":[{"day":0,"title":"Zero","tasks":[{"command":"/quiz x","label":"x"}]}]}"#,
         )
         .unwrap();
@@ -263,12 +263,12 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        // Missing kaynaklar returns default safely.
+        // Missing resources returns default safely.
         let missing = CourseConfig::load_or_default(dir.path(), "Physics").unwrap();
         assert_eq!(missing, CourseConfig::default());
 
-        let kaynaklar = dir.path().join("kaynaklar");
-        fs::create_dir_all(&kaynaklar).unwrap();
+        let resources = dir.path().join("resources");
+        fs::create_dir_all(&resources).unwrap();
         let outside = dir.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("course.json"), r#"{"title":"Escaped"}"#).unwrap();
@@ -276,13 +276,13 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            symlink(&outside, kaynaklar.join("Escaped")).unwrap();
+            symlink(&outside, resources.join("Escaped")).unwrap();
             assert!(CourseConfig::load_or_default(dir.path(), "Escaped").is_err());
 
-            fs::create_dir_all(kaynaklar.join("LinkedFile")).unwrap();
+            fs::create_dir_all(resources.join("LinkedFile")).unwrap();
             symlink(
                 outside.join("course.json"),
-                kaynaklar.join("LinkedFile/course.json"),
+                resources.join("LinkedFile/course.json"),
             )
             .unwrap();
             assert!(CourseConfig::load_or_default(dir.path(), "LinkedFile").is_err());

@@ -85,7 +85,7 @@ mod tests {
         .unwrap();
         let raw = format!(
             "failed reading {} with sk-tui-secret-1234",
-            root.path().join("kaynaklar/doc.md").display()
+            root.path().join("resources/doc.md").display()
         );
         let formatted = status_error(root.path(), "Action failed", &raw);
         assert!(formatted.starts_with("Action failed: "));

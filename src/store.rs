@@ -327,7 +327,9 @@ impl Store {
                 topic: None,
             };
             if value.answer_index >= value.choices.len() {
-                return Err(invalid("Kayıtlı soru geçersiz."));
+                return Err(invalid(
+                    "Kayıtlı soru geçersiz / Stored question is invalid.",
+                ));
             }
             output.push(StoredQuestion {
                 id,
@@ -399,7 +401,7 @@ impl Store {
         )?;
         let choices: Vec<String> = serde_json::from_str(&choices_json)?;
         if choice >= choices.len() {
-            return Err(invalid("Seçenek geçersiz."));
+            return Err(invalid("Seçenek geçersiz / Invalid choice."));
         }
         let correct = choice as i64 == answer;
         if tx.execute(
@@ -407,7 +409,7 @@ impl Store {
             params![correct, session],
         )? != 1
         {
-            return Err(invalid("Quiz oturumu kapalı."));
+            return Err(invalid("Quiz oturumu kapalı / Quiz session is closed."));
         }
         tx.execute(
             "INSERT INTO answers(question_id,choice,correct,at) VALUES(?1,?2,?3,?4)",
@@ -431,7 +433,9 @@ impl Store {
             let due_at = at
                 .date_naive()
                 .checked_add_days(Days::new(1 << (next_box - 1)))
-                .ok_or_else(|| invalid("Tekrar tarihi hesaplanamadı."))?;
+                .ok_or_else(|| {
+                    invalid("Tekrar tarihi hesaplanamadı / Failed to compute review due date.")
+                })?;
             tx.execute(
                 "INSERT INTO reviews(question_id,box,due_at) VALUES(?1,?2,?3) ON CONFLICT(question_id) DO UPDATE SET box=excluded.box,due_at=excluded.due_at",
                 params![review_target, next_box, due_at.to_string()],
@@ -644,12 +648,14 @@ impl Store {
                 continue;
             }
             let choices_vec: Vec<String> = serde_json::from_str(&choices)?;
-            let answer_idx =
-                usize::try_from(answer_index).map_err(|_| invalid("Kayıtlı soru geçersiz."))?;
-            let choice_idx =
-                usize::try_from(choice).map_err(|_| invalid("Kayıtlı cevap geçersiz."))?;
+            let answer_idx = usize::try_from(answer_index)
+                .map_err(|_| invalid("Kayıtlı soru geçersiz / Stored question is invalid."))?;
+            let choice_idx = usize::try_from(choice)
+                .map_err(|_| invalid("Kayıtlı cevap geçersiz / Stored answer is invalid."))?;
             if answer_idx >= choices_vec.len() || choice_idx >= choices_vec.len() {
-                return Err(invalid("Kayıtlı soru veya cevap geçersiz."));
+                return Err(invalid(
+                    "Kayıtlı soru veya cevap geçersiz / Stored question or answer is invalid.",
+                ));
             }
             let value = Question {
                 question,

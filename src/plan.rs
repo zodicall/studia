@@ -1,4 +1,4 @@
-//! Ders bazlı çalışma planı takibi. Günler isteğe bağlı olarak `kaynaklar/<ders>/course.json`
+//! Ders bazlı çalışma planı takibi. Günler isteğe bağlı olarak `resources/<ders>/course.json`
 //! dosyasından yüklenir; sabit gün listesi veya gömülü müfredat yoktur.
 
 use crate::{
@@ -63,7 +63,7 @@ pub fn start_date(store: &Store, subject: &str) -> Result<Option<NaiveDate>> {
         .state(&key)?
         .map(|value| {
             NaiveDate::parse_from_str(&value, DATE_FORMAT)
-                .map_err(|_| invalid("Plan başlangıç tarihi bozuk."))
+                .map_err(|_| invalid("Plan başlangıç tarihi bozuk / Invalid plan start date."))
         })
         .transpose()
 }

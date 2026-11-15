@@ -83,7 +83,7 @@ jobs:
             exit 1
           fi
           # Ensure no tracked secret files or runtime databases exist.
-          if git ls-files | grep -vE '(^|/)\.env\.example$' | grep -E '(^|/)\.env(\.|$)|\.db(-shm|-wal)?$|\.log$|^kaynaklar/|^data/|^anki/'; then
+          if git ls-files | grep -vE '(^|/)\.env\.example$' | grep -E '(^|/)\.env(\.|$)|\.db(-shm|-wal)?$|\.log$|^resources/|^data/|^anki/'; then
             echo "::error::Runtime or secret file committed to git."
             exit 1
           fi

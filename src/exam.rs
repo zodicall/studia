@@ -1,6 +1,6 @@
 //! Mock exam bank discovery, safe persistence, and answer-key-backed import.
-//! Discovers JSON exam banks under `kaynaklar/<subject>/exams/*.json` and
-//! `data/denemeler/<subject>/*.json`, sorted deterministically by slug.
+//! Discovers JSON exam banks under `resources/<subject>/exams/*.json` and
+//! `data/exams/<subject>/*.json`, sorted deterministically by slug.
 
 use crate::{Result, ai, course, invalid, store::Store};
 use serde::{Deserialize, Serialize};
@@ -203,23 +203,27 @@ pub fn parse_items(
     choices_count: usize,
 ) -> Result<Vec<ai::Question>> {
     if !(4..=5).contains(&choices_count) {
-        return Err(invalid("Şık sayısı 4 veya 5 olmalıdır."));
+        return Err(invalid(
+            "Şık sayısı 4 veya 5 olmalıdır / Choices count must be 4 or 5.",
+        ));
     }
     let parsed: Items = serde_json::from_str(ai::strip_code_fence(raw))?;
     let mut questions = Vec::new();
     for number in range.clone() {
         if number == 0 || number > answers.len() {
             return Err(invalid(format!(
-                "{number}. soru için cevap anahtarı eksik."
+                "{number}. soru için cevap anahtarı eksik / Missing answer key for question {number}."
             )));
         }
         let mut matches = parsed.items.iter().filter(|item| item.no == number);
-        let item = matches
-            .next()
-            .ok_or_else(|| invalid(format!("{number}. soru üretilmedi.")))?;
+        let item = matches.next().ok_or_else(|| {
+            invalid(format!(
+                "{number}. soru üretilmedi / Question {number} was not generated."
+            ))
+        })?;
         if matches.next().is_some() {
             return Err(invalid(format!(
-                "{number}. soru birden fazla kez üretildi."
+                "{number}. soru birden fazla kez üretildi / Question {number} was generated multiple times."
             )));
         }
         let choices: Vec<String> = item
@@ -235,12 +239,15 @@ pub fn parse_items(
             })
             .collect();
         if choices.len() != choices_count {
-            return Err(invalid(format!("{number}. sorunun şıkları geçersiz.")));
+            return Err(invalid(format!(
+                "{number}. sorunun şıkları geçersiz / Invalid choices for question {number}."
+            )));
         }
         let answer_index = answers[number - 1];
         if answer_index >= choices.len() {
             return Err(invalid(format!(
-                "{number}. soru için cevap indeksi ({answer_index}) şık sayısı ({}) dışında.",
+                "{number}. soru için cevap indeksi ({answer_index}) şık sayısı ({}) dışında / Answer index ({answer_index}) out of bounds ({}) for question {number}.",
+                choices.len(),
                 choices.len()
             )));
         }
@@ -259,7 +266,9 @@ pub fn parse_items(
         let question = item.question.trim();
         let explanation = item.explanation.trim();
         if question.is_empty() || explanation.is_empty() {
-            return Err(invalid(format!("{number}. soru veya açıklama boş.")));
+            return Err(invalid(format!(
+                "{number}. soru veya açıklama boş / Question {number} text or explanation is empty."
+            )));
         }
         // Bozuk işaretli soru silinmez; metnin başına neyin eksik olduğu yazılır.
         let question = if broken {
@@ -294,11 +303,13 @@ pub fn import_with(
     mut generate: impl FnMut(RangeInclusive<usize>, &str, &str) -> Result<String>,
 ) -> Result<Vec<ai::Question>> {
     if !(4..=5).contains(&choices_count) {
-        return Err(invalid("Şık sayısı 4 veya 5 olmalıdır."));
+        return Err(invalid(
+            "Şık sayısı 4 veya 5 olmalıdır / Choices count must be 4 or 5.",
+        ));
     }
     if answers.is_empty() || answers.len() > MAX_BANK_SIZE {
         return Err(invalid(format!(
-            "Soru sayısı 1–{MAX_BANK_SIZE} arasında olmalıdır."
+            "Soru sayısı 1–{MAX_BANK_SIZE} arasında olmalıdır / Question count must be between 1 and {MAX_BANK_SIZE}."
         )));
     }
     if let Some((i, &ans)) = answers
@@ -307,7 +318,8 @@ pub fn import_with(
         .find(|(_, ans)| **ans >= choices_count)
     {
         return Err(invalid(format!(
-            "{}. soru için cevap indeksi ({ans}) şık sayısı ({choices_count}) dışında.",
+            "{}. soru için cevap indeksi ({ans}) şık sayısı ({choices_count}) dışında / Answer index ({ans}) out of bounds ({choices_count}) for question {}.",
+            i + 1,
             i + 1
         )));
     }
@@ -333,7 +345,7 @@ fn saved_bank_path(root: &Path, subject: &str, slug: &str) -> Result<PathBuf> {
     let slug = course::validate_identifier(slug)?;
     Ok(root
         .join("data")
-        .join("denemeler")
+        .join("exams")
         .join(subject)
         .join(format!("{slug}.json")))
 }
@@ -342,8 +354,7 @@ fn saved_bank_path(root: &Path, subject: &str, slug: &str) -> Result<PathBuf> {
 fn resource_bank_path(root: &Path, subject: &str, slug: &str) -> Result<PathBuf> {
     let subject = course::validate_identifier(subject)?;
     let slug = course::validate_identifier(slug)?;
-    Ok(root
-        .join("kaynaklar")
+    Ok(crate::sources::sources_dir(root)
         .join(subject)
         .join("exams")
         .join(format!("{slug}.json")))
@@ -351,21 +362,29 @@ fn resource_bank_path(root: &Path, subject: &str, slug: &str) -> Result<PathBuf>
 
 fn validate_bank(bank: &Bank) -> Result<()> {
     if bank.title.trim().is_empty() {
-        return Err(invalid("Sınav bankası başlığı boş olamaz."));
+        return Err(invalid(
+            "Sınav bankası başlığı boş olamaz / Exam bank title cannot be empty.",
+        ));
     }
     for (idx, q) in bank.questions.iter().enumerate() {
         if q.question.trim().is_empty() {
-            return Err(invalid(format!("{}. soru metni boş.", idx + 1)));
+            return Err(invalid(format!(
+                "{}. soru metni boş / Question {} text is empty.",
+                idx + 1,
+                idx + 1
+            )));
         }
         if !(4..=5).contains(&q.choices.len()) {
             return Err(invalid(format!(
-                "{}. sorunun şık sayısı 4 veya 5 olmalıdır.",
+                "{}. sorunun şık sayısı 4 veya 5 olmalıdır / Question {} must have 4 or 5 choices.",
+                idx + 1,
                 idx + 1
             )));
         }
         if q.answer_index >= q.choices.len() {
             return Err(invalid(format!(
-                "{}. soru için cevap indeksi şık sayısı dışında.",
+                "{}. soru için cevap indeksi şık sayısı dışında / Answer index out of bounds for question {}.",
+                idx + 1,
                 idx + 1
             )));
         }
@@ -380,7 +399,7 @@ fn load_file(path: &Path) -> Result<Option<Bank>> {
     let len = fs::metadata(path)?.len();
     if len > course::MAX_COURSE_JSON_BYTES {
         return Err(invalid(format!(
-            "Sınav bankası çok büyük ({len} bayt): {}",
+            "Sınav bankası çok büyük ({len} bayt) / Exam bank too large ({len} bytes): {}",
             path.display()
         )));
     }
@@ -418,7 +437,7 @@ fn collect_banks_in_dir(
     let canon_dir = fs::canonicalize(dir)?;
     if canon_dir == canon_base || !canon_dir.starts_with(&canon_base) {
         return Err(invalid(format!(
-            "Sınav dizini izin verilen kök dışına taşıyor: {}",
+            "Sınav dizini izin verilen kök dışına taşıyor / Exam directory escapes allowed root: {}",
             dir.display()
         )));
     }
@@ -455,17 +474,17 @@ fn collect_banks_in_dir(
     Ok(())
 }
 
-/// Discovers valid mock exam banks under `<root>/kaynaklar/<subject>/exams/*.json`
-/// and `<root>/data/denemeler/<subject>/*.json`, sorted deterministically by slug.
+/// Discovers valid mock exam banks under `<root>/resources/<subject>/exams/*.json`
+/// and `<root>/data/exams/<subject>/*.json`, sorted deterministically by slug.
 pub fn discover_banks(root: &Path, subject: &str) -> Result<Vec<DiscoveredBank>> {
     let subject = course::validate_identifier(subject)?;
     let mut found = BTreeMap::new();
-    let kaynaklar_root = root.join("kaynaklar");
-    let exams_dir = kaynaklar_root.join(subject).join("exams");
-    collect_banks_in_dir(&kaynaklar_root, &exams_dir, &mut found)?;
-    let denemeler_root = root.join("data").join("denemeler");
-    let denemeler_dir = denemeler_root.join(subject);
-    collect_banks_in_dir(&denemeler_root, &denemeler_dir, &mut found)?;
+    let resources_root = crate::sources::sources_dir(root);
+    let exams_dir = resources_root.join(subject).join("exams");
+    collect_banks_in_dir(&resources_root, &exams_dir, &mut found)?;
+    let data_exams_root = root.join("data").join("exams");
+    let data_exams_dir = data_exams_root.join(subject);
+    collect_banks_in_dir(&data_exams_root, &data_exams_dir, &mut found)?;
     Ok(found.into_values().collect())
 }
 
@@ -611,7 +630,7 @@ mod tests {
     fn spec_exam_1_2_dynamic_discovery_and_traversal_guard() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let bio_exams = root.join("kaynaklar/Biology/exams");
+        let bio_exams = root.join("resources/Biology/exams");
         fs::create_dir_all(&bio_exams).unwrap();
         let midterm = Bank {
             title: "Biology Midterm".into(),
@@ -801,13 +820,13 @@ mod tests {
                 serde_json::to_string(&escaped).unwrap(),
             )
             .unwrap();
-            fs::create_dir_all(root.join("kaynaklar/EscapeDir")).unwrap();
-            symlink(&outside, root.join("kaynaklar/EscapeDir/exams")).unwrap();
+            fs::create_dir_all(root.join("resources/EscapeDir")).unwrap();
+            symlink(&outside, root.join("resources/EscapeDir/exams")).unwrap();
             assert!(discover_banks(root, "EscapeDir").is_err());
 
             symlink(
                 outside.join("leak.json"),
-                root.join("data/denemeler/Bio/leak.json"),
+                root.join("data/exams/Bio/leak.json"),
             )
             .unwrap();
             let bio = discover_banks(root, "Bio").unwrap();

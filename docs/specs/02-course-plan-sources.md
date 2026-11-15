@@ -10,12 +10,12 @@
 | ID | Requirement |
 | :--- | :--- |
 | `COURSE-1` | Zero hardcoded domain-specific course names, exam brands, publishers, websites, or teacher personas in defaults or heuristics. |
-| `COURSE-2` | Zero-config onboarding: any valid directory `<root>/kaynaklar/<subject>/` loads cleanly with `CourseConfig::default()` (`title = None`, `persona = None`, `exam = None`, `plan = []`). |
-| `COURSE-3` | Optional `<root>/kaynaklar/<subject>/course.json` schema (`#[serde(deny_unknown_fields)]` optional or clean typed fields): `title: Option<String>`, `persona: Option<String>`, `exam: Option<ExamConfig>`, `plan: Vec<DayConfig>`. `ExamConfig` validates `question_count` (`1..=200`, default `20`), `choices_count` (`4..=5`, default `5`), `categories: Vec<CategoryWeight { name, count }>`, and `rules: Option<String>`. `DayConfig` holds `day: u16`, `title: String`, `tasks: Vec<TaskConfig { command, label }>`. Invalid JSON surfaces a clear error identifying the file path rather than silently ignoring user typos. |
+| `COURSE-2` | Zero-config onboarding: any valid directory `<root>/resources/<subject>/` loads cleanly with `CourseConfig::default()` (`title = None`, `persona = None`, `exam = None`, `plan = []`). |
+| `COURSE-3` | Optional `<root>/resources/<subject>/course.json` schema (`#[serde(deny_unknown_fields)]` optional or clean typed fields): `title: Option<String>`, `persona: Option<String>`, `exam: Option<ExamConfig>`, `plan: Vec<DayConfig>`. `ExamConfig` validates `question_count` (`1..=200`, default `20`), `choices_count` (`4..=5`, default `5`), `categories: Vec<CategoryWeight { name, count }>`, and `rules: Option<String>`. `DayConfig` holds `day: u16`, `title: String`, `tasks: Vec<TaskConfig { command, label }>`. Invalid JSON surfaces a clear error identifying the file path rather than silently ignoring user typos. |
 | `COURSE-4` | Safe identifier containment: subject directory names and slug identifiers reject `""`, `"."`, `".."`, `/`, `\`, `\0`, and leading `-`. Canonicalized resource targets stay strictly inside their base directory. |
 
 ### Acceptance Criteria (`COURSE-*`)
-- **Given** an empty directory `kaynaklar/Rust101/notes.md` with no `course.json` -> **Then** `CourseConfig::load_or_default` returns default config cleanly and indexing discovers `"Rust101"`.
+- **Given** an empty directory `resources/Rust101/notes.md` with no `course.json` -> **Then** `CourseConfig::load_or_default` returns default config cleanly and indexing discovers `"Rust101"`.
 - **Given** `examples/general-course/course.json` and `examples/academic-english/course.json` -> **Then** both deserialize cleanly and pass `CourseConfig::validate()`.
 - **Given** `choices_count: 7` or `day: 0` or subject `"../secret"` -> **Then** validation rejects cleanly with `Err`.
 
@@ -48,11 +48,11 @@
 
 | ID | Requirement |
 | :--- | :--- |
-| `SRC-1` | Supports `.txt`, `.md`, `.pdf`, `.docx` inside `kaynaklar/<subject>/`. Skips `course.json`, `exams/`, `_duplicates`, `99_ARCHIVE`, and hidden (`.`-prefixed) directories. Tolerates broken symlinks (`read_dir`/metadata errors skip offending entry instead of aborting the subject). Prevents circular symlink infinite recursion via `max_depth = 16` and visited canonical directory set. |
+| `SRC-1` | Supports `.txt`, `.md`, `.pdf`, `.docx` inside `resources/<subject>/`. Skips `course.json`, `exams/`, `_duplicates`, `99_ARCHIVE`, and hidden (`.`-prefixed) directories. Tolerates broken symlinks (`read_dir`/metadata errors skip offending entry instead of aborting the subject). Prevents circular symlink infinite recursion via `max_depth = 16` and visited canonical directory set. |
 | `SRC-2` | Resource bounds: checks `metadata.len() > MAX_BYTES` (`25 MiB`) **before** copying a PDF to a `tempfile::Builder` file or calling `pdftotext`. DOCX zip extraction enforces `MAX_BYTES` on entry size and decompressed XML stream. PDF/DOCX extraction loops track accumulated character counts incrementally ($O(N)$, no per-iteration `output.chars().count()`). `pdftotext` fallback path (`C:\Program Files\Git\mingw64\bin\pdftotext.exe`) is guarded with `#[cfg(windows)]` and runs with bounded stdout + subprocess timeout. |
 | `SRC-3` | Zero `eprintln!` calls inside `sources::index` (prevents corrupting Ratatui's alternate screen when indexed from TUI background threads); non-fatal extraction warnings append via `telegram::log_file(root, ...)`. Zero hardcoded exam marker strings, keyword expansion maps, or watermark cleanup lists. |
 
 ### Acceptance Criteria (`SRC-*`)
 - **Given** a 26 MiB file named `türkçe.pdf` -> **Then** `MAX_BYTES` check rejects it *before* creating a temp PDF copy or invoking `pdftotext`.
-- **Given** a circular directory symlink `a/b -> ../` inside `kaynaklar/Demo/` -> **Then** `sources::index` completes safely without stack overflow.
-- **Given** a broken symlink inside `kaynaklar/` -> **Then** `sources::subjects()` and `sources::index()` continue discovering valid subjects/files.
+- **Given** a circular directory symlink `a/b -> ../` inside `resources/Demo/` -> **Then** `sources::index` completes safely without stack overflow.
+- **Given** a broken symlink inside `resources/` -> **Then** `sources::subjects()` and `sources::index()` continue discovering valid subjects/files.
