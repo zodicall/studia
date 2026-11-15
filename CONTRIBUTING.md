@@ -40,3 +40,8 @@ If you work in an offline environment, `cargo test --offline --locked` runs the 
   - Zero `.unwrap()`, `.expect()`, or `todo!()` in non-`#[cfg(test)]` production paths.
   - Zero `eprintln!` inside TUI code (`src/tui.rs`, `src/tui/`).
   - Never commit `.env`, databases (`*.db`), private study materials (`kaynaklar/`, `data/`, `anki/`), personal filesystem paths, or tokens.
+
+## Licensing & Copyright Policy
+
+- **Inbound = Outbound (MIT)**: By submitting a pull request or other contribution to `studia`, you agree that your contribution is licensed under the project's [MIT License](LICENSE).
+- **No Copyrighted Third-Party Materials**: Do not submit copyrighted third-party exam questions, textbooks, answer keys, or proprietary course materials in PRs, issues, or example templates. All sample courses and test fixtures must be original or permissively licensed.

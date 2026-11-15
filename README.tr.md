@@ -19,7 +19,7 @@
 
 - **Rust 1.89+** (`cargo build --release --locked`) veya hazır release ikilisi
 - `PATH` içinde **`curl`** (Telegram ve HTTP AI istekleri için)
-- **`pdftotext`** (Poppler, isteğe bağlı — yalnızca `.pdf` dosyalarını indekslemek için gereklidir; `.md`, `.txt` ve `.docx` ek araç gerektirmeden çalışır)
+- **`pdftotext`** (Poppler, isteğe bağlı fallback — gömülü PDF metin okuyucu dahildir; `.md`, `.txt`, `.docx` ve standart `.pdf` dosyaları ek araç gerektirmeden çalışır)
 
 ### Kurulum ve Çalıştırma
 
@@ -150,10 +150,16 @@ Tüm komutların hem Türkçe hem İngilizce biçimi geçerlidir:
 
 Kurulum sorunlarını çevrimdışı incelemek için `studia doctor` çalıştırın:
 - **`curl bulunamadı`**: `curl` kurup `PATH` dizinine ekleyin.
-- **`pdftotext bulunamadı`**: PDF dosyalarından çalışıyorsanız Poppler (`pdftotext`) kurun.
+- **`pdftotext: yüklü değil`**: Yalnızca isteğe bağlı fallback içindir; gömülü PDF metin okuyucu aktiftir. Karmaşık PDF'lerde ek çıkarma gerekirse Poppler (`pdftotext`) kurabilirsiniz.
 - **`Ortam dosyası izinleri çok açık`**: Unix/macOS'ta `chmod 600 .env` uygulayın.
 - **`non-loopback http://`**: Uzak sunucu adreslerinde mümkünse `https://` kullanın.
 
+## Sorumluluk Reddi, Üçüncü Taraf Bildirimleri ve Gizlilik
+
+- **Yapay Zeka Doğruluğu ve Başarı Garantisi Olmaması**: Yapay zeka tarafından üretilen konu anlatımları, quizler, Leitner tekrar varyasyonları ve koçluk geri bildirimleri hatalar veya halüsinasyonlar içerebilir; yalnızca çalışma desteği amaçlıdır ve akademik başarı veya sınav sonucu garantisi vermez.
+- **Bağlantısızlık ve Ticari Markalar**: `studia` bağımsız bir açık kaynak projesidir. Telegram, Google Gemini, OpenAI, Anthropic Claude, Anki, Ollama ve anılan diğer ad/hizmetler ilgili sahiplerinin ticari markalarıdır; yapılandırdığınız harici sağlayıcıların Kullanım Koşullarına uymak tamamen kullanıcının sorumluluğundadır.
+- **Kendi Sunucunuzda Gizlilik (KVKK / GDPR)**: `studia` makinenizde yerel olarak çalışır; yalnızca yapılandırdığınız AI ve Telegram API'lerine indekslenmiş not kesitlerini ve istemleri gönderir, çalışma geçmişi ile çalışma günlüklerini yerel olarak `data/studia.db` ve `data/bot.log` içinde saklar. İşleticiler, izinsiz kişisel veri, gizli bilgi veya telif hakkıyla korunan üçüncü taraf materyalleri yüklemekten kaçınmalıdır.
+
 ## Güvenlik ve Lisans
 
-Güvenlik sınırları ve bildirim süreci için [SECURITY.md](SECURITY.md), lisans koşulları için [LICENSE](LICENSE) dosyasına bakın.
+Güvenlik sınırları ve bildirim süreci için [SECURITY.md](SECURITY.md), lisans koşulları için [LICENSE](LICENSE) ve üçüncü taraf bağımlılık bildirimleri için [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) dosyasına bakın.

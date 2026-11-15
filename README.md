@@ -19,7 +19,7 @@
 
 - **Rust 1.89+** (`cargo build --release --locked`) or a prebuilt release binary
 - **`curl`** on `PATH` (for Telegram API & HTTP AI requests)
-- **`pdftotext`** (Poppler, optional — required only when indexing `.pdf` files; `.md`, `.txt`, and `.docx` work out of the box)
+- **`pdftotext`** (Poppler, optional fallback — a built-in PDF text extractor is included; `.md`, `.txt`, `.docx`, and standard `.pdf` files work out of the box)
 
 ### Install & Run
 
@@ -150,10 +150,16 @@ All commands accept both English and Turkish aliases:
 
 Run `studia doctor` to diagnose setup issues offline:
 - **`[FAIL] curl not found`**: Install `curl` and ensure it is in `PATH`.
-- **`[INFO] pdftotext not found`**: Install Poppler (`pdftotext`) if you study from PDFs.
+- **`[INFO] pdftotext: not installed`**: Optional fallback only; the built-in PDF text extractor is active. Install Poppler (`pdftotext`) if you need fallback extraction for complex PDFs.
 - **`[WARN] Env file permissions are too broad`**: Restrict `.env` permissions (`chmod 600 .env`) on Unix/macOS.
 - **`[WARN] non-loopback http://`**: Prefer `https://` for remote `STUDIA_AI_BASE_URL` endpoints.
 
+## Disclaimer, Third-Party Notices & Privacy
+
+- **AI Accuracy & No Outcome Guarantee**: AI-generated explanations, quizzes, Leitner review variations, and coaching feedback may contain inaccuracies or hallucinations and are provided for study assistance only, with no guarantee of academic, grading, or exam outcomes.
+- **Non-Affiliation & Trademarks**: `studia` is an independent open-source project. Telegram, Google Gemini, OpenAI, Anthropic Claude, Anki, Ollama, and other referenced names/services are trademarks of their respective owners; users are solely responsible for complying with the Terms of Service of any external provider they configure.
+- **Self-Hosted Privacy (KVKK / GDPR)**: `studia` runs locally on your machine, sends indexed note excerpts and prompts only to the AI and Telegram APIs you configure, and stores study history and runtime logs locally in `data/studia.db` and `data/bot.log`. Operators must avoid uploading personal, confidential, or copyrighted third-party materials without proper authorization.
+
 ## Security & License
 
-See [SECURITY.md](SECURITY.md) for the security model, local-first data guarantees, and vulnerability reporting, and [LICENSE](LICENSE) for the MIT License.
+See [SECURITY.md](SECURITY.md) for the security model, local-first data guarantees, and vulnerability reporting, [LICENSE](LICENSE) for the MIT License, and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for third-party crate license and copyright notices.
