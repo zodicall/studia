@@ -1,9 +1,16 @@
 //! Yapay zeka koçu: ders yapılandırmasını (`course.json`) ve çalışma planını izler.
 //! Plan varsa bugünün bekleyen görevleri arasından seçer; plan yoksa istatistiklere göre öneri verir.
 
-use crate::{Result, course::CourseConfig, i18n::Lang, plan, store::Store};
+use crate::{
+    Result,
+    course::{CourseConfig, DayConfig},
+    i18n::Lang,
+    plan, sources,
+    store::Store,
+};
 use chrono::NaiveDate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Bekleyen tekrar sayısı bu eşiğe ulaşınca tekrar görevi öne alınır.
 pub const REVIEW_THRESHOLD: i64 = 5;
@@ -144,6 +151,42 @@ pub fn taught_key(subject: &str, topic: &str) -> String {
     format!("coach:taught:{subject}:{topic}")
 }
 
+fn collect_topics_and_recent(
+    store: &Store,
+    subject: &str,
+    course: &CourseConfig,
+) -> Result<(Vec<Topic>, Vec<String>)> {
+    let totals = store.topic_totals(subject)?;
+    let mut names = lesson_topics(course);
+    for (topic, _, _) in &totals {
+        if !names.iter().any(|existing| topic.contains(existing)) && !names.contains(topic) {
+            names.push(topic.clone());
+        }
+    }
+    let mut topics = Vec::with_capacity(names.len());
+    for name in names {
+        let (correct, total) = totals
+            .iter()
+            .filter(|(topic, _, _)| topic.contains(&name))
+            .fold((0, 0), |(c, t), (_, dc, dt)| (c + dc, t + dt));
+        let taught = store.state(&taught_key(subject, &name))?.is_some();
+        topics.push(Topic {
+            name,
+            taught,
+            correct,
+            total,
+        });
+    }
+    let recent = store
+        .recent_sessions()?
+        .into_iter()
+        .filter(|session| session.subject == subject)
+        .take(5)
+        .map(|session| format!("{}: {}/{}", session.topic, session.correct, session.total))
+        .collect();
+    Ok((topics, recent))
+}
+
 /// Bir dersin koç için durum özeti. `today` planın hangi gününde olunduğunu belirler.
 pub fn snapshot(
     store: &Store,
@@ -186,34 +229,7 @@ pub fn snapshot(
         }
     };
 
-    let totals = store.topic_totals(subject)?;
-    let mut names = lesson_topics(course);
-    for (topic, _, _) in &totals {
-        if !names.iter().any(|existing| topic.contains(existing)) && !names.contains(topic) {
-            names.push(topic.clone());
-        }
-    }
-    let mut topics = Vec::with_capacity(names.len());
-    for name in names {
-        let (correct, total) = totals
-            .iter()
-            .filter(|(topic, _, _)| topic.contains(&name))
-            .fold((0, 0), |(c, t), (_, dc, dt)| (c + dc, t + dt));
-        let taught = store.state(&taught_key(subject, &name))?.is_some();
-        topics.push(Topic {
-            name,
-            taught,
-            correct,
-            total,
-        });
-    }
-    let recent = store
-        .recent_sessions()?
-        .into_iter()
-        .filter(|session| session.subject == subject)
-        .take(5)
-        .map(|session| format!("{}: {}/{}", session.topic, session.correct, session.total))
-        .collect();
+    let (topics, recent) = collect_topics_and_recent(store, subject, course)?;
     Ok(Snapshot {
         subject: subject.to_string(),
         course_title: course.display_title(subject).to_string(),
@@ -223,6 +239,305 @@ pub fn snapshot(
         topics,
         recent,
     })
+}
+
+/// Plan güncelleme kontrolünün neden tetiklendiği.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdaptTrigger {
+    /// Bugünün çalıştırılabilir görevleri tamamlandı (gün sonu kontrolü).
+    EndOfDay,
+    /// Yeni gün başladı ve bir önceki günde eksik görevler var.
+    Carryover {
+        missed_day: usize,
+        missed_labels: Vec<String>,
+    },
+}
+
+impl AdaptTrigger {
+    pub fn kind_key(&self) -> &'static str {
+        match self {
+            Self::EndOfDay => "eod",
+            Self::Carryover { .. } => "carryover",
+        }
+    }
+}
+
+/// Plan düzenleme kontrolü için AI'ye gönderilen durum özeti.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdaptContext {
+    pub subject: String,
+    pub course_title: String,
+    pub persona: Option<String>,
+    pub start: NaiveDate,
+    pub current_day: usize,
+    pub total_days: usize,
+    pub editable_from_day: usize,
+    pub trigger: AdaptTrigger,
+    pub done_today_labels: Vec<String>,
+    pub remaining_plan: Vec<DayConfig>,
+    pub due: i64,
+    pub topics: Vec<Topic>,
+    pub recent: Vec<String>,
+    pub catalog: Vec<String>,
+}
+
+/// Kullanıcının onayına sunulan plan değişikliği önerisi.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanProposal {
+    pub subject: String,
+    #[serde(with = "date_serde")]
+    pub start: NaiveDate,
+    pub editable_from_day: usize,
+    pub summary: String,
+    pub adapted_days: Vec<DayConfig>,
+    pub trigger_kind: String,
+}
+
+mod date_serde {
+    use chrono::NaiveDate;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    pub fn serialize<S: Serializer>(date: &NaiveDate, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&date.format("%Y-%m-%d").to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<NaiveDate, D::Error> {
+        let raw = String::deserialize(d)?;
+        NaiveDate::parse_from_str(&raw, "%Y-%m-%d").map_err(de::Error::custom)
+    }
+}
+
+/// Aynı gün aynı kontrolün yinelenmesini önleyen durum anahtarı.
+pub fn adapt_checked_key(subject: &str, start: NaiveDate, day: usize, kind: &str) -> String {
+    format!(
+        "plan_adapt_checked:{subject}:{}:{day}:{kind}",
+        start.format("%Y-%m-%d")
+    )
+}
+
+pub fn mark_adapt_checked(store: &Store, ctx: &AdaptContext) -> Result<()> {
+    let key = adapt_checked_key(
+        &ctx.subject,
+        ctx.start,
+        ctx.current_day,
+        ctx.trigger.kind_key(),
+    );
+    store.set_state(&key, "1")
+}
+
+/// Plan elle düzenlendiğinde veya yeniden oluşturulduğunda eski kontrol/öneri durumunu temizler.
+pub fn clear_adapt_state(store: &Store, subject: &str) -> Result<()> {
+    store.clear_state(&format!("plan_proposal:{subject}"))?;
+    store.clear_state_prefix(&format!("plan_adapt_checked:{subject}:"))
+}
+
+fn is_runnable_cmd(command: &str) -> bool {
+    let name = command.split_whitespace().next().unwrap_or("");
+    RUNNABLE.contains(&name)
+}
+
+/// Gün sonu (bugünün çalıştırılabilir görevleri bitti) veya ertesi gün eksik görevi kontrol eder.
+pub fn detect_adapt_trigger(
+    store: &Store,
+    root: &Path,
+    subject: &str,
+    course: &CourseConfig,
+    due: i64,
+    today: NaiveDate,
+) -> Result<Option<AdaptContext>> {
+    if course.plan.is_empty() {
+        return Ok(None);
+    }
+    let plan::Status::Active { start, day, done } =
+        plan::status(store, subject, &course.plan, today)?
+    else {
+        return Ok(None);
+    };
+    let Some(today_cfg) = plan::day(&course.plan, day) else {
+        return Ok(None);
+    };
+    let total_days = course.plan.len();
+    let any_done_today = done.iter().any(|d| *d);
+
+    if day > 1
+        && store
+            .state(&adapt_checked_key(subject, start, day, "carryover"))?
+            .is_none()
+        && let Some(prev_cfg) = plan::day(&course.plan, day - 1)
+    {
+        let prev_done = plan::day_done(store, subject, &course.plan, start, day - 1)?;
+        let missed: Vec<String> = prev_cfg
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !prev_done.get(*idx).copied().unwrap_or(false))
+            .map(|(_, task)| task.label.clone())
+            .collect();
+        let editable_from = if any_done_today { day + 1 } else { day };
+        if !missed.is_empty() && editable_from <= plan::MAX_PLAN_DAYS {
+            return build_adapt_context(
+                store,
+                root,
+                subject,
+                course,
+                due,
+                start,
+                day,
+                total_days,
+                editable_from,
+                AdaptTrigger::Carryover {
+                    missed_day: day - 1,
+                    missed_labels: missed,
+                },
+                today_cfg,
+                &done,
+            )
+            .map(Some);
+        }
+    }
+
+    check_eod_trigger(
+        store,
+        root,
+        subject,
+        course,
+        due,
+        start,
+        day,
+        total_days,
+        today_cfg,
+        &done,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_eod_trigger(
+    store: &Store,
+    root: &Path,
+    subject: &str,
+    course: &CourseConfig,
+    due: i64,
+    start: NaiveDate,
+    day: usize,
+    total_days: usize,
+    today_cfg: &DayConfig,
+    done: &[bool],
+) -> Result<Option<AdaptContext>> {
+    if day >= plan::MAX_PLAN_DAYS {
+        return Ok(None);
+    }
+    if store
+        .state(&adapt_checked_key(subject, start, day, "eod"))?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let any_done_today = done.iter().any(|d| *d);
+    if !any_done_today {
+        return Ok(None);
+    }
+    let pending_runnable = today_cfg
+        .tasks
+        .iter()
+        .enumerate()
+        .any(|(idx, t)| !done.get(idx).copied().unwrap_or(false) && is_runnable_cmd(&t.command));
+    if pending_runnable {
+        return Ok(None);
+    }
+    build_adapt_context(
+        store,
+        root,
+        subject,
+        course,
+        due,
+        start,
+        day,
+        total_days,
+        day + 1,
+        AdaptTrigger::EndOfDay,
+        today_cfg,
+        done,
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_adapt_context(
+    store: &Store,
+    root: &Path,
+    subject: &str,
+    course: &CourseConfig,
+    due: i64,
+    start: NaiveDate,
+    current_day: usize,
+    total_days: usize,
+    editable_from_day: usize,
+    trigger: AdaptTrigger,
+    today_cfg: &DayConfig,
+    done: &[bool],
+) -> Result<AdaptContext> {
+    let (topics, recent) = collect_topics_and_recent(store, subject, course)?;
+    let catalog = sources::catalog(root, subject, 40).unwrap_or_default();
+    let done_today_labels = today_cfg
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| done.get(*idx).copied().unwrap_or(false))
+        .map(|(_, t)| t.label.clone())
+        .collect();
+    let remaining_plan = course
+        .plan
+        .get(editable_from_day.saturating_sub(1)..)
+        .unwrap_or(&[])
+        .to_vec();
+    Ok(AdaptContext {
+        subject: subject.to_string(),
+        course_title: course.display_title(subject).to_string(),
+        persona: course.persona.clone(),
+        start,
+        current_day,
+        total_days,
+        editable_from_day,
+        trigger,
+        done_today_labels,
+        remaining_plan,
+        due,
+        topics,
+        recent,
+        catalog,
+    })
+}
+
+/// Önerilen plan değişikliğinin kullanıcıya gösterilecek kısa önizleme satırları.
+pub fn proposal_preview(
+    course: &CourseConfig,
+    proposal: &PlanProposal,
+    lang: Lang,
+) -> Vec<String> {
+    proposal
+        .adapted_days
+        .iter()
+        .enumerate()
+        .take(5)
+        .map(|(idx, new_day)| {
+            let day_num = proposal.editable_from_day + idx;
+            let tag = match day_num.checked_sub(1).and_then(|i| course.plan.get(i)) {
+                Some(old) if old.title == new_day.title && old.tasks == new_day.tasks => {
+                    lang.pick("korundu", "unchanged")
+                }
+                Some(_) => lang.pick("güncellendi", "updated"),
+                None => lang.pick("eklendi", "added"),
+            };
+            let tasks: Vec<&str> = new_day.tasks.iter().map(|t| t.label.as_str()).collect();
+            format!(
+                "{} {day_num} ({tag}): {} — {}",
+                lang.pick("Gün", "Day"),
+                new_day.title,
+                tasks.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// AI'ye giden karar istemi: bugünün görevleri, durum ve kurallar.
@@ -694,5 +1009,143 @@ mod tests {
         let done = day_snapshot(1, vec![task(0, "/tekrar", true)]);
         assert!(idle_message(&done, Lang::Tr).contains("tüm görevleri tamam"));
         assert!(idle_message(&done, Lang::En).contains("complete"));
+    }
+
+    #[test]
+    fn detect_adapt_trigger_fires_end_of_day_once_when_runnable_tasks_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("studia.db")).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let course = sample_course();
+        plan::set_start(&store, "rust", today).unwrap();
+
+        // No tasks done yet -> should not trigger EOD.
+        assert!(
+            detect_adapt_trigger(&store, dir.path(), "rust", &course, 0, today)
+                .unwrap()
+                .is_none()
+        );
+
+        // One runnable task still pending -> should not trigger EOD.
+        plan::mark_done(&store, "rust", today, 1, 0).unwrap();
+        assert!(
+            detect_adapt_trigger(&store, dir.path(), "rust", &course, 0, today)
+                .unwrap()
+                .is_none()
+        );
+
+        // All runnable tasks of day 1 done -> fires EOD once.
+        plan::mark_done(&store, "rust", today, 1, 1).unwrap();
+        let ctx = detect_adapt_trigger(&store, dir.path(), "rust", &course, 3, today)
+            .unwrap()
+            .expect("EOD trigger should fire");
+        assert_eq!(ctx.trigger, AdaptTrigger::EndOfDay);
+        assert_eq!(ctx.current_day, 1);
+        assert_eq!(ctx.editable_from_day, 2);
+        assert_eq!(ctx.remaining_plan.len(), 1);
+
+        mark_adapt_checked(&store, &ctx).unwrap();
+        assert!(
+            detect_adapt_trigger(&store, dir.path(), "rust", &course, 3, today)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn detect_adapt_trigger_fires_carryover_when_yesterday_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("studia.db")).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        let course = sample_course();
+        plan::set_start(&store, "rust", start).unwrap();
+        // Only task 0 of day 1 was finished; task 1 ("Ownership") was missed.
+        plan::mark_done(&store, "rust", start, 1, 0).unwrap();
+
+        let ctx = detect_adapt_trigger(&store, dir.path(), "rust", &course, 0, day2)
+            .unwrap()
+            .expect("Carryover should fire on day 2");
+        assert_eq!(
+            ctx.trigger,
+            AdaptTrigger::Carryover {
+                missed_day: 1,
+                missed_labels: vec!["Ownership".into()],
+            }
+        );
+        assert_eq!(ctx.editable_from_day, 2);
+        mark_adapt_checked(&store, &ctx).unwrap();
+        assert!(
+            detect_adapt_trigger(&store, dir.path(), "rust", &course, 0, day2)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn proposal_preview_marks_updated_and_added_days() {
+        let course = sample_course();
+        let proposal = PlanProposal {
+            subject: "rust".into(),
+            start: NaiveDate::from_ymd_opt(2026, 11, 5).unwrap(),
+            editable_from_day: 2,
+            summary: "Extra practice".into(),
+            adapted_days: vec![
+                DayConfig {
+                    day: 2,
+                    title: "Ownership Review".into(),
+                    tasks: vec![TaskConfig {
+                        command: "/quiz Ownership 5".into(),
+                        label: "Ownership Quiz".into(),
+                    }],
+                },
+                DayConfig {
+                    day: 3,
+                    title: "Lifetimes".into(),
+                    tasks: vec![TaskConfig {
+                        command: "/anlat Lifetimes".into(),
+                        label: "Lifetimes".into(),
+                    }],
+                },
+            ],
+            trigger_kind: "eod".into(),
+        };
+        let preview = proposal_preview(&course, &proposal, Lang::Tr);
+        assert_eq!(preview.len(), 2);
+        assert!(preview[0].contains("Gün 2 (güncellendi)"));
+        assert!(preview[1].contains("Gün 3 (eklendi)"));
+    }
+
+    #[test]
+    fn detect_adapt_trigger_skips_when_at_max_plan_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("studia.db")).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let day_90 = start + chrono::Days::new((plan::MAX_PLAN_DAYS - 1) as u64);
+        let days = (1..=plan::MAX_PLAN_DAYS)
+            .map(|d| DayConfig {
+                day: d,
+                title: format!("Day {d}"),
+                tasks: vec![TaskConfig {
+                    command: "/review".into(),
+                    label: "Review".into(),
+                }],
+            })
+            .collect();
+        let course = CourseConfig {
+            title: Some("Long Course".into()),
+            persona: None,
+            exam: None,
+            plan: days,
+        };
+        plan::set_start(&store, "rust", start).unwrap();
+        for d in 1..=plan::MAX_PLAN_DAYS {
+            plan::mark_done(&store, "rust", start, d, 0).unwrap();
+        }
+        assert!(
+            detect_adapt_trigger(&store, dir.path(), "rust", &course, 0, day_90)
+                .unwrap()
+                .is_none()
+        );
     }
 }

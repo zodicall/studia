@@ -3,11 +3,12 @@
 
 use crate::{
     Result,
-    course::{DayConfig, TaskConfig, validate_identifier},
+    course::{CourseConfig, DayConfig, TaskConfig, validate_identifier},
     invalid,
     store::Store,
 };
 use chrono::{Days, NaiveDate, NaiveDateTime, NaiveTime};
+use std::path::Path;
 
 const START_KEY_PREFIX: &str = "plan_start";
 const DATE_FORMAT: &str = "%Y-%m-%d";
@@ -138,6 +139,53 @@ pub fn clear_done(store: &Store, subject: &str, start: NaiveDate) -> Result<()> 
     validate_identifier(subject)?;
     let prefix = format!("plan_done:{subject}:{}:", start.format(DATE_FORMAT));
     store.clear_state_prefix(&prefix)
+}
+
+/// Clears completion marks for `subject` starting on `start` from `from_day` onward,
+/// preserving completion flags of earlier days.
+pub fn clear_done_from(
+    store: &Store,
+    subject: &str,
+    start: NaiveDate,
+    from_day: usize,
+) -> Result<()> {
+    validate_identifier(subject)?;
+    let start_str = start.format(DATE_FORMAT);
+    for day_num in from_day.max(1)..=MAX_PLAN_DAYS {
+        let prefix = format!("plan_done:{subject}:{start_str}:{day_num}:");
+        store.clear_state_prefix(&prefix)?;
+    }
+    Ok(())
+}
+
+/// Replaces plan days from `editable_from_day` (1-based) onward while keeping earlier days
+/// and their completion marks intact.
+pub fn apply_adapted_days(
+    root: &Path,
+    store: &Store,
+    subject: &str,
+    start: NaiveDate,
+    editable_from_day: usize,
+    adapted: Vec<DayConfig>,
+) -> Result<CourseConfig> {
+    validate_identifier(subject)?;
+    let mut course = CourseConfig::load_or_default(root, subject)?;
+    if editable_from_day == 0 || editable_from_day - 1 > course.plan.len() {
+        return Err(invalid(format!(
+            "editable_from_day ({editable_from_day}) out of range for plan length {}.",
+            course.plan.len()
+        )));
+    }
+    let mut updated = course.plan[..editable_from_day - 1].to_vec();
+    let remaining_capacity = MAX_PLAN_DAYS.saturating_sub(updated.len());
+    for (idx, mut day_cfg) in adapted.into_iter().take(remaining_capacity).enumerate() {
+        day_cfg.day = editable_from_day + idx;
+        updated.push(day_cfg);
+    }
+    course.plan = updated;
+    course.save(root, subject)?;
+    clear_done_from(store, subject, start, editable_from_day)?;
+    Ok(course)
 }
 
 /// Parses either a day count (`1..=MAX_PLAN_DAYS`) or a target exam date (`YYYY-MM-DD` / `DD.MM.YYYY`).
@@ -419,6 +467,57 @@ mod tests {
         assert_eq!(
             day_done(&store, "history", &days, today, 1).unwrap(),
             vec![true, false]
+        );
+    }
+
+    #[test]
+    fn apply_adapted_days_preserves_past_days_and_done_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("studia.db")).unwrap();
+        let start = date("2026-11-05");
+        let course = CourseConfig {
+            title: Some("Math".into()),
+            persona: None,
+            exam: None,
+            plan: sample_days(),
+        };
+        course.save(dir.path(), "math").unwrap();
+        set_start(&store, "math", start).unwrap();
+        mark_done(&store, "math", start, 1, 0).unwrap();
+        mark_done(&store, "math", start, 2, 1).unwrap();
+
+        let replacement = vec![
+            DayConfig {
+                day: 1,
+                title: "Extra Basics".into(),
+                tasks: vec![TaskConfig {
+                    command: "/anlat Basics".into(),
+                    label: "Re-study basics".into(),
+                }],
+            },
+            DayConfig {
+                day: 2,
+                title: "Final Review".into(),
+                tasks: vec![TaskConfig {
+                    command: "/review".into(),
+                    label: "Due review".into(),
+                }],
+            },
+        ];
+        let updated = apply_adapted_days(dir.path(), &store, "math", start, 2, replacement).unwrap();
+        assert_eq!(updated.plan.len(), 3);
+        assert_eq!(updated.plan[0].title, "Diagnostic");
+        assert_eq!(updated.plan[1].day, 2);
+        assert_eq!(updated.plan[1].title, "Extra Basics");
+        assert_eq!(updated.plan[2].day, 3);
+        assert_eq!(updated.plan[2].title, "Final Review");
+        assert_eq!(
+            day_done(&store, "math", &updated.plan, start, 1).unwrap(),
+            vec![true, false]
+        );
+        assert_eq!(
+            day_done(&store, "math", &updated.plan, start, 2).unwrap(),
+            vec![false]
         );
     }
 }

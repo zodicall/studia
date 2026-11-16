@@ -961,16 +961,57 @@ fn draw_plan(frame: &mut Frame, content: Rect, app: &App) {
     let [coach_area, content] =
         Layout::vertical([Constraint::Length(6), Constraint::Min(1)]).areas(content);
     draw_coach(frame, coach_area, app);
+    let proposal_lines: Vec<Line<'static>> = match &app.plan_proposal {
+        Some(proposal) => {
+            let preview = crate::coach::proposal_preview(&app.course, proposal, app.lang);
+            let mut lines = Vec::with_capacity(preview.len() + 3);
+            lines.push(Line::from(Span::styled(
+                sanitize_tui_text(&proposal.summary),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            )));
+            for item in preview {
+                lines.push(Line::from(Span::styled(
+                    format!("• {}", sanitize_tui_text(&item)),
+                    Style::default().fg(TEXT),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                app.lang.pick(
+                    "[Enter / y] Planı Güncelle   [Esc / n] Mevcut Planı Koru",
+                    "[Enter / y] Apply Update   [Esc / n] Keep Current Plan",
+                ),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            lines
+        }
+        None => Vec::new(),
+    };
+    let proposal_height = if proposal_lines.is_empty() {
+        0
+    } else {
+        (proposal_lines.len() as u16).saturating_add(2).min(10)
+    };
     let summary = if app.session_tab == app.tab {
         app.summary.as_str()
     } else {
         ""
     };
-    let [summary_area, tasks] = Layout::vertical([
+    let [proposal_area, summary_area, tasks] = Layout::vertical([
+        Constraint::Length(proposal_height),
         Constraint::Length(if summary.is_empty() { 0 } else { 4 }),
         Constraint::Min(1),
     ])
     .areas(content);
+    if !proposal_lines.is_empty() {
+        panel_text(
+            frame,
+            proposal_area,
+            app.lang
+                .pick("Koç Plan Önerisi (Onay Bekliyor)", "Coach Plan Update Proposal"),
+            Text::from(proposal_lines),
+            0,
+        );
+    }
     paragraph(
         frame,
         summary_area,

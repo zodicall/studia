@@ -1,5 +1,5 @@
 use crate::{
-    Result, ai, config, course, exam,
+    Result, ai, coach, config, course, exam,
     fsrs_engine::{self, BinaryRating, CardKind, CardStatus, Flashcard},
     i18n::Lang,
     invalid, plan, sources,
@@ -159,6 +159,7 @@ pub fn plan_text_in(
                 }
             };
             plan::set_start(store, subject, start)?;
+            coach::clear_adapt_state(store, subject)?;
             let last_date = plan::date_of(start, length);
             match lang {
                 Lang::Tr => format!(
@@ -201,6 +202,7 @@ pub fn plan_text_in(
             } else {
                 let new_start = today - chrono::Days::new((number - 1) as u64);
                 plan::set_start(store, subject, new_start)?;
+                coach::clear_adapt_state(store, subject)?;
                 match lang {
                     Lang::Tr => format!(
                         "Bugün artık Gün {number}/{length}. Plan başlangıcı {} olarak güncellendi; bugünün işaretleri sıfırdan başlar. Görevler için /bugun.",
@@ -275,6 +277,7 @@ pub fn apply_generated_plan(
     let mut course_cfg = course::CourseConfig::load_or_default(root, subject)?;
     course_cfg.plan = days;
     course_cfg.save(root, subject)?;
+    coach::clear_adapt_state(store, subject)?;
     if auto_start {
         plan::clear_done(store, subject, today)?;
         plan::set_start(store, subject, today)?;
@@ -920,6 +923,10 @@ pub enum JobKind {
     RepairLeech {
         card_id: i64,
     },
+    /// Gün sonu veya ertesi gün eksik görevlere göre uyarlamalı plan kontrolü.
+    PlanAdapt {
+        ctx: Box<coach::AdaptContext>,
+    },
 }
 
 pub enum JobResult {
@@ -929,6 +936,7 @@ pub enum JobResult {
     Vocab(Vec<ai::Card>),
     Plan(Vec<course::DayConfig>),
     PlanChat(ai::PlanChatReply),
+    PlanAdapt(ai::PlanAdaptReply),
     Flashcards {
         cards: Vec<Flashcard>,
         tag: String,
@@ -1684,6 +1692,7 @@ pub fn prepare_job_in(
                 question.clone()
             }
         }
+        JobKind::PlanAdapt { .. } => title.to_string(),
     };
     prepare_job_with_query(root, store, subject, &course, kind, &query, lang)
 }
@@ -1714,7 +1723,7 @@ fn prepare_job_with_query(
         .unwrap_or_default();
 
     let sources = match kind {
-        JobKind::GeneratePlan { .. } | JobKind::PlanChat { .. } => {
+        JobKind::GeneratePlan { .. } | JobKind::PlanChat { .. } | JobKind::PlanAdapt { .. } => {
             sources::text(root, subject, query).unwrap_or_default()
         }
         _ => sources::text(root, subject, query)?,
@@ -1723,6 +1732,7 @@ fn prepare_job_with_query(
         JobKind::DenemeCoach { history, .. }
         | JobKind::LessonChat { history, .. }
         | JobKind::PlanChat { history, .. } => history.clone(),
+        JobKind::PlanAdapt { .. } => Vec::new(),
         _ => store.history(subject)?,
     };
     let quality = ai::quality_rules(lang);
@@ -2015,6 +2025,11 @@ fn prepare_job_with_query(
                 ai::leech_repair_schema(),
             )
         }
+        JobKind::PlanAdapt { ctx } => {
+            let (prompt, nonce) = ai::plan_adapt_request(ctx, lang);
+            inner_nonce = nonce;
+            (prompt, ai::plan_adapt_schema())
+        }
     };
     let request = if matches!(
         kind,
@@ -2025,6 +2040,7 @@ fn prepare_job_with_query(
             | JobKind::LessonChat { .. }
             | JobKind::GeneratePlan { .. }
             | JobKind::PlanChat { .. }
+            | JobKind::PlanAdapt { .. }
             | JobKind::GenerateFlashcards { .. }
             | JobKind::CuotibenAnalyze { .. }
             | JobKind::RepairLeech { .. }
@@ -2123,6 +2139,12 @@ pub fn failure_text_in(kind: &JobKind, lang: Lang) -> &'static str {
         (JobKind::RepairLeech { .. }, Lang::En) => {
             "Could not repair leech card right now. Please try again shortly."
         }
+        (JobKind::PlanAdapt { .. }, Lang::Tr) => {
+            "Plan uyarlama kontrolü tamamlanamadı; mevcut plan korundu."
+        }
+        (JobKind::PlanAdapt { .. }, Lang::En) => {
+            "Could not complete plan review; existing schedule kept."
+        }
     }
 }
 
@@ -2197,6 +2219,9 @@ pub fn save_job_in(
         }
         JobKind::GeneratePlan { days, .. } => Ok(JobResult::Plan(ai::parse_plan(raw, *days)?)),
         JobKind::PlanChat { .. } => Ok(JobResult::PlanChat(ai::parse_plan_chat(raw)?)),
+        JobKind::PlanAdapt { ctx } => {
+            Ok(JobResult::PlanAdapt(ai::parse_plan_adapt(raw, ctx.editable_from_day)?))
+        }
         JobKind::GenerateFlashcards { count, .. } => {
             let payload = ai::parse_cuotiben_payload(raw)?;
             if payload.route != ai::CuotibenRoute::AnkiCard || payload.cards.len() != *count {
@@ -4328,6 +4353,10 @@ impl Bot {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
+        if let JobKind::PlanAdapt { ctx } = &pending.kind {
+            // Mark checked even on failure or cancellation so poll() does not re-trigger in a loop.
+            let _ = coach::mark_adapt_checked(&self.store, ctx);
+        }
         if pending.cancelled {
             return self.edit(
                 pending.message_id,
@@ -4424,6 +4453,8 @@ impl Bot {
                         JobKind::Lesson { topic } => topic,
                         _ => lang.pick("Konu", "Topic").to_string(),
                     };
+                    self.store
+                        .set_state(&coach::taught_key(&pending.subject, &topic), "1")?;
                     let questions = self.store.add_questions(
                         &pending.subject,
                         &topic,
@@ -4578,6 +4609,50 @@ impl Bot {
                     };
                     self.edit(pending.message_id, &msg, caller)
                 }
+                JobResult::PlanAdapt(reply) => {
+                    let JobKind::PlanAdapt { ctx } = &pending.kind else {
+                        return Ok(());
+                    };
+                    if !reply.needs_update || reply.days.is_empty() {
+                        let msg = match lang {
+                            Lang::Tr => format!("✅ **Koç planı kontrol etti:** {}", reply.summary),
+                            Lang::En => {
+                                format!("✅ **Coach reviewed your plan:** {}", reply.summary)
+                            }
+                        };
+                        return self.edit(pending.message_id, &msg, caller);
+                    }
+                    let proposal = coach::PlanProposal {
+                        subject: ctx.subject.clone(),
+                        start: ctx.start,
+                        editable_from_day: ctx.editable_from_day,
+                        summary: reply.summary.clone(),
+                        adapted_days: reply.days,
+                        trigger_kind: ctx.trigger.kind_key().into(),
+                    };
+                    let json_proposal = serde_json::to_string(&proposal)?;
+                    self.store
+                        .set_state(&plan_proposal_key(&pending.subject), &json_proposal)?;
+                    let preview = coach::proposal_preview(&course, &proposal, lang).join("\n• ");
+                    let msg = match lang {
+                        Lang::Tr => format!(
+                            "✨ **Koç Plan Güncellemesi Öneriyor**\n{}\n\n• {preview}",
+                            proposal.summary
+                        ),
+                        Lang::En => format!(
+                            "✨ **Coach Proposes a Plan Update**\n{}\n\n• {preview}",
+                            proposal.summary
+                        ),
+                    };
+                    let keyboard = json!({
+                        "inline_keyboard": [[
+                            {"text": lang.pick("✅ Planı Güncelle", "✅ Apply Update"), "callback_data": "padapt:ok"},
+                            {"text": lang.pick("❌ Mevcut Kalsın", "❌ Keep Current"), "callback_data": "padapt:no"}
+                        ]]
+                    })
+                    .to_string();
+                    self.edit_with_markup(pending.message_id, &msg, Some(&keyboard), caller)
+                }
             }
         })();
         match &result {
@@ -4654,6 +4729,107 @@ impl Bot {
         Ok(())
     }
 
+    fn plan_adapt_callback(&mut self, callback: &Value, caller: &mut Caller<'_>) -> Result<()> {
+        let lang = self.lang();
+        let callback_id = callback["id"].as_str().unwrap_or("");
+        let _ = caller("answerCallbackQuery", &[("callback_query_id", callback_id)]);
+        let Some(data) = callback["data"].as_str() else {
+            return Ok(());
+        };
+        let Ok(subject) = self.active_subject() else {
+            self.send(lang.pick(STALE_BUTTON, STALE_BUTTON_EN), None, caller)?;
+            return Ok(());
+        };
+        let key = plan_proposal_key(&subject);
+        let Some(raw) = self.store.state(&key)? else {
+            self.send(lang.pick(STALE_BUTTON, STALE_BUTTON_EN), None, caller)?;
+            return Ok(());
+        };
+        let proposal: coach::PlanProposal = serde_json::from_str(&raw)?;
+        let msg = match data {
+            "padapt:ok" => {
+                self.store.clear_state(&key)?;
+                match plan::apply_adapted_days(
+                    &self.root,
+                    &self.store,
+                    &proposal.subject,
+                    proposal.start,
+                    proposal.editable_from_day,
+                    proposal.adapted_days,
+                ) {
+                    Ok(_) => match lang {
+                        Lang::Tr => format!(
+                            "✅ **Plan güncellendi!**\n{}\n\nGüncel program için /bugun.",
+                            proposal.summary
+                        ),
+                        Lang::En => format!(
+                            "✅ **Study plan updated!**\n{}\n\nRun /today to see the updated schedule.",
+                            proposal.summary
+                        ),
+                    },
+                    Err(_) => lang
+                        .pick(
+                            "Plan bu öneriden sonra değiştiği için güncelleme uygulanamadı.",
+                            "Could not apply update because the plan changed since this proposal.",
+                        )
+                        .to_string(),
+                }
+            }
+            "padapt:no" => {
+                self.store.clear_state(&key)?;
+                lang.pick(
+                    "Mevcut çalışma planı korundu.",
+                    "Kept existing study schedule.",
+                )
+                .to_string()
+            }
+            _ => {
+                self.send(lang.pick(STALE_BUTTON, STALE_BUTTON_EN), None, caller)?;
+                return Ok(());
+            }
+        };
+        if let Some(message_id) = callback["message"]["message_id"].as_i64() {
+            self.edit(message_id, &msg, caller)
+        } else {
+            self.send(&msg, None, caller).map(|_| ())
+        }
+    }
+
+    fn maybe_run_plan_adapt(
+        &mut self,
+        today: NaiveDate,
+        caller: &mut Caller<'_>,
+        ai: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        if self.pending.is_some() || self.session.is_some() || self.fc_session.is_some() {
+            return Ok(());
+        }
+        let Ok(subject) = self.active_subject() else {
+            return Ok(());
+        };
+        if self.store.state(&plan_proposal_key(&subject))?.is_some() {
+            return Ok(());
+        }
+        let course = self.load_course(&subject);
+        let due = self.store.review_counts(&subject, Utc::now()).map_or(0, |r| r.0);
+        let Some(ctx) =
+            coach::detect_adapt_trigger(&self.store, &self.root, &subject, &course, due, today)?
+        else {
+            return Ok(());
+        };
+        let checked_ctx = ctx.clone();
+        let res = self.begin_job(
+            subject,
+            JobKind::PlanAdapt { ctx: Box::new(ctx) },
+            caller,
+            ai,
+        );
+        if res.is_err() || self.pending.is_none() {
+            let _ = coach::mark_adapt_checked(&self.store, &checked_ctx);
+        }
+        res
+    }
+
     fn handle_update(
         &mut self,
         update: &Value,
@@ -4664,6 +4840,12 @@ impl Bot {
             return Ok(());
         }
         if let Some(callback) = update.get("callback_query") {
+            if callback["data"]
+                .as_str()
+                .is_some_and(|data| data.starts_with("padapt:"))
+            {
+                return self.plan_adapt_callback(callback, caller);
+            }
             if callback["data"]
                 .as_str()
                 .is_some_and(|data| data.starts_with("p:") || data.starts_with("pday:"))
@@ -5597,8 +5779,13 @@ impl Bot {
                 telegram::log(&self.root, "Telegram güncellemesi işlenemedi.");
             }
         }
-        self.complete_job(caller)
+        self.complete_job(caller)?;
+        self.maybe_run_plan_adapt(Local::now().date_naive(), caller, ai)
     }
+}
+
+fn plan_proposal_key(subject: &str) -> String {
+    format!("plan_proposal:{subject}")
 }
 
 pub fn next_listener_backoff(current: Duration, succeeded: bool) -> Duration {
@@ -8552,5 +8739,145 @@ mod tests {
             crate::fsrs_engine::CardKind::Contrastive
         );
         assert!(repaired.mnemonic_hint.is_some());
+    }
+
+    #[test]
+    fn telegram_plan_adapt_sends_proposal_buttons_and_applies_on_ok() {
+        let (root, mut bot) = setup();
+        write_test_course(root.path(), "Ders");
+        let today = Local::now().date_naive();
+        plan::set_start(&bot.store, "Ders", today).unwrap();
+        // Complete all runnable tasks on Day 1 (0: /tekrar, 1: /quiz; task 2 is manual).
+        plan::mark_done(&bot.store, "Ders", today, 1, 0).unwrap();
+        plan::mark_done(&bot.store, "Ders", today, 1, 1).unwrap();
+
+        let mut calls = vec![];
+        let ai_reply = json!({
+            "needs_update": true,
+            "summary": "Zayıf konu için 2. güne ekstra quiz eklendi.",
+            "days": [
+                {
+                    "day": 2,
+                    "title": "Ekstra Quiz",
+                    "tasks": [
+                        {"command": "/quiz Konu 5", "label": "Konu pekistirme"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+
+        bot.maybe_run_plan_adapt(today, &mut caller(&mut calls), move |prompt, schema| {
+            assert!(prompt.contains("Gün sonu kontrolü"));
+            assert_eq!(schema, ai::plan_adapt_schema());
+            Ok(ai_reply)
+        })
+        .unwrap();
+        complete(&mut bot, &mut calls);
+
+        let last = calls.last().unwrap();
+        let markup = last["fields"]["reply_markup"].as_str().unwrap();
+        assert!(markup.contains("padapt:ok"));
+        assert!(markup.contains("padapt:no"));
+
+        let cb = json!({
+            "callback_query": {
+                "id": "cb-padapt-1",
+                "from": {"id": 42},
+                "message": {"chat": {"id": 42, "type": "private"}, "message_id": 77},
+                "data": "padapt:ok"
+            }
+        });
+        bot.handle_update(&cb, &mut caller(&mut calls), no_ai)
+            .unwrap();
+        let updated = course::CourseConfig::load_or_default(root.path(), "Ders").unwrap();
+        assert_eq!(updated.plan.len(), 2);
+        assert_eq!(updated.plan[0].title, "Tanı");
+        assert_eq!(updated.plan[1].title, "Ekstra Quiz");
+        assert!(bot.store.state("plan_proposal:Ders").unwrap().is_none());
+    }
+
+    #[test]
+    fn telegram_plan_adapt_reject_keeps_existing_plan() {
+        let (root, mut bot) = setup();
+        write_test_course(root.path(), "Ders");
+        let yesterday = Local::now().date_naive() - chrono::Days::new(1);
+        plan::set_start(&bot.store, "Ders", yesterday).unwrap();
+        plan::mark_done(&bot.store, "Ders", yesterday, 1, 0).unwrap();
+
+        let mut calls = vec![];
+        let ai_reply = json!({
+            "needs_update": true,
+            "summary": "Eksik görev 2. güne aktarıldı.",
+            "days": [
+                {
+                    "day": 2,
+                    "title": "Taşınan Gün",
+                    "tasks": [
+                        {"command": "/tekrar", "label": "Tekrar"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+
+        let today = Local::now().date_naive();
+        bot.maybe_run_plan_adapt(today, &mut caller(&mut calls), move |_, _| Ok(ai_reply))
+            .unwrap();
+        complete(&mut bot, &mut calls);
+
+        let cb = json!({
+            "callback_query": {
+                "id": "cb-padapt-2",
+                "from": {"id": 42},
+                "message": {"chat": {"id": 42, "type": "private"}, "message_id": 78},
+                "data": "padapt:no"
+            }
+        });
+        bot.handle_update(&cb, &mut caller(&mut calls), no_ai)
+            .unwrap();
+        let kept = course::CourseConfig::load_or_default(root.path(), "Ders").unwrap();
+        assert_eq!(kept.plan.len(), 4);
+        assert_eq!(kept.plan[1].title, "Konu");
+        assert!(bot.store.state("plan_proposal:Ders").unwrap().is_none());
+    }
+
+    #[test]
+    fn telegram_plan_adapt_failure_and_cancel_mark_checked_no_retry_loop() {
+        let (root, mut bot) = setup();
+        write_test_course(root.path(), "Ders");
+        let today = Local::now().date_naive();
+        plan::set_start(&bot.store, "Ders", today).unwrap();
+        plan::mark_done(&bot.store, "Ders", today, 1, 0).unwrap();
+        plan::mark_done(&bot.store, "Ders", today, 1, 1).unwrap();
+
+        let mut calls = vec![];
+        // 1. Failing/invalid AI response must still mark the day checked so it doesn't loop.
+        bot.maybe_run_plan_adapt(today, &mut caller(&mut calls), |_, _| {
+            Ok("invalid json".into())
+        })
+        .unwrap();
+        complete(&mut bot, &mut calls);
+        assert!(bot.pending.is_none());
+        let sent_after_fail = calls.len();
+        bot.maybe_run_plan_adapt(today, &mut caller(&mut calls), no_ai)
+            .unwrap();
+        assert!(bot.pending.is_none());
+        assert_eq!(calls.len(), sent_after_fail);
+
+        // 2. Cancelled carryover check must also mark checked and not re-trigger.
+        let tomorrow = today + chrono::Days::new(1);
+        bot.maybe_run_plan_adapt(tomorrow, &mut caller(&mut calls), |_, _| {
+            Ok(r#"{"needs_update":false,"summary":"ok","days":[]}"#.into())
+        })
+        .unwrap();
+        assert!(bot.pending.is_some());
+        bot.pending.as_mut().unwrap().cancelled = true;
+        complete(&mut bot, &mut calls);
+        let sent_after_cancel = calls.len();
+        bot.maybe_run_plan_adapt(tomorrow, &mut caller(&mut calls), no_ai)
+            .unwrap();
+        assert!(bot.pending.is_none());
+        assert_eq!(calls.len(), sent_after_cancel);
     }
 }

@@ -166,6 +166,10 @@ enum Work {
     Coach {
         snapshot: coach::Snapshot,
     },
+    /// Koçun gün sonu / ertesi gün plan uyarlama kontrolü.
+    PlanAdapt {
+        ctx: coach::AdaptContext,
+    },
     /// Ayar modalından başlatılan canlı AI bağlantı testi.
     TestAi,
 }
@@ -233,6 +237,7 @@ fn job_label(kind: &JobKind, lang: Lang) -> &'static str {
             lang.pick("Çalışma planı hazırlanıyor", "Generating study plan")
         }
         JobKind::PlanChat { .. } => lang.pick("Plan danışmanı yanıtlıyor", "Planner is responding"),
+        JobKind::PlanAdapt { .. } => lang.pick("Koç planı gözden geçiriyor", "Coach is reviewing the plan"),
     }
 }
 
@@ -411,6 +416,8 @@ pub struct App {
     coach_ready: Option<coach::Step>,
     /// Son tamamlanan koç oturumunun özeti.
     pub coach_note: String,
+    /// Koçun gün sonu / ertesi gün için önerdiği plan güncellemesi.
+    pub plan_proposal: Option<coach::PlanProposal>,
     pub lang: Lang,
     /// Açık modal pencere (Plan oluşturucu, Plan düzenleyici, AI/Model ayarları).
     pub modal: Option<Modal>,
@@ -554,6 +561,7 @@ impl App {
             coach_step: None,
             coach_ready: None,
             coach_note: String::new(),
+            plan_proposal: None,
             lang,
             modal: None,
             ai_badge,
@@ -659,6 +667,13 @@ impl App {
                     ),
                     true,
                 ),
+                Work::PlanAdapt { .. } => (
+                    self.lang.pick(
+                        "Koç planı gözden geçiriyor",
+                        "Coach is reviewing the plan",
+                    ),
+                    true,
+                ),
                 Work::TestAi => (
                     self.lang
                         .pick("AI bağlantısı test ediliyor", "Testing AI connection"),
@@ -730,7 +745,7 @@ impl App {
                     )
                     .into();
             }
-            Some(Work::Coach { .. }) => {
+            Some(Work::Coach { .. } | Work::PlanAdapt { .. }) => {
                 // The user stopped the coach mid-decision: wait for F3 instead of deciding again.
                 self.pending = None;
                 self.set_coach_mode(CoachMode::Paused)?;
@@ -881,12 +896,39 @@ impl App {
         Ok(())
     }
 
+    fn begin_plan_adapt_with(
+        &mut self,
+        ctx: coach::AdaptContext,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        if self.pending.is_some() {
+            return Ok(());
+        }
+        let kind = JobKind::PlanAdapt {
+            ctx: Box::new(ctx.clone()),
+        };
+        let (prompt, schema) =
+            bot::prepare_job_in(&self.root, &self.store, &ctx.subject, &kind, self.lang)?;
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("studia-tui-plan-adapt".into())
+            .spawn(move || {
+                let _ = sender.send(generate(prompt, schema));
+            })?;
+        self.pending = Some(Pending {
+            work: Work::PlanAdapt { ctx },
+            receiver,
+            started: Instant::now(),
+        });
+        Ok(())
+    }
+
     /// Koçun kararını AI'ye sorar. Durum özeti burada, ana iş parçacığında okunur.
     fn begin_coach_with(
         &mut self,
         generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
     ) -> Result<()> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.plan_proposal.is_some() {
             return Ok(());
         }
         let subject = self.subject()?;
@@ -904,6 +946,11 @@ impl App {
                 .pick("✓ Plan bugünden başlatıldı.", "✓ Study plan started today.")
                 .into();
             return Ok(());
+        }
+        if let Some(ctx) =
+            coach::detect_adapt_trigger(&self.store, &self.root, &subject, &course, due, today)?
+        {
+            return self.begin_plan_adapt_with(ctx, generate);
         }
         if !snapshot.has_coachable() {
             self.status = coach::idle_message(&snapshot, self.lang);
@@ -929,10 +976,59 @@ impl App {
         self.begin_coach_with(move |prompt, schema| ai::generate(&root, &prompt, &schema))
     }
 
+    fn accept_plan_proposal(&mut self) -> Result<()> {
+        let Some(proposal) = self.plan_proposal.take() else {
+            return Ok(());
+        };
+        plan::apply_adapted_days(
+            &self.root,
+            &self.store,
+            &proposal.subject,
+            proposal.start,
+            proposal.editable_from_day,
+            proposal.adapted_days,
+        )?;
+        self.store
+            .clear_state(&format!("plan_proposal:{}", proposal.subject))?;
+        if proposal.trigger_kind == "carryover" && self.coach_mode == CoachMode::On {
+            self.coach_due = true;
+        }
+        self.coach_note = self
+            .lang
+            .pick("Plan güncellendi.", "Plan updated.")
+            .to_string();
+        self.status = self
+            .lang
+            .pick(
+                "✓ Plan önerisi uygulandı.",
+                "✓ Plan adjustment applied.",
+            )
+            .into();
+        self.refresh()
+    }
+
+    fn reject_plan_proposal(&mut self) -> Result<()> {
+        let Some(proposal) = self.plan_proposal.take() else {
+            return Ok(());
+        };
+        if proposal.trigger_kind == "carryover" && self.coach_mode == CoachMode::On {
+            self.coach_due = true;
+        }
+        self.status = self
+            .lang
+            .pick(
+                "Mevcut plan korundu.",
+                "Kept existing study plan.",
+            )
+            .into();
+        self.refresh()
+    }
+
     /// Her döngüde çağrılır: boşsa önce seçilmiş adımı başlatır, yoksa gerekiyorsa yeni karar ister.
     pub fn coach_tick(&mut self) -> Result<()> {
         if self.coach_mode != CoachMode::On
             || self.pending.is_some()
+            || self.plan_proposal.is_some()
             || self.session.is_some()
             || self.anki_session.is_some()
             || self.lesson.is_some()
@@ -1132,6 +1228,59 @@ impl App {
             }
             return self.refresh();
         }
+        if let Work::PlanAdapt { ctx } = pending.work {
+            let _ = coach::mark_adapt_checked(&self.store, &ctx);
+            let mut has_proposal = false;
+            match result
+                .ok()
+                .and_then(|raw| ai::parse_plan_adapt(&raw, ctx.editable_from_day).ok())
+            {
+                Some(reply) if reply.needs_update && !reply.days.is_empty() => {
+                    has_proposal = true;
+                    self.plan_proposal = Some(coach::PlanProposal {
+                        subject: ctx.subject,
+                        start: ctx.start,
+                        editable_from_day: ctx.editable_from_day,
+                        summary: reply.summary,
+                        adapted_days: reply.days,
+                        trigger_kind: ctx.trigger.kind_key().into(),
+                    });
+                    self.status = self
+                        .lang
+                        .pick(
+                            "✨ Koç plan güncellemesi önerdi (Bugün sekmesinde Enter/y: Uygula, Esc/n: Koru).",
+                            "✨ Coach proposed a plan update (Today tab: Enter/y apply, Esc/n keep).",
+                        )
+                        .into();
+                }
+                Some(reply) => {
+                    self.coach_note = reply.summary;
+                    self.status = self
+                        .lang
+                        .pick(
+                            "✓ Koç planı kontrol etti: değişiklik gerekmiyor.",
+                            "✓ Coach checked the plan: no changes needed.",
+                        )
+                        .into();
+                }
+                None => {
+                    self.status = self
+                        .lang
+                        .pick(
+                            "Plan uyarlama kontrolü tamamlanamadı; mevcut plan korundu.",
+                            "Could not evaluate plan adjustment; kept current plan.",
+                        )
+                        .into();
+                }
+            }
+            if !has_proposal
+                && matches!(ctx.trigger, coach::AdaptTrigger::Carryover { .. })
+                && self.coach_mode == CoachMode::On
+            {
+                self.coach_due = true;
+            }
+            return self.refresh();
+        }
         // Koç hatası sohbet turunda gösterilir; Sor yanıtına ve durum satırına dokunmaz.
         if let Work::Ai { subject, kind } = &pending.work
             && let JobKind::DenemeCoach { session, .. } = kind
@@ -1217,7 +1366,7 @@ impl App {
         let raw = result?;
         match pending.work {
             Work::Index => self.status = format!("✓ {raw}"),
-            Work::Coach { .. } | Work::TestAi => unreachable!(),
+            Work::Coach { .. } | Work::PlanAdapt { .. } | Work::TestAi => unreachable!(),
             Work::Ai { subject, kind } => {
                 let saved = bot::save_job_in(&mut self.store, &subject, &kind, &raw, self.lang)?;
                 if let Some((start, day, index)) = plan_task {
@@ -1380,6 +1529,7 @@ impl App {
                         )?;
                         self.plan_view_day = None;
                         self.task_selected = 0;
+                        self.plan_proposal = None;
                         self.show(&msg);
                         self.tab = 4;
                         self.status = self
@@ -1387,7 +1537,7 @@ impl App {
                             .pick("✓ Çalışma planı oluşturuldu.", "✓ Study plan generated.")
                             .into();
                     }
-                    JobResult::PlanChat(_) => {}
+                    JobResult::PlanChat(_) | JobResult::PlanAdapt(_) => {}
                     JobResult::Flashcards { cards, tag } => {
                         self.tab = ANKI_TAB;
                         self.anki_view = AnkiView::Overview;
@@ -1655,6 +1805,8 @@ impl App {
         if matches!(self.plan, plan::Status::NotStarted) {
             let subject = self.subject()?;
             plan::set_start(&self.store, &subject, Local::now().date_naive())?;
+            coach::clear_adapt_state(&self.store, &subject)?;
+            self.plan_proposal = None;
             self.plan_view_day = None;
             self.refresh()?;
             self.status = self
@@ -2198,6 +2350,9 @@ impl App {
                     self.plan_view_day = Some(number);
                     self.task_selected = 0;
                 }
+                if matches!(sub, "baslat" | "start" | "gec" | "jump" | "goto") {
+                    self.plan_proposal = None;
+                }
                 let text = bot::plan_text_in(
                     &self.store,
                     &subject,
@@ -2547,6 +2702,7 @@ impl App {
         self.task_selected = 0;
         self.coach_step = None;
         self.coach_ready = None;
+        self.plan_proposal = None;
         self.deneme_chat = None;
         self.plan_chat = None;
         self.lesson = None;
@@ -3402,6 +3558,7 @@ impl App {
         self.input.clear();
         self.plan_view_day = None;
         self.task_selected = 0;
+        self.plan_proposal = None;
         self.show(&msg);
         self.tab = 4;
         self.status = self
@@ -3797,6 +3954,24 @@ impl App {
             KeyCode::Tab => self.select_tab((self.tab + 1) % TABS.len())?,
             KeyCode::BackTab => self.select_tab((self.tab + TABS.len() - 1) % TABS.len())?,
             KeyCode::Char(ch @ '1'..='8') => self.select_tab((ch as u8 - b'1') as usize)?,
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+                if self.tab == 4
+                    && self.plan_proposal.is_some()
+                    && self.lesson.is_none()
+                    && self.session.is_none()
+                    && self.pending.is_none() =>
+            {
+                self.accept_plan_proposal()?
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc
+                if self.tab == 4
+                    && self.plan_proposal.is_some()
+                    && self.lesson.is_none()
+                    && self.session.is_none()
+                    && self.pending.is_none() =>
+            {
+                self.reject_plan_proposal()?
+            }
             KeyCode::Up | KeyCode::Down
                 if self.tab == DENEME_TAB && !self.deneme_items.is_empty() =>
             {
@@ -3863,6 +4038,7 @@ impl App {
                 self.task_selected = 0;
                 self.coach_step = None;
                 self.coach_ready = None;
+                self.plan_proposal = None;
                 self.deneme_chat = None;
                 self.plan_chat = None;
                 self.lesson = None;
@@ -4249,6 +4425,8 @@ impl App {
         }
         self.plan_view_day = None;
         self.task_selected = 0;
+        self.plan_proposal = None;
+        coach::clear_adapt_state(&self.store, &subject)?;
         self.refresh()?;
         self.status = self
             .lang
@@ -5462,6 +5640,144 @@ mod tests {
         assert!(app.pending.is_none());
         assert_eq!(app.coach_mode, CoachMode::Paused);
         release.send(()).unwrap();
+    }
+
+    #[test]
+    fn coach_end_of_day_proposes_adaptation_and_applies_on_confirm() {
+        let (_root, mut app) = setup();
+        start_plan_today(&mut app);
+        let today = Local::now().date_naive();
+        // Complete Day 1's runnable tasks (0 and 1); manual tasks 2 and 3 remain.
+        plan::mark_done(&app.store, "Ders", today, 1, 0).unwrap();
+        plan::mark_done(&app.store, "Ders", today, 1, 1).unwrap();
+        app.refresh().unwrap();
+
+        let reply = serde_json::json!({
+            "needs_update": true,
+            "summary": "Zayıf alan için gün 2 güncellendi.",
+            "days": [
+                {
+                    "day": 2,
+                    "title": "Ekstra Pekiştirme",
+                    "tasks": [
+                        {"command": "/quiz Tenses 5", "label": "Tenses pekiştirme"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+
+        app.begin_coach_with(move |prompt, schema| {
+            assert!(prompt.contains("Gün sonu kontrolü"));
+            assert_eq!(schema, ai::plan_adapt_schema());
+            Ok(reply)
+        })
+        .unwrap();
+        complete(&mut app);
+        assert!(app.plan_proposal.is_some());
+
+        // Switch to Bugün tab (4) and press Enter to apply.
+        app.tab = 4;
+        key(&mut app, KeyCode::Enter);
+        assert!(app.plan_proposal.is_none());
+        let saved = crate::course::CourseConfig::load_or_default(&app.root, "Ders").unwrap();
+        assert_eq!(saved.plan.len(), 2);
+        assert_eq!(saved.plan[0].title, "Tanı");
+        assert_eq!(saved.plan[1].title, "Ekstra Pekiştirme");
+        let day1_done = plan::day_done(&app.store, "Ders", &saved.plan, today, 1).unwrap();
+        assert_eq!(day1_done[0..2], [true, true]);
+    }
+
+    #[test]
+    fn coach_carryover_proposal_can_be_rejected_without_changing_plan() {
+        let (_root, mut app) = setup();
+        write_test_course(&app.root, "Ders");
+        let yesterday = Local::now().date_naive() - chrono::Days::new(1);
+        plan::set_start(&app.store, "Ders", yesterday).unwrap();
+        plan::mark_done(&app.store, "Ders", yesterday, 1, 0).unwrap();
+        app.refresh().unwrap();
+
+        let reply = serde_json::json!({
+            "needs_update": true,
+            "summary": "Dünkü eksik denemeyi bugüne ekledim.",
+            "days": [
+                {
+                    "day": 2,
+                    "title": "Taşınan Deneme",
+                    "tasks": [
+                        {"command": "/deneme 80", "label": "Teşhis denemesi"}
+                    ]
+                }
+            ]
+        })
+        .to_string();
+
+        app.begin_coach_with(move |prompt, _| {
+            assert!(prompt.contains("Yeni gün kontrolü"));
+            Ok(reply)
+        })
+        .unwrap();
+        complete(&mut app);
+        assert!(app.plan_proposal.is_some());
+
+        app.tab = 4;
+        key(&mut app, KeyCode::Char('n'));
+        assert!(app.plan_proposal.is_none());
+        let saved = crate::course::CourseConfig::load_or_default(&app.root, "Ders").unwrap();
+        assert_eq!(saved.plan[1].title, "Konu");
+    }
+
+    #[test]
+    fn select_subject_clears_pending_plan_proposal() {
+        let (_root, mut app) = setup();
+        fs::create_dir_all(app.root.join("resources/Tarih")).unwrap();
+        fs::write(app.root.join("resources/Tarih/not.md"), "Tarih notu.").unwrap();
+        app.refresh().unwrap();
+
+        app.plan_proposal = Some(coach::PlanProposal {
+            subject: "Ders".into(),
+            start: Local::now().date_naive(),
+            editable_from_day: 2,
+            summary: "Eski öneri".into(),
+            adapted_days: vec![],
+            trigger_kind: "eod".into(),
+        });
+        app.select_subject("Tarih").unwrap();
+        assert!(app.plan_proposal.is_none());
+    }
+
+    #[test]
+    fn apply_plan_draft_clears_pending_plan_proposal() {
+        let (_root, mut app) = setup();
+        start_plan_today(&mut app);
+        app.plan_proposal = Some(coach::PlanProposal {
+            subject: "Ders".into(),
+            start: Local::now().date_naive(),
+            editable_from_day: 2,
+            summary: "Eski öneri".into(),
+            adapted_days: vec![],
+            trigger_kind: "eod".into(),
+        });
+        app.plan_chat = Some(PlanChat {
+            subject: "Ders".into(),
+            turns: vec![],
+            draft: Some(vec![crate::course::DayConfig {
+                day: 1,
+                title: "Yeni Plan".into(),
+                tasks: vec![crate::course::TaskConfig {
+                    command: "/review".into(),
+                    label: "Tekrar".into(),
+                }],
+            }]),
+            draft_day: 0,
+            auto_start: true,
+            follow: false,
+            scroll: 0,
+            max_scroll: Cell::new(0),
+        });
+        app.apply_plan_draft().unwrap();
+        assert!(app.plan_proposal.is_none());
+        assert!(app.plan_chat.is_none());
     }
 
     #[test]

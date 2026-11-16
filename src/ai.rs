@@ -354,6 +354,24 @@ pub fn plan_chat_schema() -> String {
     .to_string()
 }
 
+pub fn plan_adapt_schema() -> String {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "needs_update": { "type": "boolean" },
+            "summary": { "type": "string", "minLength": 1, "maxLength": 400 },
+            "days": {
+                "type": "array",
+                "maxItems": crate::plan::MAX_PLAN_DAYS,
+                "items": plan_day_schema()
+            }
+        },
+        "required": ["needs_update", "summary", "days"]
+    })
+    .to_string()
+}
+
 const ALLOWED_PLAN_COMMANDS: [&str; 12] = [
     "/anlat",
     "/lesson",
@@ -401,8 +419,27 @@ struct RawPlanChatReply {
     days: Vec<DayConfig>,
 }
 
-fn normalize_plan_days(days: Vec<DayConfig>) -> Result<Vec<DayConfig>> {
-    if days.len() > crate::plan::MAX_PLAN_DAYS {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanAdaptReply {
+    pub needs_update: bool,
+    pub summary: String,
+    pub days: Vec<DayConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPlanAdaptReply {
+    needs_update: bool,
+    summary: String,
+    days: Vec<DayConfig>,
+}
+
+fn normalize_plan_slice(days: Vec<DayConfig>, start_day: usize) -> Result<Vec<DayConfig>> {
+    if start_day == 0 {
+        return Err(invalid("Plan start day must be >= 1."));
+    }
+    let prefix_len = start_day - 1;
+    if prefix_len + days.len() > crate::plan::MAX_PLAN_DAYS {
         return Err(invalid(format!(
             "Plan en fazla {} gün olabilir / Plan can be at most {} days.",
             crate::plan::MAX_PLAN_DAYS,
@@ -435,17 +472,23 @@ fn normalize_plan_days(days: Vec<DayConfig>) -> Result<Vec<DayConfig>> {
             ));
         }
         normalized.push(DayConfig {
-            day: idx + 1,
+            day: start_day + idx,
             title,
             tasks,
         });
     }
-    let check = CourseConfig {
-        plan: normalized.clone(),
-        ..CourseConfig::default()
-    };
-    check.validate()?;
+    if start_day == 1 {
+        let check = CourseConfig {
+            plan: normalized.clone(),
+            ..CourseConfig::default()
+        };
+        check.validate()?;
+    }
     Ok(normalized)
+}
+
+fn normalize_plan_days(days: Vec<DayConfig>) -> Result<Vec<DayConfig>> {
+    normalize_plan_slice(days, 1)
 }
 
 pub fn parse_plan(raw: &str, expected_days: usize) -> Result<Vec<DayConfig>> {
@@ -476,6 +519,35 @@ pub fn parse_plan_chat(raw: &str) -> Result<PlanChatReply> {
         normalize_plan_days(parsed.days)?
     };
     Ok(PlanChatReply { reply, days })
+}
+
+pub fn parse_plan_adapt(raw: &str, editable_from_day: usize) -> Result<PlanAdaptReply> {
+    let cleaned = strip_code_fence(raw);
+    let parsed: RawPlanAdaptReply = serde_json::from_str(cleaned)?;
+    let summary = parsed.summary.trim().to_string();
+    if summary.is_empty() {
+        return Err(invalid(
+            "AI plan güncelleme özeti boş döndürdü / AI plan adaptation summary must not be empty.",
+        ));
+    }
+    if !parsed.needs_update {
+        return Ok(PlanAdaptReply {
+            needs_update: false,
+            summary,
+            days: Vec::new(),
+        });
+    }
+    if parsed.days.is_empty() {
+        return Err(invalid(
+            "AI güncelleme önerdi ama gün listesi boş / AI requested update with empty days.",
+        ));
+    }
+    let days = normalize_plan_slice(parsed.days, editable_from_day)?;
+    Ok(PlanAdaptReply {
+        needs_update: true,
+        summary,
+        days,
+    })
 }
 
 fn plan_context_blocks(
@@ -701,6 +773,138 @@ pub fn plan_chat_request(
                 6) Return JSON only."
             )
         }
+    };
+    (text, Some(nonce))
+}
+
+pub fn plan_adapt_request(
+    ctx: &crate::coach::AdaptContext,
+    lang: Lang,
+) -> (String, Option<String>) {
+    let nonce = untrusted_nonce();
+    let remaining_json = serde_json::to_string(&ctx.remaining_plan).unwrap_or_default();
+    let fenced_remaining = fence_untrusted("remaining_plan", &nonce, &remaining_json);
+    let catalog_raw = if ctx.catalog.is_empty() {
+        lang.pick("(dosya listesi yok)", "(no file catalog)")
+            .to_string()
+    } else {
+        ctx.catalog.join("\n")
+    };
+    let fenced_catalog = fence_untrusted("catalog", &nonce, &catalog_raw);
+    let fenced_title = fence_untrusted("course_title", &nonce, &ctx.course_title);
+
+    let topics_raw = if ctx.topics.is_empty() {
+        lang.pick("henüz konu verisi yok", "no topic stats yet")
+            .to_string()
+    } else {
+        ctx.topics
+            .iter()
+            .map(|t| {
+                let state = match (lang, t.taught) {
+                    (Lang::Tr, true) => "anlatıldı",
+                    (Lang::Tr, false) => "anlatılmadı",
+                    (Lang::En, true) => "covered",
+                    (Lang::En, false) => "not covered",
+                };
+                match t.percent() {
+                    Some(p) => format!("- {}: {state}, {}/{} ({p:.0}%)", t.name, t.correct, t.total),
+                    None => format!(
+                        "- {}: {state}, {}",
+                        t.name,
+                        lang.pick("test yok", "no quiz yet")
+                    ),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let topics_block = fence_untrusted("topic_progress", &nonce, &topics_raw);
+    let recent_raw = if ctx.recent.is_empty() {
+        lang.pick("yok", "none").to_string()
+    } else {
+        ctx.recent.join("; ")
+    };
+    let recent_block = fence_untrusted("recent_sessions", &nonce, &recent_raw);
+    let done_today_raw = if ctx.done_today_labels.is_empty() {
+        lang.pick("henüz yok", "none yet").to_string()
+    } else {
+        ctx.done_today_labels.join(", ")
+    };
+    let done_today = fence_untrusted("done_today", &nonce, &done_today_raw);
+    let max_added = crate::plan::MAX_PLAN_DAYS.saturating_sub(ctx.editable_from_day - 1);
+
+    let trigger_desc = match (&ctx.trigger, lang) {
+        (crate::coach::AdaptTrigger::EndOfDay, Lang::Tr) => format!(
+            "Gün sonu kontrolü: Öğrenci Bugün (Gün {}/{}) görevlerini tamamladı:\n{done_today}",
+            ctx.current_day, ctx.total_days
+        ),
+        (crate::coach::AdaptTrigger::EndOfDay, Lang::En) => format!(
+            "End-of-day check: Student completed Today (Day {}/{}) tasks:\n{done_today}",
+            ctx.current_day, ctx.total_days
+        ),
+        (
+            crate::coach::AdaptTrigger::Carryover {
+                missed_day,
+                missed_labels,
+            },
+            Lang::Tr,
+        ) => {
+            let fenced_missed = fence_untrusted("missed_tasks", &nonce, &missed_labels.join(", "));
+            format!(
+                "Yeni gün kontrolü (Gün {}/{}): Dün (Gün {missed_day}) şu görevler eksik kaldı:\n{fenced_missed}",
+                ctx.current_day, ctx.total_days,
+            )
+        }
+        (
+            crate::coach::AdaptTrigger::Carryover {
+                missed_day,
+                missed_labels,
+            },
+            Lang::En,
+        ) => {
+            let fenced_missed = fence_untrusted("missed_tasks", &nonce, &missed_labels.join(", "));
+            format!(
+                "New-day check (Day {}/{}): Yesterday (Day {missed_day}) had unfinished tasks:\n{fenced_missed}",
+                ctx.current_day, ctx.total_days,
+            )
+        }
+    };
+
+    let text = match lang {
+        Lang::Tr => format!(
+            "Sen aşağıdaki ders için uyarlamalı çalışma koçusun:\n{fenced_title}\n\
+            {trigger_desc}\n\
+            Bekleyen tekrar sorusu: {}\n\
+            Konu ilerlemesi:\n{topics_block}\n\
+            Son oturumlar:\n{recent_block}\n\
+            Ders materyalleri:\n{fenced_catalog}\n\
+            Düzenlenebilir kalan plan (Gün {editable_from} ve sonrası, en fazla {max_added} gün):\n{fenced_remaining}\n\n\
+            GÖREVİN VE JSON KURALLARI:\n\
+            1) Öğrencinin performansına ve eksik/tamamlanan görevlere göre Gün {editable_from} ve sonrasının güncellenmesi gerekip gerekmediğine karar ver.\n\
+            2) Mevcut plan zaten uygunsa `needs_update: false`, `days: []` döndür ve `summary` içinde neden değişiklik gerekmediğini 1-2 cümleyle açıkla.\n\
+            3) Değişiklik gerekiyorsa (ör. doğruluk <%70 olan konuya ekstra /anlat veya /quiz eklemek, bekleyen tekrar >=5 ise /tekrar öne almak, dünkü eksik kritik konuyu aktarmak veya son gün zayıf konular için 1-2 pekiştirme günü eklemek): `needs_update: true` yap, `summary` içinde değişikliği ve nedenini öğrenciye net açıkla, `days` dizisinde Gün {editable_from} tarihinden itibaren güncellenmiş tüm kalan günleri (ardışık `day: {editable_from}, ...`) döndür.\n\
+            4) Geçmiş günlere (Gün < {editable_from}) dokunma; yalnızca `\"/anlat <konu>\"`, `\"/quiz <konu> [5-10]\"`, `\"/kelime <konu> [15-25]\"`, `\"/tekrar\"`, `\"/deneme\"` veya `\"\"` komutlarını kullan (günde 1..=6 görev).\n\
+            5) Yalnızca geçerli JSON döndür: {{\"needs_update\": bool, \"summary\": \"...\", \"days\": [...]}}",
+            ctx.due,
+            editable_from = ctx.editable_from_day
+        ),
+        Lang::En => format!(
+            "You are an adaptive study coach for:\n{fenced_title}\n\
+            {trigger_desc}\n\
+            Due review questions: {}\n\
+            Topic progress:\n{topics_block}\n\
+            Recent sessions:\n{recent_block}\n\
+            Course files:\n{fenced_catalog}\n\
+            Editable remaining schedule (Day {editable_from} onward, at most {max_added} days):\n{fenced_remaining}\n\n\
+            TASK & JSON RULES:\n\
+            1) Decide whether Day {editable_from} onward needs adjustment based on topic accuracy, due reviews, and finished/missed tasks.\n\
+            2) If the current schedule is already appropriate, set `needs_update: false`, `days: []`, and explain briefly in `summary`.\n\
+            3) If an adjustment is needed (e.g., reinforcing a <70% topic with extra /lesson or /quiz, scheduling /review when due >= 5, folding missed critical topics from yesterday, or adding 1-2 reinforcement days when finishing with weak areas): set `needs_update: true`, explain why in `summary`, and return the full updated remaining schedule starting at `day: {editable_from}` in `days`.\n\
+            4) Never touch earlier days (< {editable_from}); only use `\"/lesson <topic>\"`, `\"/quiz <topic> [5-10]\"`, `\"/cards <topic> [15-25]\"`, `\"/review\"`, `\"/exam\"`, or `\"\"` (1..=6 tasks/day).\n\
+            5) Return valid JSON only: {{\"needs_update\": bool, \"summary\": \"...\", \"days\": [...]}}",
+            ctx.due,
+            editable_from = ctx.editable_from_day
+        ),
     };
     (text, Some(nonce))
 }
@@ -1265,6 +1469,8 @@ pub fn valid_for_schema(schema: &str, raw: &str) -> bool {
     let props = &schema["properties"];
     if !props["route"].is_null() {
         parse_cuotiben_payload(raw).is_ok()
+    } else if !props["needs_update"].is_null() {
+        parse_plan_adapt(raw, 1).is_ok()
     } else if !props["lesson"].is_null() {
         parse_lesson(raw).is_ok()
     } else if let Some(n) = props["cards"]["minItems"].as_u64() {
@@ -3576,5 +3782,40 @@ mod tests {
           "cards": []
         }"##;
         assert!(parse_cuotiben_payload(bad_strat).is_err());
+    }
+
+    #[test]
+    fn parse_plan_adapt_validates_no_update_and_adapted_slice() {
+        let no_change = r#"{"needs_update":false,"summary":"Plan gayet dengeli, değişiklik yok.","days":[]}"#;
+        let parsed = parse_plan_adapt(no_change, 3).unwrap();
+        assert!(!parsed.needs_update);
+        assert!(parsed.days.is_empty());
+        assert!(valid_for_schema(&plan_adapt_schema(), no_change));
+
+        let with_update = r#"```json
+        {
+          "needs_update": true,
+          "summary": "Zayıf Tenses konusu için ekstra quiz eklendi.",
+          "days": [
+            {
+              "day": 1,
+              "title": "Tenses Pekiştirme",
+              "tasks": [
+                {"command": "/tekrar", "label": "Yanlışları tekrar et"},
+                {"command": "/quiz Tenses 5", "label": "Tenses pekiştirme testi"},
+                {"command": "/badcmd", "label": "Kitaptan oku"}
+              ]
+            }
+          ]
+        }
+        ```"#;
+        let updated = parse_plan_adapt(with_update, 3).unwrap();
+        assert!(updated.needs_update);
+        assert_eq!(updated.days.len(), 1);
+        assert_eq!(updated.days[0].day, 3);
+        assert_eq!(updated.days[0].tasks[2].command, "");
+        assert!(valid_for_schema(&plan_adapt_schema(), with_update));
+
+        assert!(parse_plan_adapt(r#"{"needs_update":true,"summary":"x","days":[]}"#, 2).is_err());
     }
 }
