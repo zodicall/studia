@@ -47,14 +47,14 @@ Komut    / her sekmeden komut yazar (Telegram ile aynı):
          /kartlar · /kart <konu> [n] · /kulucka · /strateji · /kelime <konu> [n]
          /anlat <konu> · /deneme [n] · /denemeler · /bugun · /dersler
          /plan [baslat tarih | gun N | gec N | olustur | duzenle]
-         /ai · /model <ad> · /effort <seviye> · /yanlislar · /ders <ad> · /lang <tr|en> · /iptal · /test · /yardim
+         /ai · /model <ad> · /effort <seviye> · /anadil <dil> · /yanlislar · /ders <ad> · /lang <tr|en> · /iptal · /test · /yardim
 Quiz     n yeni quiz · Enter kayıtlı sorular · w yanlışları tekrar
-         a–e veya 1–5 cevap · yanlışsa c Cuotiben analizi · Enter sonraki · Esc bitir
+         a–e veya 1–5 cevap · t açıklamayı çevir · yanlışsa c Cuotiben · Enter sonraki · Esc bitir
 Tekrar   t veya Enter bugünkü tekrarları başlat
 Deneme   ↑/↓ seç · Enter koçla tartış · d sil (y onay)
          sohbette Tab/Shift+Tab yanlışları gez · Ctrl+F Cuotiben · Enter gönder
 Bugün    ←/→ gün değiştir · ↑/↓ görev · Enter çalıştır · b başlat
-         g Planla sekmesini aç · e planı elle düzenle
+         g Planla sekmesini aç · e planı elle düzenle · derste Ctrl+T çevir
 Planla   Enter / n AI ile plan tartış · ←/→ taslak gün · Ctrl+B bugünden başlat
          Ctrl+S taslağı kaydet · Ctrl+N sıfırla · Esc çık
 Kartlar  Enter FSRS çalış · n AI kart üret · t/←/→ etiket · h High-Yield
@@ -71,15 +71,15 @@ Command  / runs slash commands from any tab (shared with Telegram):
          /quiz [topic n] · /review [n] [exact] · /practice <t> [n]
          /anki · /flashcards <topic> [n] · /incubation · /strategy · /cards <topic> [n]
          /explain <topic> · /exam [n] · /exams · /today · /courses
-         /plan [start date | day N | goto N | create | edit] · /ai · /model <name> · /effort <lvl>
+         /plan [start date | day N | goto N | create | edit] · /ai · /model <name> · /effort <lvl> · /nativelang <lang>
          /mistakes · /course <name> · /lang <tr|en> · /cancel · /test · /help
 Quiz     n new quiz · Enter saved questions · w retry mistakes
-         a–e or 1–5 answer · on wrong c Cuotiben · Enter next · Esc finish
+         a–e or 1–5 answer · t translate explanation · on wrong c Cuotiben · Enter next · Esc finish
 Review   t or Enter start due reviews
 Exams    ↑/↓ select · Enter discuss with coach · d delete (y confirm)
          in chat Tab/Shift+Tab step mistakes · Ctrl+F Cuotiben · Enter send
 Today    ←/→ change day · ↑/↓ task · Enter run · b start plan
-         g open Plan tab · e edit plan manually
+         g open Plan tab · e edit plan manually · in lesson Ctrl+T translate
 Plan     Enter / n discuss plan with AI · ←/→ draft day · Ctrl+B toggle start today
          Ctrl+S save draft · Ctrl+N reset · Esc exit
 Cards    Enter FSRS study · n AI generate · t/←/→ tag filter · h High-Yield
@@ -752,7 +752,13 @@ fn draw_practice(frame: &mut Frame, content: Rect, app: &App) {
 fn draw_lesson(frame: &mut Frame, content: Rect, app: &App, lesson: &str) {
     let [panel_area, input] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(content);
-    let mut text = lesson.to_string();
+    let mut text = if app.lesson_show_translated
+        && let Some(translated) = &app.lesson_translated
+    {
+        translated.clone()
+    } else {
+        lesson.to_string()
+    };
     if !app.lesson_turns.is_empty() {
         if !text.ends_with('\n') {
             text.push('\n');
@@ -786,10 +792,15 @@ fn draw_lesson(frame: &mut Frame, content: Rect, app: &App, lesson: &str) {
         app.scroll.min(max)
     };
     let label = app.lang.pick("Ders anlatımı", "Lesson");
-    let nav = app.lang.pick(
-        "↑/↓ PgUp/PgDn kaydır · Boş Enter: quiz",
-        "↑/↓ PgUp/PgDn scroll · Blank Enter: quiz",
-    );
+    let tr_hint = if app.lesson_show_translated {
+        app.lang.pick("Ctrl+T orijinal", "Ctrl+T original")
+    } else {
+        app.lang.pick("Ctrl+T çevir", "Ctrl+T translate")
+    };
+    let nav = match app.lang {
+        Lang::Tr => format!("↑/↓ PgUp/PgDn kaydır · {tr_hint} · Boş Enter: quiz"),
+        Lang::En => format!("↑/↓ PgUp/PgDn scroll · {tr_hint} · Blank Enter: quiz"),
+    };
     let title = if app.lesson_topic.is_empty() {
         format!("{label} · {nav}")
     } else {
@@ -835,6 +846,39 @@ fn draw_session(frame: &mut Frame, area: Rect, app: &App, session: &bot::Session
     ));
     let body = match &app.feedback {
         Some(feedback) => {
+            let rendered_feedback = if let Some(ft) = &app.feedback_translation
+                && ft.show
+                && let Some(translated) = &ft.translated
+                && let Some(prefix) = feedback.strip_suffix(&ft.explanation)
+            {
+                format!("{prefix}{translated}")
+            } else {
+                feedback.clone()
+            };
+            let translate_hint = if let Some(ft) = &app.feedback_translation
+                && !ft.explanation.trim().is_empty()
+            {
+                if ft.show {
+                    app.lang
+                        .pick(
+                            "\n[t] Orijinal açıklamayı göster",
+                            "\n[t] Show original explanation",
+                        )
+                        .to_string()
+                } else if crate::i18n::looks_foreign_for_native(&ft.explanation, &app.native_lang) {
+                    match app.lang {
+                        Lang::Tr => format!("\n🌐 [t] Açıklamayı çevir ({})", app.native_lang),
+                        Lang::En => format!("\n🌐 [t] Translate explanation ({})", app.native_lang),
+                    }
+                } else {
+                    match app.lang {
+                        Lang::Tr => format!("\n[t] Açıklamayı çevir ({})", app.native_lang),
+                        Lang::En => format!("\n[t] Translate explanation ({})", app.native_lang),
+                    }
+                }
+            } else {
+                String::new()
+            };
             let cuotiben = if app.last_wrong_choice.is_some() {
                 app.lang.pick(
                     "\n[c] Cuotiben hata defterine analiz et (FSRS / Sınav Tekniği)",
@@ -844,7 +888,7 @@ fn draw_session(frame: &mut Frame, area: Rect, app: &App, session: &bot::Session
                 ""
             };
             format!(
-                "{feedback}{cuotiben}\n\n{}",
+                "{rendered_feedback}{translate_hint}{cuotiben}\n\n{}",
                 app.lang.pick(
                     "Enter: sonraki soru / sonucu göster",
                     "Enter: next question / show summary",
@@ -1006,8 +1050,10 @@ fn draw_plan(frame: &mut Frame, content: Rect, app: &App) {
         panel_text(
             frame,
             proposal_area,
-            app.lang
-                .pick("Koç Plan Önerisi (Onay Bekliyor)", "Coach Plan Update Proposal"),
+            app.lang.pick(
+                "Koç Plan Önerisi (Onay Bekliyor)",
+                "Coach Plan Update Proposal",
+            ),
             Text::from(proposal_lines),
             0,
         );
@@ -1813,7 +1859,10 @@ fn draw_anki_overview(frame: &mut Frame, content: Rect, app: &App) {
             Style::default().fg(GOOD),
         )),
     ];
-    let title = format!("{} · {subject}", app.lang.pick("FSRS Kart Havuzu", "FSRS Card Pool"));
+    let title = format!(
+        "{} · {subject}",
+        app.lang.pick("FSRS Kart Havuzu", "FSRS Card Pool")
+    );
     panel_text(frame, stats_area, &title, Text::from(stats_lines), 0);
 
     if st.backlog_paused {
@@ -2070,8 +2119,7 @@ fn draw_anki_review(frame: &mut Frame, content: Rect, app: &App, session: &AnkiS
     panel_text(
         frame,
         action_area,
-        app.lang
-            .pick("2-Buton Değerlendirme", "2-Button Rating"),
+        app.lang.pick("2-Buton Değerlendirme", "2-Button Rating"),
         Text::from(action_lines),
         0,
     );
@@ -2099,7 +2147,11 @@ fn draw_anki_incubation(frame: &mut Frame, content: Rect, app: &App) {
         idx + 1,
         app.anki_incubation.len(),
         card.tag,
-        if card.is_high_yield { "★ High-Yield" } else { "" },
+        if card.is_high_yield {
+            "★ High-Yield"
+        } else {
+            ""
+        },
         card.context_prefix,
         card.front,
         card.back
@@ -2123,7 +2175,8 @@ fn draw_anki_incubation(frame: &mut Frame, content: Rect, app: &App) {
     panel_text(
         frame,
         content,
-        app.lang.pick("Kuluçka Havuzu (Cuotiben)", "Incubation Queue (Cuotiben)"),
+        app.lang
+            .pick("Kuluçka Havuzu (Cuotiben)", "Incubation Queue (Cuotiben)"),
         markdown(&text),
         app.scroll,
     );
@@ -2154,8 +2207,10 @@ fn draw_anki_strategy(frame: &mut Frame, content: Rect, app: &App) {
     panel_text(
         frame,
         content,
-        app.lang
-            .pick("Sınav Tekniği Defteri (Esc: geri)", "Strategy Sheet (Esc: back)"),
+        app.lang.pick(
+            "Sınav Tekniği Defteri (Esc: geri)",
+            "Strategy Sheet (Esc: back)",
+        ),
         markdown(&body),
         app.scroll,
     );
@@ -2235,6 +2290,7 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                     lang.pick("Boş Enter", "Blank Enter"),
                     lang.pick("quiz'e geç", "quiz"),
                 ),
+                ("Ctrl+T", lang.pick("çevir/orijinal", "translate/orig")),
                 ("↑/↓ PgUp/PgDn", lang.pick("kaydır", "scroll")),
                 ("Esc", lang.pick("temizle / kapat", "clear / close")),
             ],
@@ -2261,6 +2317,7 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     if app.tab == 4 && app.lesson.is_some() {
         return vec![
+            ("Ctrl+T", lang.pick("çevir/orijinal", "translate/orig")),
             ("↑/↓ PgUp/PgDn", lang.pick("kaydır", "scroll")),
             ("Enter", lang.pick("quiz'e geç", "quiz")),
             ("Esc", lang.pick("kapat", "close")),
@@ -2272,6 +2329,21 @@ fn context_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("Enter", lang.pick("sonraki soru", "next question")),
                 ("Esc", lang.pick("quizi bitir", "finish quiz")),
             ];
+            if let Some(ft) = &app.feedback_translation
+                && !ft.explanation.trim().is_empty()
+            {
+                keys.insert(
+                    1,
+                    (
+                        "t",
+                        if ft.show {
+                            lang.pick("orijinal", "original")
+                        } else {
+                            lang.pick("çevir", "translate")
+                        },
+                    ),
+                );
+            }
             if app.last_wrong_choice.is_some() {
                 keys.insert(1, ("c", "Cuotiben"));
             }
@@ -2664,18 +2736,23 @@ fn mask_secret_display(
 }
 
 fn draw_ai_settings(frame: &mut Frame, area: Rect, m: &AiSettingsModal, lang: Lang) {
-    let popup = centered(area, 84, 25);
+    let popup = centered(area, 84, 26);
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .title(lang.pick(
-            " AI Sağlayıcı ve Model Ayarları (.env) · Esc kapat ",
-            " AI Provider & Model Settings (.env) · Esc close ",
+            " Ayarlar · Ana Dil & AI (.env) · Esc kapat ",
+            " Settings · Native Language & AI (.env) · Esc close ",
         ))
         .style(Style::default().fg(TEXT).bg(BASE))
         .border_style(Style::default().fg(ACCENT));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
+    let native_val = if m.native_lang.trim().is_empty() {
+        lang.pick("(boş)", "(empty)")
+    } else {
+        m.native_lang.as_str()
+    };
     let selected_provider = m.provider();
     let provider_val = format!("◀ {} ▶", selected_provider.display_name(lang));
     let model_val = if m.model.is_empty() {
@@ -2726,7 +2803,7 @@ fn draw_ai_settings(frame: &mut Frame, area: Rect, m: &AiSettingsModal, lang: La
         ));
     }
 
-    let test_style = if m.field == 8 {
+    let test_style = if m.field == 9 {
         Style::default()
             .fg(BASE)
             .bg(ACCENT)
@@ -2734,7 +2811,7 @@ fn draw_ai_settings(frame: &mut Frame, area: Rect, m: &AiSettingsModal, lang: La
     } else {
         Style::default().fg(ACCENT).bg(SURFACE)
     };
-    let save_style = if m.field == 9 {
+    let save_style = if m.field == 10 {
         Style::default()
             .fg(BASE)
             .bg(GOOD)
@@ -2747,51 +2824,57 @@ fn draw_ai_settings(frame: &mut Frame, area: Rect, m: &AiSettingsModal, lang: La
         Line::from(status_spans),
         Line::raw(""),
         field_row(
+            lang.pick("Ana Dil", "Native Language"),
+            native_val,
+            m.field == 0,
+            Some(lang.pick("←/→ hazır · yaz: özel", "←/→ preset · type custom")),
+        ),
+        field_row(
             lang.pick("Sağlayıcı", "Provider"),
             &provider_val,
-            m.field == 0,
+            m.field == 1,
             Some("←/→"),
         ),
         field_row(
             lang.pick("Model", "Model"),
             model_val,
-            m.field == 1,
+            m.field == 2,
             Some(lang.pick("←/→ hazır · yaz: özel", "←/→ preset · type custom")),
         ),
         field_row(
             lang.pick("Düşünme Eforu", "Effort"),
             &effort_val,
-            m.field == 2,
+            m.field == 3,
             Some("←/→"),
         ),
         field_row(
             lang.pick("Base URL", "Base URL"),
             base_val,
-            m.field == 3,
+            m.field == 4,
             Some("OpenAI / Gemini URL"),
         ),
         field_row(
             "GEMINI_API_KEY",
             &gemini_disp,
-            m.field == 4,
+            m.field == 5,
             Some(lang.pick("yaz: değiştir · Del/Bksp: sil", "type: set · Bksp: clear")),
         ),
         field_row(
             "OPENAI_API_KEY",
             &openai_disp,
-            m.field == 5,
+            m.field == 6,
             Some(lang.pick("yaz: değiştir · Del/Bksp: sil", "type: set · Bksp: clear")),
         ),
         field_row(
             "STUDIA_AI_CMD",
             custom_val,
-            m.field == 6,
+            m.field == 7,
             Some("{prompt} {schema}"),
         ),
         field_row(
             lang.pick("Zaman aşımı (sn)", "Timeout (sec)"),
             &m.timeout_secs,
-            m.field == 7,
+            m.field == 8,
             Some("0 = limitsiz"),
         ),
         Line::raw(""),
@@ -3160,24 +3243,25 @@ mod tests {
 
         // 2. AiSettingsModal: verify raw typed secret never appears in buffer.
         app.key(press(KeyCode::F(5))).unwrap();
-        app.key(press(KeyCode::Tab)).unwrap(); // 1: model
-        app.key(press(KeyCode::Tab)).unwrap(); // 2: effort
-        app.key(press(KeyCode::Tab)).unwrap(); // 3: base_url
-        app.key(press(KeyCode::Tab)).unwrap(); // 4: gemini_key
+        app.key(press(KeyCode::Tab)).unwrap(); // 1: provider
+        app.key(press(KeyCode::Tab)).unwrap(); // 2: model
+        app.key(press(KeyCode::Tab)).unwrap(); // 3: effort
+        app.key(press(KeyCode::Tab)).unwrap(); // 4: base_url
+        app.key(press(KeyCode::Tab)).unwrap(); // 5: gemini_key
         for ch in "sk-super-secret-xyz999".chars() {
             app.key(press(KeyCode::Char(ch))).unwrap();
         }
         for (w, h) in [(100, 30), (60, 16)] {
             let ai_screen = render(&app, w, h);
             assert!(!ai_screen.contains("sk-super-secret-xyz999"));
-            assert!(ai_screen.contains("AI Sağlayıcı") || ai_screen.contains("AI"));
+            assert!(ai_screen.contains("Ana Dil") || ai_screen.contains("Native Language"));
         }
         app.key(press(KeyCode::Esc)).unwrap();
         app.key(press(KeyCode::F(4))).unwrap();
         app.key(press(KeyCode::F(5))).unwrap();
         let en_screen = render(&app, 100, 30);
         assert!(
-            en_screen.contains("AI Provider & Model Settings"),
+            en_screen.contains("Settings · Native Language & AI"),
             "{en_screen}"
         );
     }
@@ -3270,7 +3354,10 @@ mod tests {
         assert_eq!(app.tab, ANKI_TAB);
         for (w, h) in [(100, 30), (80, 24), (60, 16)] {
             let overview = render(&app, w, h);
-            assert!(overview.contains("FSRS Kart Havuzu"), "{w}x{h}:\n{overview}");
+            assert!(
+                overview.contains("FSRS Kart Havuzu"),
+                "{w}x{h}:\n{overview}"
+            );
             if w >= 80 {
                 assert!(
                     overview.contains("#Ders::Baglac::Zitlik"),
@@ -3318,5 +3405,68 @@ mod tests {
         app.anki_view = AnkiView::Strategy;
         let strat_en = render(&app, 100, 30);
         assert!(strat_en.contains("Strategy Sheet"), "{strat_en}");
+    }
+
+    #[test]
+    fn quiz_feedback_renders_foreign_translate_hint_and_translated_overlay() {
+        let (_root, mut app) = app_with_subject();
+        app.native_lang = "Türkçe".into();
+        let questions = app
+            .store
+            .add_questions(
+                "Ders",
+                "Grammar",
+                vec![Question {
+                    question: "She ---- here since 2020.".into(),
+                    choices: vec![
+                        "lives".into(),
+                        "has lived".into(),
+                        "lived".into(),
+                        "living".into(),
+                    ],
+                    answer_index: 1,
+                    explanation:
+                        "Correct answer: 'has lived'. Present perfect is used with 'since 2020'."
+                            .into(),
+                    source: "s".into(),
+                    topic: None,
+                }],
+            )
+            .unwrap();
+        let session = crate::bot::Session::start(&app.store, "Ders", "Grammar", questions).unwrap();
+        app.session = Some(session);
+        app.session_tab = 1;
+        app.tab = 1;
+        app.key(press(KeyCode::Char('b'))).unwrap();
+
+        let original_screen = render(&app, 120, 36);
+        assert!(
+            original_screen.contains("[t] Açıklamayı çevir (Türkçe)"),
+            "{original_screen}"
+        );
+        assert!(
+            original_screen.contains("Present perfect is used with 'since 2020'."),
+            "{original_screen}"
+        );
+
+        if let Some(ft) = app.feedback_translation.as_mut() {
+            ft.translated = Some(
+                "Doğru cevap: 'has lived'. 'since 2020' ile present perfect kullanılır.".into(),
+            );
+            ft.show = true;
+        }
+        let translated_screen = render(&app, 120, 36);
+        assert!(
+            translated_screen.contains("'since 2020' ile present perfect kullanılır."),
+            "{translated_screen}"
+        );
+        assert!(
+            translated_screen.contains("[t] Orijinal açıklamayı göster"),
+            "{translated_screen}"
+        );
+        assert!(
+            !translated_screen.contains("Present perfect is used with"),
+            "{translated_screen}"
+        );
     }
 }

@@ -128,6 +128,7 @@ impl PlanEditModal {
 
 #[derive(Clone, Debug)]
 pub struct AiSettingsModal {
+    pub native_lang: String,
     pub provider_idx: usize,
     pub model: String,
     pub effort_idx: usize,
@@ -149,7 +150,7 @@ pub struct AiSettingsModal {
 }
 
 impl AiSettingsModal {
-    pub fn load(cfg: AiConfig, lang: Lang) -> Self {
+    pub fn load(cfg: AiConfig, lang: Lang, native_lang: String) -> Self {
         let provider_idx = AiProvider::ALL
             .iter()
             .position(|&p| p == cfg.provider)
@@ -162,6 +163,7 @@ impl AiSettingsModal {
         let gemini_key_masked = cfg.gemini_api_key.as_deref().map(config::mask_secret_tail);
         let openai_key_masked = cfg.openai_api_key.as_deref().map(config::mask_secret_tail);
         Self {
+            native_lang,
             provider_idx,
             model: cfg.model.clone().unwrap_or_default(),
             effort_idx,
@@ -181,6 +183,18 @@ impl AiSettingsModal {
             error: None,
             existing_cfg: cfg,
         }
+    }
+
+    pub fn cycle_native_lang(&mut self, delta: isize) {
+        let presets = crate::i18n::NATIVE_LANGUAGE_PRESETS;
+        let len = presets.len() as isize;
+        let current = presets
+            .iter()
+            .position(|&p| p.eq_ignore_ascii_case(self.native_lang.trim()))
+            .map_or(if delta >= 0 { -1 } else { 0 }, |i| i as isize);
+        let next = (current + delta).rem_euclid(len) as usize;
+        self.native_lang = presets[next].to_string();
+        self.error = None;
     }
 
     pub fn provider(&self) -> AiProvider {

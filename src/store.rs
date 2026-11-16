@@ -279,6 +279,55 @@ impl Store {
         Ok(())
     }
 
+    /// Returns the stored native language name, or the fallback for `ui_lang` if unset.
+    pub fn native_lang(&self, ui_lang: crate::i18n::Lang) -> Result<String> {
+        let saved = self
+            .state("native_lang")?
+            .map(|raw| crate::i18n::normalize_native_lang(&raw))
+            .filter(|norm| !norm.is_empty());
+        Ok(saved.unwrap_or_else(|| ui_lang.default_native_name().to_string()))
+    }
+
+    /// Persists the user's native language name in `state("native_lang")`.
+    pub fn set_native_lang(&self, raw: &str) -> Result<String> {
+        let normalized = crate::i18n::normalize_native_lang(raw);
+        if normalized.is_empty() {
+            return Err(crate::invalid("Native language cannot be empty."));
+        }
+        self.set_state("native_lang", &normalized)?;
+        Ok(normalized)
+    }
+
+    fn translation_cache_key(target_lang: &str, source_text: &str) -> String {
+        let lang_norm = crate::i18n::normalize_native_lang(target_lang).to_ascii_lowercase();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in source_text.as_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("tr_cache:{lang_norm}:{}:{hash:016x}", source_text.len())
+    }
+
+    /// Returns a cached translation of `source_text` into `target_lang`, if previously saved.
+    pub fn cached_translation(
+        &self,
+        target_lang: &str,
+        source_text: &str,
+    ) -> Result<Option<String>> {
+        self.state(&Self::translation_cache_key(target_lang, source_text))
+    }
+
+    /// Persists a translated text snippet in SQLite for instant re-use across sessions.
+    pub fn save_translation(
+        &self,
+        target_lang: &str,
+        source_text: &str,
+        translated: &str,
+    ) -> Result<()> {
+        let key = Self::translation_cache_key(target_lang, source_text);
+        self.set_state(&key, translated)
+    }
+
     pub fn offset(&self) -> Result<i64> {
         match self.state("offset")? {
             Some(value) => Ok(value.parse()?),
@@ -1255,7 +1304,9 @@ impl Store {
         let total_active = active.len();
         let due_learning = active
             .iter()
-            .filter(|c| matches!(c.state, CardState::Learning | CardState::Relearning) && c.due <= now)
+            .filter(|c| {
+                matches!(c.state, CardState::Learning | CardState::Relearning) && c.due <= now
+            })
             .count();
         let due_reviews = active
             .iter()
@@ -1279,7 +1330,9 @@ impl Store {
         let new_remaining_today = if backlog_paused {
             0
         } else {
-            DAILY_NEW_CARD_LIMIT.saturating_sub(new_today).min(new_total)
+            DAILY_NEW_CARD_LIMIT
+                .saturating_sub(new_today)
+                .min(new_total)
         };
         let incubation_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM flashcards WHERE subject=?1 AND status='incubation'",
@@ -2183,7 +2236,12 @@ mod tests {
         let grammar_q = store
             .due_flashcards_queue("yds", Some("#YDS::Grammar"), false, t0)
             .unwrap();
-        assert!(grammar_q.cards.iter().all(|c| c.tag.starts_with("#YDS::Grammar")));
+        assert!(
+            grammar_q
+                .cards
+                .iter()
+                .all(|c| c.tag.starts_with("#YDS::Grammar"))
+        );
 
         // Review 1 new card -> remaining daily quota becomes 19
         store
@@ -2263,11 +2321,24 @@ mod tests {
         inc.status = CardStatus::Incubation;
         let saved = store.add_flashcards(vec![inc], t0).unwrap();
         assert_eq!(store.incubation_cards("yds").unwrap().len(), 1);
-        assert!(store.due_flashcards_queue("yds", None, false, t0).unwrap().cards.is_empty());
+        assert!(
+            store
+                .due_flashcards_queue("yds", None, false, t0)
+                .unwrap()
+                .cards
+                .is_empty()
+        );
 
         assert!(store.approve_incubation_card(saved[0].id, t0).unwrap());
         assert!(store.incubation_cards("yds").unwrap().is_empty());
-        assert_eq!(store.due_flashcards_queue("yds", None, false, t0).unwrap().cards.len(), 1);
+        assert_eq!(
+            store
+                .due_flashcards_queue("yds", None, false, t0)
+                .unwrap()
+                .cards
+                .len(),
+            1
+        );
 
         // Strategy note stays out of flashcards queue
         store
@@ -2278,7 +2349,10 @@ mod tests {
         // Leech flag & repair
         store
             .conn
-            .execute("UPDATE flashcards SET is_leech=1, lapses=3 WHERE id=?1", [saved[0].id])
+            .execute(
+                "UPDATE flashcards SET is_leech=1, lapses=3 WHERE id=?1",
+                [saved[0].id],
+            )
             .unwrap();
         assert!(
             store
@@ -2299,5 +2373,29 @@ mod tests {
         assert!(!repaired.is_leech);
         assert_eq!(repaired.card_type, CardKind::Contrastive);
         assert_eq!(repaired.lapses, 3);
+    }
+
+    #[test]
+    fn spec_store_native_lang_and_translation_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("studia.db")).unwrap();
+
+        assert_eq!(store.native_lang(crate::i18n::Lang::Tr).unwrap(), "Türkçe");
+        assert_eq!(store.native_lang(crate::i18n::Lang::En).unwrap(), "English");
+
+        assert!(store.set_native_lang("   ").is_err());
+        assert_eq!(store.set_native_lang("  deutsch ").unwrap(), "deutsch");
+        assert_eq!(store.native_lang(crate::i18n::Lang::Tr).unwrap(), "deutsch");
+
+        let src = "Correct answer: 'however'. It introduces contrast.";
+        assert_eq!(store.cached_translation("Türkçe", src).unwrap(), None);
+        store
+            .save_translation("Türkçe", src, "Doğru cevap: 'however'. Zıtlık bildirir.")
+            .unwrap();
+        assert_eq!(
+            store.cached_translation("tr", src).unwrap().as_deref(),
+            Some("Doğru cevap: 'however'. Zıtlık bildirir.")
+        );
+        assert_eq!(store.cached_translation("Deutsch", src).unwrap(), None);
     }
 }

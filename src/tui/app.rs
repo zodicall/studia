@@ -156,10 +156,30 @@ pub struct PlanChat {
     pub max_scroll: Cell<u16>,
 }
 
+/// Quiz/Tekrar geri bildirimindeki açıklamanın çeviri kaplama durumu (`self.feedback`'i bozmaz).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedbackTranslation {
+    pub question_id: i64,
+    pub explanation: String,
+    pub translated: Option<String>,
+    pub show: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TranslateTarget {
+    QuizFeedback { question_id: i64 },
+    Lesson { subject: String, topic: String },
+}
+
 enum Work {
     Ai {
         subject: String,
         kind: JobKind,
+    },
+    Translate {
+        target: TranslateTarget,
+        target_lang: String,
+        source_text: String,
     },
     Index,
     /// Koçun adım seçimi; sonucu `coach::parse` ile doğrulanır.
@@ -226,18 +246,22 @@ fn job_label(kind: &JobKind, lang: Lang) -> &'static str {
         JobKind::GenerateFlashcards { .. } => {
             lang.pick("FSRS kartları üretiliyor", "Generating FSRS cards")
         }
-        JobKind::CuotibenAnalyze { .. } => {
-            lang.pick("Cuotiben hata analizi yapılıyor", "Analyzing mistake (Cuotiben)")
-        }
-        JobKind::RepairLeech { .. } => {
-            lang.pick("Sülük kart AI ile onarılıyor", "Repairing leech card with AI")
-        }
+        JobKind::CuotibenAnalyze { .. } => lang.pick(
+            "Cuotiben hata analizi yapılıyor",
+            "Analyzing mistake (Cuotiben)",
+        ),
+        JobKind::RepairLeech { .. } => lang.pick(
+            "Sülük kart AI ile onarılıyor",
+            "Repairing leech card with AI",
+        ),
         JobKind::DenemeCoach { .. } => lang.pick("Koç yanıtlıyor", "Coach is answering"),
         JobKind::GeneratePlan { .. } => {
             lang.pick("Çalışma planı hazırlanıyor", "Generating study plan")
         }
         JobKind::PlanChat { .. } => lang.pick("Plan danışmanı yanıtlıyor", "Planner is responding"),
-        JobKind::PlanAdapt { .. } => lang.pick("Koç planı gözden geçiriyor", "Coach is reviewing the plan"),
+        JobKind::PlanAdapt { .. } => {
+            lang.pick("Koç planı gözden geçiriyor", "Coach is reviewing the plan")
+        }
     }
 }
 
@@ -419,6 +443,13 @@ pub struct App {
     /// Koçun gün sonu / ertesi gün için önerdiği plan güncellemesi.
     pub plan_proposal: Option<coach::PlanProposal>,
     pub lang: Lang,
+    /// Kullanıcının çalışma açıklamaları için seçtiği ana dil (arayüz dilinden bağımsız).
+    pub native_lang: String,
+    /// Quiz geri bildirimi açıklaması için çeviri durumu.
+    pub feedback_translation: Option<FeedbackTranslation>,
+    /// Açık ders anlatımının çevrilmiş metni ve görünüm anahtarı (`self.lesson` değişmez).
+    pub lesson_translated: Option<String>,
+    pub lesson_show_translated: bool,
     /// Açık modal pencere (Plan oluşturucu, Plan düzenleyici, AI/Model ayarları).
     pub modal: Option<Modal>,
     /// Başlık çubuğundaki etkin sağlayıcı/model etiketi.
@@ -507,6 +538,7 @@ impl App {
         let root = fs::canonicalize(root)?;
         let store = Store::open(&root.join("data/studia.db"))?;
         let coach_mode = CoachMode::from_state(store.state("coach_mode")?);
+        let native_lang = store.native_lang(lang)?;
         let ai_badge = compute_ai_badge(&root);
         let mut app = Self {
             root,
@@ -563,6 +595,10 @@ impl App {
             coach_note: String::new(),
             plan_proposal: None,
             lang,
+            native_lang,
+            feedback_translation: None,
+            lesson_translated: None,
+            lesson_show_translated: false,
             modal: None,
             ai_badge,
             anki_stats: FlashcardStats::default(),
@@ -668,10 +704,8 @@ impl App {
                     true,
                 ),
                 Work::PlanAdapt { .. } => (
-                    self.lang.pick(
-                        "Koç planı gözden geçiriyor",
-                        "Coach is reviewing the plan",
-                    ),
+                    self.lang
+                        .pick("Koç planı gözden geçiriyor", "Coach is reviewing the plan"),
                     true,
                 ),
                 Work::TestAi => (
@@ -679,6 +713,7 @@ impl App {
                         .pick("AI bağlantısı test ediliyor", "Testing AI connection"),
                     true,
                 ),
+                Work::Translate { .. } => (self.lang.pick("Çevriliyor", "Translating"), true),
                 // Koç ve ders sohbetinde Esc sohbetten çıkarır; iş arka planda biter, sonucu atılır.
                 Work::Ai { kind, .. } => (
                     job_label(kind, self.lang),
@@ -735,7 +770,7 @@ impl App {
                     )
                     .into();
             }
-            Some(Work::TestAi) => {
+            Some(Work::TestAi | Work::Translate { .. }) => {
                 self.pending = None;
                 self.status = self
                     .lang
@@ -891,9 +926,157 @@ impl App {
         self.editing = None;
         let cfg = config::load_ai_config(&self.root)?;
         self.modal = Some(Modal::AiSettings(Box::new(AiSettingsModal::load(
-            cfg, self.lang,
+            cfg,
+            self.lang,
+            self.native_lang.clone(),
         ))));
         Ok(())
+    }
+
+    fn clear_feedback_state(&mut self) {
+        self.feedback = None;
+        self.feedback_translation = None;
+        self.last_wrong_choice = None;
+    }
+
+    fn clear_lesson_state(&mut self) {
+        self.lesson = None;
+        self.lesson_topic.clear();
+        self.lesson_turns.clear();
+        self.lesson_follow = false;
+        self.lesson_translated = None;
+        self.lesson_show_translated = false;
+    }
+
+    fn clear_active_translations(&mut self) {
+        if let Some(ft) = self.feedback_translation.as_mut() {
+            ft.translated = None;
+            ft.show = false;
+        }
+        self.lesson_translated = None;
+        self.lesson_show_translated = false;
+    }
+
+    fn set_native_lang_and_reset(&mut self, raw: &str) -> Result<String> {
+        let saved = self.store.set_native_lang(raw)?;
+        self.native_lang = saved.clone();
+        self.clear_active_translations();
+        Ok(saved)
+    }
+
+    fn sync_native_lang(&mut self, ui_lang: Lang) -> Result<()> {
+        let next_native = self.store.native_lang(ui_lang)?;
+        if next_native != self.native_lang {
+            self.native_lang = next_native;
+            self.clear_active_translations();
+        }
+        Ok(())
+    }
+
+    fn begin_translate_with(
+        &mut self,
+        target: TranslateTarget,
+        source_text: String,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        if source_text.trim().is_empty() {
+            return Ok(());
+        }
+        if self.pending.is_some() {
+            self.status = self
+                .lang
+                .pick(
+                    "Önceki istek sürüyor…",
+                    "Previous request is still running…",
+                )
+                .into();
+            return Ok(());
+        }
+        let target_lang = self.native_lang.clone();
+        let prompt = ai::translate_request(&source_text, &target_lang, self.lang);
+        let schema = ai::ANSWER_SCHEMA.to_string();
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("studia-tui-translate".into())
+            .spawn(move || {
+                let _ = sender.send(generate(prompt, schema));
+            })?;
+        self.pending = Some(Pending {
+            work: Work::Translate {
+                target,
+                target_lang,
+                source_text,
+            },
+            receiver,
+            started: Instant::now(),
+        });
+        self.status.clear();
+        Ok(())
+    }
+
+    fn toggle_translate_feedback_with(
+        &mut self,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        let Some(ft) = self.feedback_translation.as_mut() else {
+            return Ok(());
+        };
+        if ft.translated.is_some() {
+            ft.show = !ft.show;
+            return Ok(());
+        }
+        let question_id = ft.question_id;
+        let explanation = ft.explanation.clone();
+        if let Some(cached) = self
+            .store
+            .cached_translation(&self.native_lang, &explanation)?
+        {
+            if let Some(ft) = self.feedback_translation.as_mut() {
+                ft.translated = Some(cached);
+                ft.show = true;
+            }
+            return Ok(());
+        }
+        self.begin_translate_with(
+            TranslateTarget::QuizFeedback { question_id },
+            explanation,
+            generate,
+        )
+    }
+
+    fn toggle_translate_feedback(&mut self) -> Result<()> {
+        let generate = ai_generate(&self.root);
+        self.toggle_translate_feedback_with(generate)
+    }
+
+    fn toggle_translate_lesson_with(
+        &mut self,
+        generate: impl FnOnce(String, String) -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        let Some(lesson) = self.lesson.clone() else {
+            return Ok(());
+        };
+        if self.lesson_translated.is_some() {
+            self.lesson_show_translated = !self.lesson_show_translated;
+            return Ok(());
+        }
+        if let Some(cached) = self.store.cached_translation(&self.native_lang, &lesson)? {
+            self.lesson_translated = Some(cached);
+            self.lesson_show_translated = true;
+            return Ok(());
+        }
+        let subject = if !self.session_subject.is_empty() {
+            self.session_subject.clone()
+        } else {
+            self.subject()?
+        };
+        let topic = self.lesson_topic.clone();
+        self.begin_translate_with(TranslateTarget::Lesson { subject, topic }, lesson, generate)
+    }
+
+    fn toggle_translate_lesson(&mut self) -> Result<()> {
+        let generate = ai_generate(&self.root);
+        self.toggle_translate_lesson_with(generate)
     }
 
     fn begin_plan_adapt_with(
@@ -999,10 +1182,7 @@ impl App {
             .to_string();
         self.status = self
             .lang
-            .pick(
-                "✓ Plan önerisi uygulandı.",
-                "✓ Plan adjustment applied.",
-            )
+            .pick("✓ Plan önerisi uygulandı.", "✓ Plan adjustment applied.")
             .into();
         self.refresh()
     }
@@ -1016,10 +1196,7 @@ impl App {
         }
         self.status = self
             .lang
-            .pick(
-                "Mevcut plan korundu.",
-                "Kept existing study plan.",
-            )
+            .pick("Mevcut plan korundu.", "Kept existing study plan.")
             .into();
         self.refresh()
     }
@@ -1119,6 +1296,7 @@ impl App {
         };
         self.lang = next;
         self.store.set_state("lang", next.code())?;
+        self.sync_native_lang(next)?;
         self.status = next
             .pick(
                 "✓ Dil Türkçe olarak ayarlandı.",
@@ -1363,10 +1541,64 @@ impl App {
             }
             return Ok(());
         }
+        if let Work::Translate {
+            target,
+            target_lang,
+            source_text,
+        } = pending.work
+        {
+            match result.and_then(|raw| ai::parse_answer(&raw)) {
+                Ok(translated) => {
+                    let _ = self
+                        .store
+                        .save_translation(&target_lang, &source_text, &translated);
+                    if target_lang == self.native_lang {
+                        match target {
+                            TranslateTarget::QuizFeedback { question_id } => {
+                                if let Some(ft) = self.feedback_translation.as_mut()
+                                    && ft.question_id == question_id
+                                {
+                                    ft.translated = Some(translated);
+                                    ft.show = true;
+                                }
+                            }
+                            TranslateTarget::Lesson { subject, topic } => {
+                                let current_subject = if !self.session_subject.is_empty() {
+                                    self.session_subject.as_str()
+                                } else {
+                                    self.subjects
+                                        .get(self.selected)
+                                        .map_or("", |s| s.name.as_str())
+                                };
+                                if self.lesson.is_some()
+                                    && self.lesson_topic == topic
+                                    && current_subject == subject
+                                {
+                                    self.lesson_translated = Some(translated);
+                                    self.lesson_show_translated = true;
+                                    self.scroll = 0;
+                                    self.lesson_follow = false;
+                                }
+                            }
+                        }
+                    }
+                    self.status = self
+                        .lang
+                        .pick("✓ Çeviri hazır.", "✓ Translation ready.")
+                        .into();
+                }
+                Err(err) => {
+                    self.status = config::redact_error(&self.root, &err);
+                }
+            }
+            return Ok(());
+        }
         let raw = result?;
         match pending.work {
             Work::Index => self.status = format!("✓ {raw}"),
-            Work::Coach { .. } | Work::PlanAdapt { .. } | Work::TestAi => unreachable!(),
+            Work::Coach { .. } | Work::PlanAdapt { .. } | Work::TestAi | Work::Translate { .. } => {
+                unreachable!()
+            }
             Work::Ai { subject, kind } => {
                 let saved = bot::save_job_in(&mut self.store, &subject, &kind, &raw, self.lang)?;
                 if let Some((start, day, index)) = plan_task {
@@ -1468,6 +1700,8 @@ impl App {
                         self.lesson_topic = raw_topic.clone();
                         self.lesson_turns.clear();
                         self.lesson_follow = false;
+                        self.lesson_translated = None;
+                        self.lesson_show_translated = false;
                         self.lesson_max_scroll.set(u16::MAX);
                         self.editing = Some(Input::LessonChat);
                         self.input.clear();
@@ -1498,7 +1732,7 @@ impl App {
                         // The lesson is shown on the Bugün tab, then its quiz starts there.
                         self.session_tab = 4;
                         self.tab = 4;
-                        self.feedback = None;
+                        self.clear_feedback_state();
                         self.summary.clear();
                         self.summary_session = None;
                         self.scroll = 0;
@@ -1637,21 +1871,15 @@ impl App {
         self.session = Some(session);
         self.session_tab = tab;
         self.session_subject = subject.into();
-        self.feedback = None;
+        self.clear_feedback_state();
         self.summary.clear();
         self.summary_session = None;
-        self.lesson = None;
-        self.lesson_topic.clear();
-        self.lesson_turns.clear();
-        self.lesson_follow = false;
+        self.clear_lesson_state();
         self.scroll = 0;
     }
 
     pub fn close_session(&mut self) -> Result<()> {
-        self.lesson = None;
-        self.lesson_topic.clear();
-        self.lesson_turns.clear();
-        self.lesson_follow = false;
+        self.clear_lesson_state();
         if self.editing == Some(Input::LessonChat) {
             self.editing = None;
         }
@@ -1660,7 +1888,7 @@ impl App {
             self.summary = session.finish_in(&self.store, self.lang, true)?;
             self.summary_session = None;
             self.session = None;
-            self.feedback = None;
+            self.clear_feedback_state();
         }
         Ok(())
     }
@@ -1965,6 +2193,8 @@ impl App {
                 })
                 .collect();
             self.lesson_follow = false;
+            self.lesson_translated = None;
+            self.lesson_show_translated = false;
             self.lesson_max_scroll.set(u16::MAX);
             self.editing = Some(Input::LessonChat);
             self.input.clear();
@@ -1976,7 +2206,7 @@ impl App {
             self.session_subject = subject;
             self.session_tab = 4;
             self.tab = 4;
-            self.feedback = None;
+            self.clear_feedback_state();
             self.summary.clear();
             self.summary_session = None;
             self.scroll = 0;
@@ -2004,9 +2234,9 @@ impl App {
 
     /// Bugün sekmesinde seçili plan görevini çalıştırır. Telegram'daki ▶ düğmesiyle aynı komutlar.
     fn plan_enter(&mut self) -> Result<()> {
-        if self.lesson.take().is_some() {
+        if self.lesson.is_some() {
+            self.clear_lesson_state();
             self.editing = None;
-            self.lesson_follow = false;
             self.scroll = 0;
             return Ok(());
         }
@@ -2169,8 +2399,7 @@ impl App {
                     self.session = None;
                     self.coach_after_session(&topic, correct, answered);
                 }
-                self.feedback = None;
-                self.last_wrong_choice = None;
+                self.clear_feedback_state();
                 self.scroll = 0;
                 self.refresh()?;
             }
@@ -2290,6 +2519,7 @@ impl App {
                 Some(new_lang) => {
                     self.lang = new_lang;
                     self.store.set_state("lang", new_lang.code())?;
+                    self.sync_native_lang(new_lang)?;
                     self.status = new_lang
                         .pick(
                             "✓ Dil Türkçe olarak ayarlandı.",
@@ -2305,6 +2535,38 @@ impl App {
                         .into();
                 }
             },
+            "anadil" | "nativelang" => {
+                if args.trim().is_empty() {
+                    self.status = match self.lang {
+                        Lang::Tr => format!(
+                            "Ana dil: {} · Değiştirmek için: /anadil <dil> (veya F5)",
+                            self.native_lang
+                        ),
+                        Lang::En => format!(
+                            "Native language: {} · Change with: /nativelang <lang> (or F5)",
+                            self.native_lang
+                        ),
+                    };
+                } else {
+                    match self.set_native_lang_and_reset(args) {
+                        Ok(saved) => {
+                            self.status = match self.lang {
+                                Lang::Tr => format!("✓ Ana dil güncellendi: {saved}"),
+                                Lang::En => format!("✓ Native language updated: {saved}"),
+                            };
+                        }
+                        Err(_) => {
+                            self.status = self
+                                .lang
+                                .pick(
+                                    "Geçersiz dil adı. Örn: /anadil Türkçe",
+                                    "Invalid language name. E.g. /nativelang English",
+                                )
+                                .into();
+                        }
+                    }
+                }
+            }
             "bugun" | "today" => {
                 self.tab = 4;
                 self.plan_today();
@@ -2705,7 +2967,7 @@ impl App {
         self.plan_proposal = None;
         self.deneme_chat = None;
         self.plan_chat = None;
-        self.lesson = None;
+        self.clear_lesson_state();
         self.refresh()?;
         self.status = format!(
             "{}: {matched}",
@@ -2890,9 +3152,9 @@ impl App {
             return Ok(());
         };
         let duration_ms = session.shown_at.elapsed().as_millis().min(600_000) as i64;
-        let outcome = self
-            .store
-            .record_flashcard_review(card.id, rating, duration_ms, Utc::now())?;
+        let outcome =
+            self.store
+                .record_flashcard_review(card.id, rating, duration_ms, Utc::now())?;
         match rating {
             BinaryRating::Again => session.again_count += 1,
             BinaryRating::Good => session.good_count += 1,
@@ -2952,7 +3214,10 @@ impl App {
         if cards.is_empty() {
             self.status = self
                 .lang
-                .pick("Dışa aktarılacak aktif FSRS kartı yok.", "No active FSRS cards to export.")
+                .pick(
+                    "Dışa aktarılacak aktif FSRS kartı yok.",
+                    "No active FSRS cards to export.",
+                )
                 .into();
             return Ok(());
         }
@@ -2960,8 +3225,16 @@ impl App {
         let path =
             bot::write_anki_flashcards_in(&self.root, &subject, export_topic, &cards, self.lang)?;
         self.status = match self.lang {
-            Lang::Tr => format!("✓ {} kart Anki'ye aktarıldı: {}", cards.len(), path.display()),
-            Lang::En => format!("✓ Exported {} card(s) to Anki: {}", cards.len(), path.display()),
+            Lang::Tr => format!(
+                "✓ {} kart Anki'ye aktarıldı: {}",
+                cards.len(),
+                path.display()
+            ),
+            Lang::En => format!(
+                "✓ Exported {} card(s) to Anki: {}",
+                cards.len(),
+                path.display()
+            ),
         };
         Ok(())
     }
@@ -3278,9 +3551,8 @@ impl App {
             return Ok(());
         }
         if text.is_empty() {
-            self.lesson = None;
+            self.clear_lesson_state();
             self.editing = None;
-            self.lesson_follow = false;
             self.scroll = 0;
             return Ok(());
         }
@@ -3716,6 +3988,9 @@ impl App {
                 KeyCode::Char('f') if control && input == Input::DenemeChat => {
                     self.trigger_cuotiben_deneme()?;
                 }
+                KeyCode::Char('t') if control && input == Input::LessonChat => {
+                    self.toggle_translate_lesson()?;
+                }
                 KeyCode::Esc => {
                     self.input.clear();
                     self.editing = None;
@@ -3769,6 +4044,9 @@ impl App {
                 Ok(())
             };
         }
+        if control && key.code == KeyCode::Char('t') && self.tab == 4 && self.lesson.is_some() {
+            return self.toggle_translate_lesson();
+        }
         if (key.code == KeyCode::Char('q') && !control)
             || (control && key.code == KeyCode::Char('c'))
         {
@@ -3801,10 +4079,22 @@ impl App {
                 .is_some_and(|question| choice < question.value.choices.len())
         {
             let current_q = session.questions.get(session.position).cloned();
+            let is_exam = session.is_exam;
             let feedback = session.answer_in(&mut self.store, choice, self.lang)?;
             self.last_wrong_choice = current_q
+                .as_ref()
                 .filter(|q| choice != q.value.answer_index)
                 .map(|q| (q.id, choice));
+            self.feedback_translation = if !is_exam {
+                current_q.map(|q| FeedbackTranslation {
+                    question_id: q.id,
+                    explanation: q.value.explanation,
+                    translated: None,
+                    show: false,
+                })
+            } else {
+                None
+            };
             self.feedback = Some(feedback);
             self.scroll = 0;
             self.refresh()?;
@@ -3816,6 +4106,13 @@ impl App {
             && key.code == KeyCode::Char('c')
         {
             return self.trigger_cuotiben_quiz();
+        }
+        if self.tab == self.session_tab
+            && self.feedback.is_some()
+            && self.feedback_translation.is_some()
+            && key.code == KeyCode::Char('t')
+        {
+            return self.toggle_translate_feedback();
         }
         if self.tab == ANKI_TAB {
             if let Some(session) = self.anki_session.as_mut() {
@@ -3837,8 +4134,7 @@ impl App {
                         return self.rate_anki_card(BinaryRating::Good);
                     }
                     KeyCode::Char('r')
-                        if session.revealed
-                            && session.current().is_some_and(|c| c.is_leech) =>
+                        if session.revealed && session.current().is_some_and(|c| c.is_leech) =>
                     {
                         return self.repair_current_leech();
                     }
@@ -3867,9 +4163,7 @@ impl App {
                         self.scroll = 0;
                         return Ok(());
                     }
-                    KeyCode::Enter | KeyCode::Char(' ')
-                        if self.anki_view == AnkiView::Overview =>
-                    {
+                    KeyCode::Enter | KeyCode::Char(' ') if self.anki_view == AnkiView::Overview => {
                         return self.start_anki_review();
                     }
                     KeyCode::Char('n') if self.anki_view == AnkiView::Overview => {
@@ -4041,7 +4335,7 @@ impl App {
                 self.plan_proposal = None;
                 self.deneme_chat = None;
                 self.plan_chat = None;
-                self.lesson = None;
+                self.clear_lesson_state();
                 self.anki_session = None;
                 self.anki_tag_idx = 0;
                 self.anki_inc_idx = 0;
@@ -4441,7 +4735,7 @@ impl App {
         key: KeyEvent,
         control: bool,
     ) -> Result<bool> {
-        const FIELDS: usize = 10;
+        const FIELDS: usize = 11;
         match key.code {
             KeyCode::Esc => {
                 if matches!(self.pending.as_ref().map(|p| &p.work), Some(Work::TestAi)) {
@@ -4453,18 +4747,22 @@ impl App {
             KeyCode::BackTab | KeyCode::Up => m.field = (m.field + FIELDS - 1) % FIELDS,
             KeyCode::Left | KeyCode::Right if m.field == 0 => {
                 let delta = if key.code == KeyCode::Right { 1 } else { -1 };
+                m.cycle_native_lang(delta);
+            }
+            KeyCode::Left | KeyCode::Right if m.field == 1 => {
+                let delta = if key.code == KeyCode::Right { 1 } else { -1 };
                 m.cycle_provider(delta, self.lang);
             }
-            KeyCode::Char(' ') if m.field == 0 => m.cycle_provider(1, self.lang),
-            KeyCode::Left | KeyCode::Right if m.field == 1 => {
+            KeyCode::Char(' ') if m.field == 1 => m.cycle_provider(1, self.lang),
+            KeyCode::Left | KeyCode::Right if m.field == 2 => {
                 let delta = if key.code == KeyCode::Right { 1 } else { -1 };
                 m.cycle_suggested_model(delta);
             }
-            KeyCode::Left | KeyCode::Right if m.field == 2 => {
+            KeyCode::Left | KeyCode::Right if m.field == 3 => {
                 let delta = if key.code == KeyCode::Right { 1 } else { -1 };
                 m.cycle_effort(delta);
             }
-            KeyCode::Char(' ') if m.field == 2 => m.cycle_effort(1),
+            KeyCode::Char(' ') if m.field == 3 => m.cycle_effort(1),
             KeyCode::Char('t') if control => {
                 return self.trigger_ai_settings_test(m);
             }
@@ -4472,22 +4770,26 @@ impl App {
                 return self.save_ai_settings(m);
             }
             KeyCode::Enter => match m.field {
-                8 => return self.trigger_ai_settings_test(m),
-                9 => return self.save_ai_settings(m),
+                9 => return self.trigger_ai_settings_test(m),
+                10 => return self.save_ai_settings(m),
                 _ => m.field = (m.field + 1) % FIELDS,
             },
-            KeyCode::Char(' ') if m.field == 8 => return self.trigger_ai_settings_test(m),
-            KeyCode::Char(' ') if m.field == 9 => return self.save_ai_settings(m),
+            KeyCode::Char(' ') if m.field == 9 => return self.trigger_ai_settings_test(m),
+            KeyCode::Char(' ') if m.field == 10 => return self.save_ai_settings(m),
             KeyCode::Backspace => match m.field {
-                1 => {
+                0 => {
+                    m.native_lang.pop();
+                    m.error = None;
+                }
+                2 => {
                     m.model.pop();
                     m.error = None;
                 }
-                3 => {
+                4 => {
                     m.base_url.pop();
                     m.error = None;
                 }
-                4 => {
+                5 => {
                     if m.gemini_key_dirty {
                         m.gemini_key_input.pop();
                     } else {
@@ -4497,7 +4799,7 @@ impl App {
                     }
                     m.error = None;
                 }
-                5 => {
+                6 => {
                     if m.openai_key_dirty {
                         m.openai_key_input.pop();
                     } else {
@@ -4507,57 +4809,62 @@ impl App {
                     }
                     m.error = None;
                 }
-                6 => {
+                7 => {
                     m.custom_cmd.pop();
                     m.error = None;
                 }
-                7 => {
+                8 => {
                     m.timeout_secs.pop();
                     m.error = None;
                 }
                 _ => {}
             },
             KeyCode::Char('u') if control => match m.field {
-                1 => m.model.clear(),
-                3 => m.base_url.clear(),
-                4 => {
+                0 => m.native_lang.clear(),
+                2 => m.model.clear(),
+                4 => m.base_url.clear(),
+                5 => {
                     m.gemini_key_dirty = true;
                     m.gemini_key_input.clear();
                     m.gemini_key_masked = None;
                 }
-                5 => {
+                6 => {
                     m.openai_key_dirty = true;
                     m.openai_key_input.clear();
                     m.openai_key_masked = None;
                 }
-                6 => m.custom_cmd.clear(),
-                7 => m.timeout_secs.clear(),
+                7 => m.custom_cmd.clear(),
+                8 => m.timeout_secs.clear(),
                 _ => {}
             },
             KeyCode::Char(ch) if !control => match m.field {
-                1 => {
+                0 => {
+                    m.native_lang.push(ch);
+                    m.error = None;
+                }
+                2 => {
                     m.model.push(ch);
                     m.error = None;
                 }
-                3 => {
+                4 => {
                     m.base_url.push(ch);
                     m.error = None;
                 }
-                4 => {
+                5 => {
                     m.gemini_key_dirty = true;
                     m.gemini_key_input.push(ch);
                     m.error = None;
                 }
-                5 => {
+                6 => {
                     m.openai_key_dirty = true;
                     m.openai_key_input.push(ch);
                     m.error = None;
                 }
-                6 => {
+                7 => {
                     m.custom_cmd.push(ch);
                     m.error = None;
                 }
-                7 if ch.is_ascii_digit() => {
+                8 if ch.is_ascii_digit() => {
                     m.timeout_secs.push(ch);
                     m.error = None;
                 }
@@ -4586,7 +4893,23 @@ impl App {
     }
 
     fn save_ai_settings(&mut self, m: &mut AiSettingsModal) -> Result<bool> {
+        let normalized_lang = crate::i18n::normalize_native_lang(&m.native_lang);
+        if normalized_lang.is_empty() {
+            m.error = Some(
+                self.lang
+                    .pick(
+                        "Ana dil boş bırakılamaz.",
+                        "Native language cannot be empty.",
+                    )
+                    .into(),
+            );
+            return Ok(true);
+        }
         if let Err(err) = m.save_to_dotenv(&self.root) {
+            m.error = Some(config::redact_error(&self.root, &err));
+            return Ok(true);
+        }
+        if let Err(err) = self.set_native_lang_and_reset(&normalized_lang) {
             m.error = Some(config::redact_error(&self.root, &err));
             return Ok(true);
         }
@@ -4594,8 +4917,8 @@ impl App {
         self.status = self
             .lang
             .pick(
-                "✓ AI ayarları .env dosyasına kaydedildi.",
-                "✓ AI settings saved to .env.",
+                "✓ Ayarlar kaydedildi (.env & ana dil).",
+                "✓ Settings saved (.env & native language).",
             )
             .into();
         Ok(false)
@@ -6352,29 +6675,47 @@ mod tests {
         key(&mut app, KeyCode::F(5));
         assert!(matches!(app.modal, Some(Modal::AiSettings(_))));
 
-        // Cycle provider to GeminiApi (Auto -> GeminiApi = Right x1).
+        // Field 0 is Native Language: cycle preset (Türkçe -> English -> Deutsch) then type custom.
         key(&mut app, KeyCode::Right);
-        // Move to Model (field 1) and enter custom model.
+        key(&mut app, KeyCode::Right);
+        if let Some(Modal::AiSettings(m)) = &app.modal {
+            assert_eq!(m.native_lang, "Deutsch");
+        }
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        for ch in "Brazilian Portuguese".chars() {
+            key(&mut app, KeyCode::Char(ch));
+        }
+
+        // Move to Provider (field 1) and cycle to GeminiApi (Auto -> GeminiApi = Right x1).
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Right);
+        // Move to Model (field 2) and enter custom model.
         key(&mut app, KeyCode::Tab);
         for ch in "gemini-3.8-flash".chars() {
             key(&mut app, KeyCode::Char(ch));
         }
-        // Move to Effort (field 2) and pick "high" (default -> minimal -> low -> medium -> high).
+        // Move to Effort (field 3) and pick "high" (default -> minimal -> low -> medium -> high).
         key(&mut app, KeyCode::Tab);
         for _ in 0..4 {
             key(&mut app, KeyCode::Right);
         }
-        // Move to Base URL (field 3) -> GEMINI_API_KEY (field 4).
+        // Move to Base URL (field 4) -> GEMINI_API_KEY (field 5).
         key(&mut app, KeyCode::Tab);
         key(&mut app, KeyCode::Tab);
         for ch in "gem-secret-key-9999".chars() {
             key(&mut app, KeyCode::Char(ch));
         }
 
-        // Ctrl+S saves to .env and closes modal.
+        // Ctrl+S saves to .env + SQLite native_lang and closes modal.
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .unwrap();
         assert!(app.modal.is_none());
+        assert_eq!(app.native_lang, "Brazilian Portuguese");
+        assert_eq!(
+            app.store.native_lang(Lang::Tr).unwrap(),
+            "Brazilian Portuguese"
+        );
 
         let dotenv = fs::read_to_string(root.path().join(".env")).unwrap();
         assert!(dotenv.contains("STUDIA_TELEGRAM_TOKEN=tg-keep-token"));
@@ -6560,5 +6901,177 @@ mod tests {
         key(&mut app, KeyCode::Char('s'));
         assert_eq!(app.anki_view, AnkiView::Strategy);
         assert_eq!(app.anki_notes.len(), 1);
+    }
+
+    #[test]
+    fn quiz_feedback_translation_caches_toggles_and_handles_errors() {
+        let (_root, mut app) = setup();
+        app.command("/anadil", "Türkçe").unwrap();
+        assert_eq!(app.native_lang, "Türkçe");
+
+        let questions = app
+            .store
+            .add_questions(
+                "Ders",
+                "YDS Contrast",
+                vec![crate::ai::Question {
+                    question: "---- the heavy rain, they arrived on time.".into(),
+                    choices: vec![
+                        "Although".into(),
+                        "Despite".into(),
+                        "Because".into(),
+                        "Unless".into(),
+                    ],
+                    answer_index: 1,
+                    explanation:
+                        "Correct answer: 'Despite'. It takes a noun phrase rather than a clause."
+                            .into(),
+                    source: "s".into(),
+                    topic: None,
+                }],
+            )
+            .unwrap();
+        app.start_session("Ders", "YDS Contrast", questions, 1)
+            .unwrap();
+        app.tab = 1;
+        key(&mut app, KeyCode::Char('b'));
+        assert!(app.feedback.as_ref().unwrap().contains("✅ Doğru"));
+        let ft = app.feedback_translation.as_ref().unwrap();
+        assert_eq!(
+            ft.explanation,
+            "Correct answer: 'Despite'. It takes a noun phrase rather than a clause."
+        );
+        assert!(!ft.show);
+
+        // First failed translation attempt surfaces redacted error without crashing.
+        app.toggle_translate_feedback_with(|_p, _s| Err(crate::invalid("network boom")))
+            .unwrap();
+        while app.pending.is_some() {
+            app.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.status.contains("network boom"));
+        assert!(!app.feedback_translation.as_ref().unwrap().show);
+
+        // Successful translation caches to SQLite and enables translated display.
+        app.toggle_translate_feedback_with(|_p, _s| {
+            Ok(r#"{"answer":"Doğru cevap: 'Despite'. İsim öbeği alır."}"#.into())
+        })
+        .unwrap();
+        while app.pending.is_some() {
+            app.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ft = app.feedback_translation.as_ref().unwrap();
+        assert!(ft.show);
+        assert_eq!(
+            ft.translated.as_deref(),
+            Some("Doğru cevap: 'Despite'. İsim öbeği alır.")
+        );
+        // `app.feedback` stays immutable so original text is always preserved.
+        assert!(
+            app.feedback
+                .as_ref()
+                .unwrap()
+                .contains("Correct answer: 'Despite'")
+        );
+
+        // Pressing 't' toggles back to original and back to translated instantly (no pending job).
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.pending.is_none());
+        assert!(!app.feedback_translation.as_ref().unwrap().show);
+        key(&mut app, KeyCode::Char('t'));
+        assert!(app.pending.is_none());
+        assert!(app.feedback_translation.as_ref().unwrap().show);
+
+        // Advancing clears feedback_translation.
+        key(&mut app, KeyCode::Enter);
+        assert!(app.feedback.is_none());
+        assert!(app.feedback_translation.is_none());
+    }
+
+    #[test]
+    fn lesson_translation_preserves_original_in_sqlite_across_followup_chat() {
+        let (_root, mut app) = setup();
+        app.command("/anadil", "Türkçe").unwrap();
+        let stored_qs = app
+            .store
+            .add_questions(
+                "Ders",
+                "Modals",
+                vec![crate::ai::Question {
+                    question: "Q1".into(),
+                    choices: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                    answer_index: 0,
+                    explanation: "Exp".into(),
+                    source: "s".into(),
+                    topic: None,
+                }],
+            )
+            .unwrap();
+        app.store
+            .save_lesson(
+                "Ders",
+                Lang::Tr,
+                "Modals",
+                "Original English lesson explaining modal verbs in detail.",
+                &stored_qs,
+                &[],
+            )
+            .unwrap();
+
+        app.open_or_begin_lesson("Modals", None).unwrap();
+        assert_eq!(
+            app.lesson.as_deref(),
+            Some("Original English lesson explaining modal verbs in detail.")
+        );
+
+        app.toggle_translate_lesson_with(|_p, _s| {
+            Ok(r#"{"answer":"Modal fiilleri ayrıntılı açıklayan Türkçe ders metni."}"#.into())
+        })
+        .unwrap();
+        while app.pending.is_some() {
+            app.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.lesson_show_translated);
+        assert_eq!(
+            app.lesson_translated.as_deref(),
+            Some("Modal fiilleri ayrıntılı açıklayan Türkçe ders metni.")
+        );
+        // Original `app.lesson` stays untouched!
+        assert_eq!(
+            app.lesson.as_deref(),
+            Some("Original English lesson explaining modal verbs in detail.")
+        );
+
+        // Follow-up LessonChat saves original lesson + turn back to SQLite, not the translation.
+        app.lesson_turn("Bir örnek verir misin?".into(), |_p, _s| {
+            Ok(r#"{"answer":"Elbette: You must study."}"#.into())
+        })
+        .unwrap();
+        while app.pending.is_some() {
+            app.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (saved_lesson, _qs, turns) = app
+            .store
+            .load_lesson("Ders", Lang::Tr, "Modals")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved_lesson,
+            "Original English lesson explaining modal verbs in detail."
+        );
+        assert_eq!(turns.len(), 1);
+
+        // Ctrl+T toggles back to original and blank Enter clears translation state.
+        app.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(!app.lesson_show_translated);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.lesson.is_none());
+        assert!(app.lesson_translated.is_none());
+        assert!(!app.lesson_show_translated);
     }
 }
