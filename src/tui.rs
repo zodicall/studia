@@ -76,10 +76,15 @@ pub fn run_with(root: &Path, lang: Lang) -> Result<()> {
         }
         Ok(())
     })();
-    // Close only this UI's session; never close a concurrent listener's session.
+    // Persist in-progress quiz sessions across app exit; never touch a concurrent listener's session.
+    // If still on a lesson screen before starting its quick check, close the unstarted 0/0 session.
     app.stop_listener();
-    let closed = app.close_session();
-    result.and(closed)
+    let exit_result = if app.lesson.is_some() {
+        app.close_session()
+    } else {
+        app.persist_active_session()
+    };
+    result.and(exit_result)
 }
 
 #[cfg(test)]

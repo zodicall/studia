@@ -7,6 +7,7 @@ use crate::{
     telegram,
 };
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -859,6 +860,20 @@ pub struct Session {
     course: Option<course::CourseConfig>,
 }
 
+/// Seri hale getirilebilen oturum anlık görüntüsü (TUI çıkış/açılış arasında sürdürmek için).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub id: i64,
+    pub subject: String,
+    pub topic: String,
+    pub is_exam: bool,
+    pub questions: Vec<(i64, Option<i64>)>,
+    pub position: usize,
+    pub correct: usize,
+    pub started: String,
+    pub answers: Vec<(usize, bool)>,
+}
+
 #[derive(Clone)]
 pub enum JobKind {
     Answer {
@@ -1148,6 +1163,75 @@ impl Session {
                 ),
             }
         })
+    }
+
+    pub fn to_snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            id: self.id,
+            subject: self.subject.clone(),
+            topic: self.topic.clone(),
+            is_exam: self.is_exam,
+            questions: self
+                .questions
+                .iter()
+                .map(|q| (q.id, q.review_target))
+                .collect(),
+            position: self.position,
+            correct: self.correct,
+            started: self.started.to_rfc3339(),
+            answers: self.answers.clone(),
+        }
+    }
+
+    pub fn from_snapshot(
+        store: &Store,
+        root: &Path,
+        snap: SessionSnapshot,
+    ) -> Result<Option<Self>> {
+        if !store.is_session_open(snap.id)? {
+            return Ok(None);
+        }
+        let Ok(started) = DateTime::parse_from_rfc3339(&snap.started) else {
+            return Ok(None);
+        };
+        let started = started.with_timezone(&Utc);
+        let mut questions = Vec::with_capacity(snap.questions.len());
+        for (qid, review_target) in snap.questions {
+            let Some((_, mut stored)) = store.question_by_id(qid)? else {
+                return Ok(None);
+            };
+            stored.review_target = review_target;
+            questions.push(stored);
+        }
+        if questions.is_empty()
+            || snap.position > questions.len()
+            || snap.answers.len() != snap.position
+            || snap.correct > snap.position
+            || snap.answers.iter().filter(|(_, ok)| *ok).count() != snap.correct
+            || snap
+                .answers
+                .iter()
+                .enumerate()
+                .any(|(i, (choice, _))| *choice >= questions[i].value.choices.len())
+        {
+            return Ok(None);
+        }
+        let Ok(course) = course::CourseConfig::load_or_default(root, &snap.subject) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            id: snap.id,
+            subject: snap.subject,
+            topic: snap.topic,
+            is_exam: snap.is_exam,
+            questions,
+            position: snap.position,
+            message_id: None,
+            correct: snap.correct,
+            started,
+            answers: snap.answers,
+            course: Some(course),
+        }))
     }
 }
 

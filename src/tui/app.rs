@@ -1,7 +1,7 @@
 use super::modals::{AiSettingsModal, Modal, PlanEditModal, PlanEditPrompt, TASK_CMD_KINDS};
 use crate::{
     Result, ai,
-    bot::{self, JobKind, JobResult, Session},
+    bot::{self, JobKind, JobResult, Session, SessionSnapshot},
     coach, config, exam,
     fsrs_engine::{BinaryRating, Flashcard},
     i18n::Lang,
@@ -11,6 +11,7 @@ use crate::{
 };
 use chrono::{Days, Local, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
     fs,
@@ -154,6 +155,16 @@ pub struct PlanChat {
     pub follow: bool,
     pub scroll: u16,
     pub max_scroll: Cell<u16>,
+}
+
+const TUI_ACTIVE_SESSION_KEY: &str = "tui_active_session";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TuiSessionSnapshot {
+    session: SessionSnapshot,
+    session_tab: usize,
+    feedback: Option<String>,
+    last_wrong_choice: Option<(i64, usize)>,
 }
 
 /// Quiz/Tekrar geri bildirimindeki açıklamanın çeviri kaplama durumu (`self.feedback`'i bozmaz).
@@ -613,6 +624,7 @@ impl App {
             last_wrong_choice: None,
         };
         app.refresh()?;
+        app.restore_active_session()?;
         Ok(app)
     }
 
@@ -1863,11 +1875,10 @@ impl App {
         let session =
             Session::start_kind_at(&self.store, subject, topic, questions, is_exam, Utc::now())?
                 .with_course(course);
-        self.install_session(subject, session, tab);
-        Ok(())
+        self.install_session(subject, session, tab)
     }
 
-    fn install_session(&mut self, subject: &str, session: Session, tab: usize) {
+    fn install_session(&mut self, subject: &str, session: Session, tab: usize) -> Result<()> {
         self.session = Some(session);
         self.session_tab = tab;
         self.session_subject = subject.into();
@@ -1876,6 +1887,100 @@ impl App {
         self.summary_session = None;
         self.clear_lesson_state();
         self.scroll = 0;
+        self.persist_active_session()
+    }
+
+    pub fn persist_active_session(&self) -> Result<()> {
+        if let Some(session) = &self.session
+            && self.lesson.is_none()
+        {
+            let snap = TuiSessionSnapshot {
+                session: session.to_snapshot(),
+                session_tab: self.session_tab,
+                feedback: self.feedback.clone(),
+                last_wrong_choice: self.last_wrong_choice,
+            };
+            self.store
+                .set_state(TUI_ACTIVE_SESSION_KEY, &serde_json::to_string(&snap)?)?;
+        } else {
+            self.clear_active_session()?;
+        }
+        Ok(())
+    }
+
+    fn clear_active_session(&self) -> Result<()> {
+        self.store.clear_state(TUI_ACTIVE_SESSION_KEY)
+    }
+
+    fn restore_active_session(&mut self) -> Result<()> {
+        let Some(raw) = self.store.state(TUI_ACTIVE_SESSION_KEY)? else {
+            return Ok(());
+        };
+        let Ok(snap) = serde_json::from_str::<TuiSessionSnapshot>(&raw) else {
+            return self.clear_active_session();
+        };
+        if !matches!(snap.session_tab, 1 | 2 | 4) {
+            return self.clear_active_session();
+        }
+        let Some(session) = Session::from_snapshot(&self.store, &self.root, snap.session)? else {
+            return self.clear_active_session();
+        };
+        if (session.position >= session.questions.len() && snap.feedback.is_none())
+            || (session.position == 0 && snap.feedback.is_some())
+        {
+            return self.clear_active_session();
+        }
+        if let Some(idx) = self.subjects.iter().position(|s| s.name == session.subject)
+            && idx != self.selected
+        {
+            self.selected = idx;
+            self.store.set_state("active_subject", &session.subject)?;
+            self.refresh()?;
+        }
+        let answered = session.position;
+        let total = session.questions.len();
+        let last_question = session
+            .position
+            .checked_sub(1)
+            .and_then(|idx| session.questions.get(idx));
+        let feedback_translation = if snap.feedback.is_some() && !session.is_exam {
+            last_question.map(|q| FeedbackTranslation {
+                question_id: q.id,
+                explanation: q.value.explanation.clone(),
+                translated: None,
+                show: false,
+            })
+        } else {
+            None
+        };
+        let last_wrong_choice = if snap.feedback.is_some() {
+            snap.last_wrong_choice.filter(|(qid, choice)| {
+                last_question.is_some_and(|q| q.id == *qid && *choice < q.value.choices.len())
+            })
+        } else {
+            None
+        };
+        self.session_subject = session.subject.clone();
+        self.session_tab = snap.session_tab;
+        self.tab = snap.session_tab;
+        self.clear_feedback_state();
+        self.feedback = snap.feedback;
+        self.last_wrong_choice = last_wrong_choice;
+        self.feedback_translation = feedback_translation;
+        self.summary.clear();
+        self.summary_session = None;
+        self.clear_lesson_state();
+        self.scroll = 0;
+        self.status = match self.lang {
+            Lang::Tr => {
+                format!("✓ Yarım kalan quiz devam ediyor ({answered}/{total}) · Esc: bitir")
+            }
+            Lang::En => {
+                format!("✓ Resumed in-progress quiz ({answered}/{total}) · Esc: finish")
+            }
+        };
+        self.session = Some(session);
+        Ok(())
     }
 
     pub fn close_session(&mut self) -> Result<()> {
@@ -1890,6 +1995,7 @@ impl App {
             self.session = None;
             self.clear_feedback_state();
         }
+        self.clear_active_session()?;
         Ok(())
     }
 
@@ -2131,7 +2237,7 @@ impl App {
             Session::start_exam(&self.store, subject, &bank.title, questions)?.with_course(course);
         self.store
             .set_state(&format!("deneme_bank:{}", session.id), slug)?;
-        self.install_session(subject, session, 4);
+        self.install_session(subject, session, 4)?;
         self.tab = 4;
         let broken = bank
             .questions
@@ -2238,6 +2344,7 @@ impl App {
             self.clear_lesson_state();
             self.editing = None;
             self.scroll = 0;
+            self.persist_active_session()?;
             return Ok(());
         }
         if self.session.is_some() {
@@ -2390,7 +2497,8 @@ impl App {
         }
         if let Some(session) = &self.session {
             if self.feedback.is_some() {
-                if session.position == session.questions.len() {
+                let finished = session.position == session.questions.len();
+                if finished {
                     self.last_wrong = session.wrong_questions();
                     let (topic, correct, answered) =
                         (session.topic.clone(), session.correct(), session.position);
@@ -2401,6 +2509,11 @@ impl App {
                 }
                 self.clear_feedback_state();
                 self.scroll = 0;
+                if finished {
+                    self.clear_active_session()?;
+                } else {
+                    self.persist_active_session()?;
+                }
                 self.refresh()?;
             }
             return Ok(());
@@ -3554,6 +3667,7 @@ impl App {
             self.clear_lesson_state();
             self.editing = None;
             self.scroll = 0;
+            self.persist_active_session()?;
             return Ok(());
         }
         let idle = self.pending.is_none();
@@ -4097,6 +4211,7 @@ impl App {
             };
             self.feedback = Some(feedback);
             self.scroll = 0;
+            self.persist_active_session()?;
             self.refresh()?;
             return Ok(());
         }
@@ -4335,11 +4450,18 @@ impl App {
                 self.plan_proposal = None;
                 self.deneme_chat = None;
                 self.plan_chat = None;
-                self.clear_lesson_state();
+                if self.lesson.is_some() {
+                    self.close_session()?;
+                } else {
+                    self.clear_lesson_state();
+                }
                 self.anki_session = None;
                 self.anki_tag_idx = 0;
                 self.anki_inc_idx = 0;
                 self.anki_view = AnkiView::Overview;
+                if self.session.is_some() {
+                    self.persist_active_session()?;
+                }
                 self.refresh()?;
             }
             KeyCode::Char('r') => self.begin_index()?,
@@ -7073,5 +7195,193 @@ mod tests {
         assert!(app.lesson.is_none());
         assert!(app.lesson_translated.is_none());
         assert!(!app.lesson_show_translated);
+    }
+
+    #[test]
+    fn mid_quiz_exit_persists_and_resumes_on_reopen() {
+        let (root, mut app) = setup();
+        app.store
+            .add_questions("Ders", "Modals", numbered_questions(3))
+            .unwrap();
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        let session_id = app.session.as_ref().unwrap().id;
+
+        // İlk soruyu yanlış cevapla (doğru şık 1, seçilen 0) ve çıkış yap.
+        key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.session.as_ref().unwrap().position, 1);
+        assert_eq!(app.session.as_ref().unwrap().correct(), 0);
+        assert!(app.feedback.as_ref().unwrap().contains("❌ Yanlış"));
+        assert!(app.last_wrong_choice.is_some());
+        assert!(app.feedback_translation.is_some());
+
+        app.persist_active_session().unwrap();
+        drop(app);
+
+        // Yeniden açılışta yarım kalan quiz aynı sekme, geri bildirim ve soruyla geri yüklenir.
+        let mut reopened = App::open(root.path()).unwrap();
+        assert_eq!(reopened.tab, 1);
+        assert_eq!(reopened.session_tab, 1);
+        assert!(reopened.status.contains("1/3"));
+        let resumed = reopened.session.as_ref().unwrap();
+        assert_eq!(resumed.id, session_id);
+        assert_eq!(resumed.position, 1);
+        assert_eq!(resumed.correct(), 0);
+        assert_eq!(resumed.questions.len(), 3);
+        assert!(reopened.feedback.as_ref().unwrap().contains("❌ Yanlış"));
+        assert!(reopened.last_wrong_choice.is_some());
+        assert!(reopened.feedback_translation.is_some());
+
+        // Kalan 2 soruyu doğru cevaplayarak oturumu tamamla.
+        key(&mut reopened, KeyCode::Enter);
+        key(&mut reopened, KeyCode::Char('b'));
+        key(&mut reopened, KeyCode::Enter);
+        key(&mut reopened, KeyCode::Char('b'));
+        assert_eq!(reopened.session.as_ref().unwrap().position, 3);
+        key(&mut reopened, KeyCode::Enter);
+        assert!(reopened.session.is_none());
+        assert!(reopened.summary.contains("2/3"));
+        assert_eq!(reopened.wrong_count(), 1);
+        assert!(
+            reopened
+                .store
+                .state(TUI_ACTIVE_SESSION_KEY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_variations_and_retry_wrong_preserve_targets_across_restart() {
+        let (root, mut app) = setup();
+        let original = app
+            .store
+            .add_questions("Ders", "Modals", vec![question()])
+            .unwrap();
+        let orig_id = original[0].id;
+        let sess = app
+            .store
+            .start_session("Ders", "Modals", "2026-01-01T10:00:00Z")
+            .unwrap();
+        app.store.record_answer(sess, orig_id, 0).unwrap();
+        app.store.end_session(sess).unwrap();
+
+        let mut variations = app
+            .store
+            .add_questions("Ders", "tekrar", numbered_questions(2))
+            .unwrap();
+        variations[0].review_target = Some(orig_id);
+        variations[1].review_target = Some(orig_id);
+        app.start_session("Ders", "tekrar", variations, 2).unwrap();
+        key(&mut app, KeyCode::Char('3'));
+        key(&mut app, KeyCode::Char('a')); // 1. soru yanlış
+        key(&mut app, KeyCode::Enter);
+        drop(app);
+
+        let mut reopened = App::open(root.path()).unwrap();
+        assert_eq!(reopened.tab, 2);
+        let resumed = reopened.session.as_ref().unwrap();
+        assert_eq!(resumed.position, 1);
+        assert_eq!(resumed.questions[1].review_target, Some(orig_id));
+
+        // 2. soruyu doğru cevapla ve bitir; review kutusu 2'ye ilerlemeli.
+        key(&mut reopened, KeyCode::Char('b'));
+        key(&mut reopened, KeyCode::Enter);
+        assert!(reopened.session.is_none());
+        assert_eq!(reopened.wrong_count(), 1);
+
+        // Yanlışları tekrar et ("w") modunda da çıkışta oturum korunmalı.
+        key(&mut reopened, KeyCode::Char('2'));
+        key(&mut reopened, KeyCode::Char('w'));
+        assert_eq!(reopened.session.as_ref().unwrap().questions.len(), 1);
+        drop(reopened);
+
+        let mut reopened_retry = App::open(root.path()).unwrap();
+        assert_eq!(reopened_retry.tab, 1);
+        assert_eq!(reopened_retry.session.as_ref().unwrap().questions.len(), 1);
+        key(&mut reopened_retry, KeyCode::Char('b'));
+        key(&mut reopened_retry, KeyCode::Enter);
+        assert!(reopened_retry.session.is_none());
+        assert!(reopened_retry.summary.contains("1/1"));
+    }
+
+    #[test]
+    fn deneme_exam_mid_exit_stays_open_and_resumes_with_coach_paused() {
+        let (root, mut app) = setup();
+        app.set_coach_mode(CoachMode::On).unwrap();
+        let questions = app
+            .store
+            .add_exam_questions("Ders", "Deneme Sınavı", numbered_questions(3))
+            .unwrap();
+        app.start_session_with_kind("Ders", "Deneme Sınavı", questions, 4, true)
+            .unwrap();
+        app.tab = 4;
+        key(&mut app, KeyCode::Char('b'));
+        key(&mut app, KeyCode::Enter);
+        let exam_id = app.session.as_ref().unwrap().id;
+        drop(app);
+
+        // Bitmemiş deneme henüz Denemeler geçmişinde listelenmemeli.
+        let mut reopened = App::open(root.path()).unwrap();
+        assert!(
+            reopened
+                .store
+                .deneme_sessions("Ders", 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Koç açıkken bile geri yüklenen oturumu ezmemeli.
+        reopened.coach_tick().unwrap();
+        assert_eq!(reopened.session.as_ref().unwrap().id, exam_id);
+        assert!(reopened.session.as_ref().unwrap().is_exam);
+        assert_eq!(reopened.session.as_ref().unwrap().position, 1);
+        assert_eq!(reopened.tab, 4);
+
+        // Kalan soruları tamamla ve Denemeler geçmişine düştüğünü doğrula.
+        key(&mut reopened, KeyCode::Char('b'));
+        key(&mut reopened, KeyCode::Enter);
+        key(&mut reopened, KeyCode::Char('b'));
+        key(&mut reopened, KeyCode::Enter);
+        assert!(reopened.session.is_none());
+        assert_eq!(reopened.store.deneme_sessions("Ders", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn explicit_escape_clears_saved_session_and_corrupt_snapshot_recovers() {
+        let (root, mut app) = setup();
+        app.store
+            .add_questions("Ders", "Modals", numbered_questions(2))
+            .unwrap();
+        key(&mut app, KeyCode::Char('2'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('b'));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.store.state(TUI_ACTIVE_SESSION_KEY).unwrap().is_some());
+
+        // Esc ile erken bitirme kaydedilen anlık görüntüyü temizlemeli.
+        key(&mut app, KeyCode::Esc);
+        assert!(app.session.is_none());
+        assert!(app.store.state(TUI_ACTIVE_SESSION_KEY).unwrap().is_none());
+        drop(app);
+
+        let reopened = App::open(root.path()).unwrap();
+        assert!(reopened.session.is_none());
+        assert_eq!(reopened.tab, 0);
+
+        // Bozuk JSON anlık görüntüsü açılışı bozmamalı ve temizlenmeli.
+        reopened
+            .store
+            .set_state(TUI_ACTIVE_SESSION_KEY, "{not-valid-json")
+            .unwrap();
+        drop(reopened);
+        let recovered = App::open(root.path()).unwrap();
+        assert!(recovered.session.is_none());
+        assert!(
+            recovered
+                .store
+                .state(TUI_ACTIVE_SESSION_KEY)
+                .unwrap()
+                .is_none()
+        );
     }
 }

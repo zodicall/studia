@@ -641,6 +641,18 @@ impl Store {
         )? == 1)
     }
 
+    pub fn is_session_open(&self, session: i64) -> Result<bool> {
+        let open: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT ended_at IS NULL FROM sessions WHERE id=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(open.unwrap_or(false))
+    }
+
     pub fn close_interrupted_sessions(&self) -> Result<()> {
         // Only the listener's previous session belongs to this process on restart.
         self.conn.execute(
@@ -2397,5 +2409,15 @@ mod tests {
             Some("Doğru cevap: 'however'. Zıtlık bildirir.")
         );
         assert_eq!(store.cached_translation("Deutsch", src).unwrap(), None);
+    }
+
+    #[test]
+    fn is_session_open_reflects_lifecycle() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        assert!(!store.is_session_open(999).unwrap());
+        let id = store.start_session("Ders", "Modals", &now()).unwrap();
+        assert!(store.is_session_open(id).unwrap());
+        assert!(store.end_session(id).unwrap());
+        assert!(!store.is_session_open(id).unwrap());
     }
 }
